@@ -9,7 +9,7 @@ mod ws;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::config::Config;
@@ -28,20 +28,19 @@ pub struct AppState {
     about = "Cloudcode agent: dials out to a hub via WebSocket and serves its claude OAuth credentials"
 )]
 struct Cli {
+    /// Path to agent config. With no subcommand, agent runs in the foreground
+    /// using this config and streams logs to stdout. On first run, if the
+    /// file is missing, a template (with an auto-generated shared_secret)
+    /// is written here and the agent exits so you can edit it.
+    #[arg(short, long, default_value = "agent.toml", global = true)]
+    config: PathBuf,
+
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Start the agent (dial the hub and serve requests until exit).
-    Serve {
-        #[arg(short, long, default_value = "agent.toml")]
-        config: PathBuf,
-    },
-    /// Generate a new shared secret. Prints the plaintext for agent.toml
-    /// and the argon2id hash for hub.toml.
-    GenSecret,
     /// 后台管理 agent daemon（start/stop/restart/status）
     Daemon {
         #[command(subcommand)]
@@ -58,14 +57,19 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    match Cli::parse().cmd {
-        Cmd::Serve { config } => serve(config).await,
-        Cmd::GenSecret => gen_secret(),
-        Cmd::Daemon { cmd } => cloudcode_daemon::run("agent", "agent.toml", cmd),
+    let cli = Cli::parse();
+    match cli.cmd {
+        None => serve(cli.config).await,
+        Some(Cmd::Daemon { cmd }) => cloudcode_daemon::run("agent", "agent.toml", cmd),
     }
 }
 
 async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
+    if !config_path.exists() {
+        init_config(&config_path)?;
+        return Ok(());
+    }
+
     let config =
         Config::load(&config_path).with_context(|| format!("loading {}", config_path.display()))?;
     let credentials = Arc::new(
@@ -97,17 +101,51 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     ws::run(state).await
 }
 
-fn gen_secret() -> anyhow::Result<()> {
+/// Write a fresh agent.toml with an auto-generated shared_secret, and print
+/// the matching [[agents]] block (containing the argon2id hash) so the user
+/// can hand it to the hub admin.
+fn init_config(path: &Path) -> anyhow::Result<()> {
     let secret = auth::generate_secret();
     let hash = auth::hash_secret(&secret)?;
-    println!("# Plaintext secret (give to the agent host, do not commit):");
-    println!("# add to agent.toml under [auth]");
-    println!("[auth]");
-    println!("shared_secret = \"{}\"", secret);
+    let agent_name = name::default_agent_name();
+
+    let template = format!(
+        r#"# Auto-generated on first run. Edit [hub].url before re-running.
+
+[hub]
+url = "wss://hub.example.com/v1/agent/ws"
+
+[agent]
+# Auto-detected from hostname-user; override if hub reports name_taken.
+# name = "{agent_name}"
+
+[auth]
+shared_secret = "{secret}"
+
+# [claude] section is optional; defaults read ~/.claude/.credentials.json.
+# [claude]
+# credentials_path = "/custom/path/credentials.json"
+# upstream         = "https://api.anthropic.com"
+# anthropic_beta   = ["oauth-2025-04-20"]
+"#
+    );
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+    }
+    std::fs::write(path, template).with_context(|| format!("writing {}", path.display()))?;
+
+    println!("# Wrote {}", path.display());
+    println!("# Auto-detected agent name: {}", agent_name);
     println!();
-    println!("# argon2id hash; give to hub admin to add under [[agents]]");
+    println!("# Give the following block to your hub admin to paste into hub.toml:");
     println!("[[agents]]");
-    println!("# name = \"<auto-detected on agent start, or set explicitly>\"");
+    println!("name = \"{}\"", agent_name);
     println!("shared_secret_hash = \"{}\"", hash);
+    println!();
+    println!("# Then edit [hub].url in {} and re-run.", path.display());
     Ok(())
 }

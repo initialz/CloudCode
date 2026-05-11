@@ -1,9 +1,9 @@
 //! 通用 daemon 生命周期管理：start/stop/restart/status。
 //!
 //! 调用方（cloudcode-hub / cloudcode-agent）注入 service 名和默认 config 路径；
-//! 本 crate 会 spawn `current_exe serve --config <config>`，setsid 后台跑，
-//! PID 与日志默认放 `~/.local/state/cloudcode/<name>.{pid,log}`，可由
-//! `CLOUDCODE_STATE_DIR` 覆盖。
+//! 本 crate 会 spawn `current_exe --config <config>`（前台模式），setsid
+//! 后台跑，PID 与日志默认放 `~/.local/state/cloudcode/<name>.{pid,log}`，
+//! 可由 `CLOUDCODE_STATE_DIR` 覆盖。
 
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
@@ -119,8 +119,7 @@ fn start(name: &str, default_config: &str, config: Option<PathBuf>) -> Result<()
     let dev_null = File::open("/dev/null").context("opening /dev/null")?;
 
     let mut cmd = Command::new(&exe);
-    cmd.arg("serve")
-        .arg("--config")
+    cmd.arg("--config")
         .arg(&cfg)
         .stdin(Stdio::from(dev_null))
         .stdout(Stdio::from(log))

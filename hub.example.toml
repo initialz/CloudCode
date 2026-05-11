@@ -1,7 +1,7 @@
 # Cloudcode Hub 配置示例
 # 复制为 hub.toml 后填入真实值。
-# 启动（前台）：cloudcode-hub serve --config hub.toml
-# 启动（守护）：cloudcode-hub daemon start --config hub.toml
+# 启动（前台，日志到 stdout）：cloudcode-hub --config hub.toml
+# 启动（守护）：             cloudcode-hub daemon start --config hub.toml
 
 [server]
 # 对外监听地址。生产配在反向代理后（nginx/caddy + TLS），代理转发到 127.0.0.1:7000。

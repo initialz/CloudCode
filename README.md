@@ -49,9 +49,9 @@ Supported: Linux x86_64 / aarch64, macOS aarch64.
 ### Hub (administrator)
 
 ```bash
-cloudcode-hub gen-token alice                    # one token per user
-$EDITOR ./hub.toml                               # paste [[accounts]] and [[agents]] blocks
-cloudcode-hub serve --config ./hub.toml          # foreground; logs to stdout
+cloudcode-hub gen-token alice            # one token per user
+$EDITOR ./hub.toml                       # paste [[accounts]] and [[agents]] blocks
+cloudcode-hub --config ./hub.toml        # foreground; logs to stdout
 # or
 cloudcode-hub daemon start --config ./hub.toml   # background
 ```
@@ -61,14 +61,17 @@ cloudcode-hub daemon start --config ./hub.toml   # background
 Run the agent as the same OS user that did `claude /login`. The agent will read `~/.claude/.credentials.json` automatically — no file copying or `chmod` required.
 
 ```bash
-cloudcode-agent gen-secret                          # one-shot: prints both halves
-$EDITOR ./agent.toml                                # paste [hub].url and [auth].shared_secret
-cloudcode-agent serve --config ./agent.toml         # foreground; logs to stdout
-# or
-cloudcode-agent daemon start --config ./agent.toml  # background
-```
+# First run: agent.toml does not exist yet. The agent writes a template
+# (with an auto-generated shared_secret) and prints an [[agents]] block
+# to hand to your hub admin, then exits.
+cloudcode-agent --config ./agent.toml
 
-The `gen-secret` output also includes an `[[agents]]` block — hand that block to your hub admin to paste into `hub.toml`.
+$EDITOR ./agent.toml                     # edit [hub].url
+
+cloudcode-agent --config ./agent.toml    # foreground; logs to stdout
+# or
+cloudcode-agent daemon start --config ./agent.toml   # background
+```
 
 ### Client (developer)
 

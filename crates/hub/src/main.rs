@@ -26,17 +26,17 @@ pub struct AppState {
 #[derive(Parser)]
 #[command(name = "cloudcode-hub", about = "Cloudcode hub: LLM API gateway")]
 struct Cli {
+    /// Path to hub config. With no subcommand, hub runs in the foreground
+    /// using this config and streams logs to stdout.
+    #[arg(short, long, default_value = "hub.toml", global = true)]
+    config: PathBuf,
+
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 启动 hub 服务
-    Serve {
-        #[arg(short, long, default_value = "hub.toml")]
-        config: PathBuf,
-    },
     /// 为一个账号生成新 token，输出明文（仅此一次）和 hash（写入 hub.toml）
     GenToken {
         /// 账号名称
@@ -58,10 +58,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    match Cli::parse().cmd {
-        Cmd::Serve { config } => serve(config).await,
-        Cmd::GenToken { name } => gen_token(&name),
-        Cmd::Daemon { cmd } => cloudcode_daemon::run("hub", "hub.toml", cmd),
+    let cli = Cli::parse();
+    match cli.cmd {
+        None => serve(cli.config).await,
+        Some(Cmd::GenToken { name }) => gen_token(&name),
+        Some(Cmd::Daemon { cmd }) => cloudcode_daemon::run("hub", "hub.toml", cmd),
     }
 }
 
