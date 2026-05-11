@@ -18,7 +18,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
@@ -33,6 +33,7 @@ pub enum MenuOutcome {
 pub async fn run(
     wire: &mut Wire,
     keys: &mut KeyRx,
+    account: &str,
     last_agent: Option<&str>,
 ) -> Result<MenuOutcome> {
     enable_raw_mode()?;
@@ -40,7 +41,7 @@ pub async fn run(
     execute!(out, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend)?;
-    let result = run_inner(&mut term, wire, keys, last_agent).await;
+    let result = run_inner(&mut term, wire, keys, account, last_agent).await;
     disable_raw_mode().ok();
     execute!(term.backend_mut(), LeaveAlternateScreen).ok();
     term.show_cursor().ok();
@@ -51,6 +52,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     wire: &mut Wire,
     keys: &mut KeyRx,
+    account: &str,
     last_agent: Option<&str>,
 ) -> Result<MenuOutcome> {
     'outer: loop {
@@ -68,8 +70,9 @@ async fn run_inner<B: ratatui::backend::Backend>(
 
         let agent = loop {
             term.draw(|f| {
-                draw_list(
+                draw_layout(
                     f,
+                    account,
                     "Select agent",
                     &agents,
                     &mut a_state,
@@ -116,8 +119,9 @@ async fn run_inner<B: ratatui::backend::Backend>(
                 w_state.select(Some(initial.min(workspaces.len().saturating_sub(1))));
             }
             term.draw(|f| {
-                draw_list(
+                draw_layout(
                     f,
+                    account,
                     &format!("Select workspace on {}", agent),
                     &workspaces,
                     &mut w_state,
@@ -214,18 +218,43 @@ fn handle_list_key(k: KeyEvent, state: &mut ListState, len: usize) -> ListAction
     }
 }
 
-fn draw_list(
+fn draw_layout(
     f: &mut ratatui::Frame,
+    account: &str,
     title: &str,
     items: &[String],
     state: &mut ListState,
     hint: &str,
 ) {
     let area = f.area();
+    // Mascot is 11 lines tall (10 art + 1 greeting); only show it when the
+    // terminal has room. Below ~24 rows we skip it so the picker stays usable.
+    let show_mascot = area.height >= 20;
+    let mascot_h: u16 = if show_mascot { 11 } else { 0 };
+
+    let constraints = if show_mascot {
+        vec![
+            ratatui::layout::Constraint::Length(mascot_h),
+            ratatui::layout::Constraint::Min(3),
+            ratatui::layout::Constraint::Length(1),
+        ]
+    } else {
+        vec![
+            ratatui::layout::Constraint::Min(3),
+            ratatui::layout::Constraint::Length(1),
+        ]
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .constraints(constraints)
         .split(area);
+
+    let (list_area, hint_area) = if show_mascot {
+        f.render_widget(mascot_widget(account), chunks[0]);
+        (chunks[1], chunks[2])
+    } else {
+        (chunks[0], chunks[1])
+    };
 
     let list_items: Vec<ListItem> = if items.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
@@ -240,7 +269,17 @@ fn draw_list(
     };
 
     let list = List::new(list_items)
-        .block(Block::default().title(title).borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(Span::styled(
+                    format!(" {} ", title),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
         .highlight_style(
             Style::default()
                 .fg(Color::Black)
@@ -249,13 +288,71 @@ fn draw_list(
         )
         .highlight_symbol("▶ ");
 
-    f.render_stateful_widget(list, chunks[0], state);
+    f.render_stateful_widget(list, list_area, state);
 
-    let hint = Paragraph::new(Span::styled(
+    let hint_widget = Paragraph::new(Span::styled(
         format!(" {} ", hint),
         Style::default().fg(Color::DarkGray),
     ));
-    f.render_widget(hint, chunks[1]);
+    f.render_widget(hint_widget, hint_area);
+}
+
+/// Cute pixel-ish robot mascot, ~10 rows tall. Designed with box-drawing
+/// chars so it stays aligned in monospace fonts.
+fn mascot_widget(account: &str) -> Paragraph<'static> {
+    let body = Style::default().fg(Color::Cyan);
+    let eyes = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let mouth = Style::default().fg(Color::LightMagenta);
+    let antenna = Style::default().fg(Color::White);
+    let cloud = Style::default().fg(Color::LightCyan);
+    let dim = Style::default().fg(Color::DarkGray);
+
+    let lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(". ° ✦ °  .", cloud)).alignment(Alignment::Center),
+        Line::from(Span::styled("│", antenna)).alignment(Alignment::Center),
+        Line::from(Span::styled("●", antenna)).alignment(Alignment::Center),
+        Line::from(Span::styled("╭─────╮", body)).alignment(Alignment::Center),
+        Line::from(vec![
+            Span::styled("│ ", body),
+            Span::styled("●", eyes),
+            Span::raw(" "),
+            Span::styled("●", eyes),
+            Span::styled(" │", body),
+        ])
+        .alignment(Alignment::Center),
+        Line::from(vec![
+            Span::styled("│  ", body),
+            Span::styled("◡", mouth),
+            Span::styled("  │", body),
+        ])
+        .alignment(Alignment::Center),
+        Line::from(Span::styled("╰──┬─┬──╯", body)).alignment(Alignment::Center),
+        Line::from(Span::styled("┌─────┴─┴─────┐", body)).alignment(Alignment::Center),
+        Line::from(vec![
+            Span::styled("│ ", body),
+            Span::styled("░", dim),
+            Span::styled(" ▓▓▓▓▓ ", body),
+            Span::styled("░", dim),
+            Span::styled(" │", body),
+        ])
+        .alignment(Alignment::Center),
+        Line::from(Span::styled("└────┬───┬────┘", body)).alignment(Alignment::Center),
+        Line::from(vec![
+            Span::styled("hi ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                account.to_string(),
+                Style::default()
+                    .fg(Color::LightMagenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" ✨", Style::default().fg(Color::Yellow)),
+        ])
+        .alignment(Alignment::Center),
+    ];
+
+    Paragraph::new(lines)
 }
 
 async fn show_message<B: ratatui::backend::Backend>(

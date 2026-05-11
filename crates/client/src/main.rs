@@ -2,7 +2,6 @@ mod input;
 mod menu;
 mod proto;
 mod relay;
-mod splash;
 mod wire;
 
 use anyhow::{anyhow, Context, Result};
@@ -216,10 +215,14 @@ async fn run_chat(agent_flag: Option<String>) -> Result<()> {
     let mut keys = input::spawn_reader();
     let preferred_agent: Option<String> = agent_flag.or_else(read_last_agent);
 
-    splash::show(&mut keys, &account_name).await?;
-
     loop {
-        let outcome = menu::run(&mut wire, &mut keys, preferred_agent.as_deref()).await?;
+        let outcome = menu::run(
+            &mut wire,
+            &mut keys,
+            &account_name,
+            preferred_agent.as_deref(),
+        )
+        .await?;
         match outcome {
             menu::MenuOutcome::OpenWorkspace { agent, workspace } => {
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
