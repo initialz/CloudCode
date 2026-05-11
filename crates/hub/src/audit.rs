@@ -35,6 +35,8 @@ pub struct AuditEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
@@ -55,6 +57,7 @@ impl AuditEvent {
             event,
             account: None,
             provider: None,
+            backend: None,
             model: None,
             status: None,
             stream: None,

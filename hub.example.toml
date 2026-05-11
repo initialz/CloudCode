@@ -5,20 +5,33 @@
 listen = "0.0.0.0:7000"
 audit_log = "./audit.jsonl"
 
+# 可选：API key 模式回退后端。配了则使用此 key 直连 Anthropic。
+# 删除整个 [anthropic] 段表示「只允许订阅模式」。
 [anthropic]
-# 上游地址，一般无需改动
 upstream = "https://api.anthropic.com"
-# 真实的 Anthropic API key（持有人=管理员）
 api_key = "sk-ant-xxxxxxxxxxxxxxxxxxxx"
 
-# 账号通过 `cloudcode-hub gen-token <name>` 生成 token 与 hash，
-# 把 hash 粘贴到这里。明文 token 只在生成时显示一次，交给用户保存。
+# 订阅模式 agent。每个 agent 是一台跑过 `claude /login` 的机器上启动的
+# cloudcode-agent 服务。可以有多个 agent，账号通过 allowed_agents 绑定。
+# [[agents]]
+# name = "max-account-1"
+# url = "http://127.0.0.1:7100"
+# shared_secret = "ag_xxxxxxxxxxxxxxxxxxxx"
+
+# 账号：通过 `cloudcode-hub gen-token <name>` 生成 token 与 hash。
+# - allowed_providers: 旧 API key 模式访问权限。["anthropic"] 或 ["*"]。
+# - allowed_agents: 订阅模式可路由到的 agent 名字列表，按顺序匹配。
+# 路由策略：先按 allowed_agents 顺序选第一个存在的 agent；
+# 没有可用 agent 时回落到 [anthropic] API key（需 allowed_providers 含 "anthropic"）；
+# 两者都没有则 403。
 [[accounts]]
 name = "alice"
 token_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
 allowed_providers = ["anthropic"]
+allowed_agents = []
 
 # [[accounts]]
 # name = "bob"
 # token_hash = "$argon2id$..."
-# allowed_providers = ["*"]
+# allowed_providers = []
+# allowed_agents = ["max-account-1"]

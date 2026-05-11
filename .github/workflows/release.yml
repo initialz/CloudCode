@@ -63,12 +63,13 @@ jobs:
           set -euo pipefail
           NAME="cloudcode-${TAG}-${SUFFIX}"
           mkdir -p "dist/${NAME}"
-          cp "target/${TARGET}/release/cloudcode-hub" "dist/${NAME}/"
-          cp "target/${TARGET}/release/cloudcode" "dist/${NAME}/"
-          cp hub.example.toml "dist/${NAME}/"
+          cp "target/${TARGET}/release/cloudcode-hub"   "dist/${NAME}/"
+          cp "target/${TARGET}/release/cloudcode-agent" "dist/${NAME}/"
+          cp "target/${TARGET}/release/cloudcode"       "dist/${NAME}/"
+          cp hub.example.toml agent.example.toml "dist/${NAME}/"
           tar -czf "${NAME}.tar.gz" -C dist "${NAME}"
-          (cd dist && sha256sum "${NAME}/cloudcode-hub" "${NAME}/cloudcode" > "../${NAME}.sha256" || \
-            shasum -a 256 "${NAME}/cloudcode-hub" "${NAME}/cloudcode" > "../${NAME}.sha256")
+          (cd dist && sha256sum "${NAME}/cloudcode-hub" "${NAME}/cloudcode-agent" "${NAME}/cloudcode" > "../${NAME}.sha256" || \
+            shasum -a 256 "${NAME}/cloudcode-hub" "${NAME}/cloudcode-agent" "${NAME}/cloudcode" > "../${NAME}.sha256")
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2

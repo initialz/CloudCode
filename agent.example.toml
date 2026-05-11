@@ -1,0 +1,20 @@
+# Cloudcode Agent 配置示例
+# 复制为 agent.toml 后填入真实值，启动：cloudcode-agent serve --config agent.toml
+
+[server]
+# 监听地址。如果 hub 和 agent 同机，可用 127.0.0.1。
+listen = "0.0.0.0:7100"
+
+[auth]
+# 由 `cloudcode-agent gen-secret` 生成。明文 secret 写入 hub 的 [[agents]].shared_secret，
+# 哈希写在这里。
+shared_secret_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
+
+[claude]
+# claude 工具 OAuth 凭据所在路径。建议用 sudo cp 把 ~/.claude/.credentials.json
+# 复制到本路径并 chown 给 cloudcode 用户、chmod 600。
+credentials_path = "/var/lib/cloudcode-agent/credentials.json"
+
+# 默认无需改动；除非你想替换上游或追加 beta flag。
+# upstream = "https://api.anthropic.com"
+# anthropic_beta = ["oauth-2025-04-20"]
