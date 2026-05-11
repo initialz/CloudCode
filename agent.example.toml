@@ -22,13 +22,24 @@ url = "wss://hub.example.com/v1/agent/ws"
 registration_token = "ag_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 # [claude] 段可整段省略 —— 默认就够：
-# - executable     = "claude"                          # PATH 查找
+# - executable     = "claude"                          # tmux 内启动的命令
 # - workspace_root = "~/cloudcode-agent/workspaces"    # 每个 workspace 一个目录
-# - extra_args     = []                                # 追加到每次 claude 调用末尾
-# Agent 每接到一个 user turn 都会 fork+exec `claude` 子进程，跨 turn 用
-# `--resume <session_id>` 串联对话历史。务必让 agent 跟 `claude /login` 在
-# 同一个系统账号下跑（claude 自己读 keychain / 文件凭据）。
+# - extra_args     = []                                # 追加到 claude 调用末尾
+# Agent 每开一个 session 就 `tmux new -A -s cloudcode-<workspace> -c <cwd> claude`。
+# tmux session 跨断连持久 —— client 关掉再开同 workspace 会 attach 回去。
+# 务必让 agent 跟 `claude /login` 在同一个系统账号下跑。
 # [claude]
 # executable     = "claude"
 # workspace_root = "~/cloudcode-agent/workspaces"
 # extra_args     = []
+
+# [tmux] 段可省略 —— 默认 PATH 查找 `tmux`：
+# [tmux]
+# executable = "tmux"
+
+# [recording] 段可省略 —— 每个 session 自动 tee 一份 asciinema cast 到
+# ~/.local/state/cloudcode/agent/recordings/<workspace>/<session_id>.cast，
+# 只录输出，不录键盘。回放：asciinema play <file>。
+# [recording]
+# dir       = "~/.local/state/cloudcode/agent/recordings"
+# keep_days = 0     # 0 = 永久保留（MVP 暂不做自动 GC）

@@ -149,7 +149,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         let _ = send_client(
             &mut sink,
             &HubToClient::Rejected {
-                reason: format!("workspace '{}' is busy on agent '{}'", workspace, agent_name),
+                reason: format!(
+                    "workspace '{}' is busy on agent '{}'",
+                    workspace, agent_name
+                ),
             },
         )
         .await;
@@ -228,6 +231,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     }
 
     let mut current_workspace = workspace.clone();
+    let mut last_cols = cols;
+    let mut last_rows = rows;
 
     // ---- Main multiplex loop ----
     loop {
@@ -245,7 +250,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         };
                         if !handle_client_frame(
                             &state, &conn, &agent_name, session_id,
-                            &mut current_workspace, frame, &mut sink,
+                            &mut current_workspace, &mut last_cols, &mut last_rows,
+                            frame, &mut sink,
                         ).await {
                             break;
                         }
@@ -283,12 +289,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let _ = sink.close().await;
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_client_frame<S>(
     state: &Arc<AppState>,
     conn: &Arc<AgentConn>,
     agent_name: &str,
     session_id: Uuid,
     current_workspace: &mut String,
+    last_cols: &mut u16,
+    last_rows: &mut u16,
     frame: ClientToHub,
     sink: &mut S,
 ) -> bool
@@ -297,6 +306,8 @@ where
 {
     match frame {
         ClientToHub::Resize { cols, rows } => {
+            *last_cols = cols;
+            *last_rows = rows;
             let _ = conn
                 .send(ServerMsg::PtyResize {
                     session_id,
@@ -327,14 +338,15 @@ where
                 .await;
                 return true;
             }
-            // Tell agent to close current PTY + open a new one.
-            let _ = conn.send(ServerMsg::PtyClose { session_id }).await;
+            // Reusing the same session_id signals "swap workspace in place"
+            // to the agent (it tears down the old PTY without sending a
+            // PtyClosed and re-opens against the new tmux session).
             if conn
                 .send(ServerMsg::PtyOpen {
                     session_id,
                     workspace: workspace.clone(),
-                    cols: 0,
-                    rows: 0,
+                    cols: *last_cols,
+                    rows: *last_rows,
                 })
                 .await
                 .is_err()
@@ -503,9 +515,7 @@ where
     S: SinkExt<Message, Error = axum::Error> + Unpin,
 {
     match evt {
-        PtyEventOut::Output(bytes) => {
-            sink.send(Message::Binary(bytes.to_vec())).await.is_ok()
-        }
+        PtyEventOut::Output(bytes) => sink.send(Message::Binary(bytes.to_vec())).await.is_ok(),
         PtyEventOut::Frame(ClientMsg::PtyOpened { workspace, cwd, .. }) => {
             // Workspace-switch confirmation comes back here too (after the
             // initial open). Report it as WorkspaceSwitched if the workspace
@@ -515,15 +525,9 @@ where
                 // we recorded. Sync up just in case.
                 *current_workspace = workspace.clone();
             }
-            send_client(
-                sink,
-                &HubToClient::WorkspaceSwitched {
-                    workspace,
-                    cwd,
-                },
-            )
-            .await
-            .is_ok()
+            send_client(sink, &HubToClient::WorkspaceSwitched { workspace, cwd })
+                .await
+                .is_ok()
         }
         PtyEventOut::Frame(ClientMsg::PtyClosed { reason, .. }) => {
             let _ = send_client(sink, &HubToClient::SessionClosed { reason }).await;
@@ -546,11 +550,10 @@ async fn cleanup(
     workspace: &str,
 ) {
     conn.unregister_session(session_id);
-    state
-        .workspaces
-        .remove_if(&(agent_name.to_string(), workspace.to_string()), |_, sid| {
-            *sid == session_id
-        });
+    state.workspaces.remove_if(
+        &(agent_name.to_string(), workspace.to_string()),
+        |_, sid| *sid == session_id,
+    );
 }
 
 fn claim_workspace(

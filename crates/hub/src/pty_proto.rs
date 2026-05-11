@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
+#[allow(dead_code)]
 pub const PTY_PROTOCOL_VERSION: &str = "1";
 
 #[derive(Debug, Serialize, Deserialize)]

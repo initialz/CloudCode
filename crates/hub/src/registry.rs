@@ -139,11 +139,7 @@ impl AgentConn {
         self.sessions.remove(&session_id);
     }
 
-    pub fn register_workspace_request(
-        &self,
-        request_id: Uuid,
-        tx: oneshot::Sender<ClientMsg>,
-    ) {
+    pub fn register_workspace_request(&self, request_id: Uuid, tx: oneshot::Sender<ClientMsg>) {
         self.workspace_requests.insert(request_id, tx);
     }
 

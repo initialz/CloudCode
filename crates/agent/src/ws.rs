@@ -1,5 +1,7 @@
 use crate::pty::OutFrame;
-use crate::tunnel::{unpack_pty_frame, ClientMsg, RejectReason, ServerMsg, PROTOCOL_VERSION, TAG_PTY_INPUT};
+use crate::tunnel::{
+    unpack_pty_frame, ClientMsg, RejectReason, ServerMsg, PROTOCOL_VERSION, TAG_PTY_INPUT,
+};
 use crate::AppState;
 use anyhow::anyhow;
 use futures::{SinkExt, StreamExt};
@@ -22,7 +24,9 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             Err(RunError::Fatal(reason)) => {
-                return Err(anyhow!("hub rejected agent ({reason}); fix config and restart"));
+                return Err(anyhow!(
+                    "hub rejected agent ({reason}); fix config and restart"
+                ));
             }
             Err(RunError::Transient(e)) => {
                 let delay = backoff.next();

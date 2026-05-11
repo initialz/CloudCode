@@ -187,26 +187,33 @@ token   = "cc_PASTE_TOKEN_HERE"
 async fn run_chat(agent_flag: Option<String>, workspace: String) -> Result<()> {
     let cfg = load_config()?;
 
-    let chosen_agent = agent_flag.or_else(read_last_agent);
-    let wire = wire::connect(&cfg.hub_url, &cfg.token).await?;
+    let mut chosen_agent = agent_flag.or_else(read_last_agent);
+    let chosen_workspace = workspace;
 
-    // Initial terminal size for the remote PTY.
-    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    loop {
+        let wire = wire::connect(&cfg.hub_url, &cfg.token).await?;
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
-    wire.out_tx
-        .send(wire::OutFrame::Text(proto::ClientToHub::OpenSession {
-            agent: chosen_agent.clone(),
-            workspace: workspace.clone(),
-            cols,
-            rows,
-        }))
-        .await
-        .context("hub send")?;
+        wire.out_tx
+            .send(wire::OutFrame::Text(proto::ClientToHub::OpenSession {
+                agent: chosen_agent.clone(),
+                workspace: chosen_workspace.clone(),
+                cols,
+                rows,
+            }))
+            .await
+            .context("hub send")?;
 
-    let app = relay::App { wire };
-    let result = relay::run(app).await;
-    if let Some(name) = &chosen_agent {
-        write_last_agent(name);
+        let app = relay::App { wire };
+        let outcome = relay::run(app).await?;
+        if let Some(name) = &outcome.last_agent {
+            write_last_agent(name);
+        }
+        match outcome.next {
+            relay::NextAction::Quit => return Ok(()),
+            relay::NextAction::Reconnect { agent } => {
+                chosen_agent = agent;
+            }
+        }
     }
-    result
 }

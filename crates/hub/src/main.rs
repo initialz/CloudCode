@@ -187,10 +187,7 @@ fn gen_token(name: &str, config_path: &Path) -> anyhow::Result<()> {
 
 fn confirm_overwrite(name: &str) -> anyhow::Result<bool> {
     use std::io::{BufRead, IsTerminal, Write};
-    eprint!(
-        "account '{}' already exists. Overwrite token? [y/N] ",
-        name
-    );
+    eprint!("account '{}' already exists. Overwrite token? [y/N] ", name);
     std::io::stderr().flush().ok();
     if !std::io::stdin().is_terminal() {
         return Err(anyhow!(

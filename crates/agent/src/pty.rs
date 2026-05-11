@@ -31,11 +31,7 @@ struct PtyHandle {
 }
 
 impl PtyManager {
-    pub fn new(
-        claude: ClaudeConfig,
-        tmux: TmuxConfig,
-        recording: RecordingConfig,
-    ) -> Result<Self> {
+    pub fn new(claude: ClaudeConfig, tmux: TmuxConfig, recording: RecordingConfig) -> Result<Self> {
         // Fail fast if tmux is not installed.
         let tmux_path = which::which(&tmux.executable).with_context(|| {
             format!(
@@ -140,6 +136,11 @@ impl PtyManager {
                 .await;
             return;
         }
+        // Same session_id arriving again = "swap workspace in place". Drop the
+        // old handle silently (the reader thread will see read==0 and exit
+        // without emitting PtyClosed because we set a no-emit marker through
+        // the absence of the entry in `sessions`).
+        let _ = self.sessions.remove(&session_id);
         let cwd = self.workspace_root().join(&workspace);
         if let Err(e) = std::fs::create_dir_all(&cwd) {
             let _ = tx
@@ -200,7 +201,10 @@ impl PtyManager {
             }
         }
         // Make sure the inner process knows it's interactive.
-        cmd.env("TERM", std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()));
+        cmd.env(
+            "TERM",
+            std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
+        );
 
         let child = match pair.slave.spawn_command(cmd) {
             Ok(c) => c,
@@ -248,7 +252,7 @@ impl PtyManager {
             master,
             writer: Mutex::new(writer),
         });
-        self.sessions.insert(session_id, handle);
+        self.sessions.insert(session_id, handle.clone());
 
         let _ = tx
             .send(OutFrame::Text(ClientMsg::PtyOpened {
@@ -259,7 +263,8 @@ impl PtyManager {
             .await;
 
         // Recording: open the cast file (best effort).
-        let recorder = match Recorder::open(&self.recording.dir, &workspace, session_id, cols, rows) {
+        let recorder = match Recorder::open(&self.recording.dir, &workspace, session_id, cols, rows)
+        {
             Ok(r) => Some(r),
             Err(e) => {
                 tracing::warn!(session = %session_id, error = %e, "recorder open failed; continuing without record");
@@ -268,12 +273,17 @@ impl PtyManager {
         };
 
         // PTY reader thread: blocking I/O on the master, push 4 KiB chunks as
-        // binary frames; tee into the cast file.
+        // binary frames; tee into the cast file. `handle` goes into the thread
+        // so the reader can ptr_eq itself against `sessions[session_id]` and
+        // skip emitting PtyClosed on a workspace-swap (where the entry has
+        // already been replaced by a fresh handle).
         let sessions = self.sessions.clone();
         let tx_out = tx.clone();
         let _ = std::thread::Builder::new()
             .name(format!("pty-reader-{}", session_id))
-            .spawn(move || pty_reader_loop(reader, session_id, sessions, tx_out, recorder, child));
+            .spawn(move || {
+                pty_reader_loop(handle, reader, session_id, sessions, tx_out, recorder, child)
+            });
     }
 
     async fn close(&self, session_id: Uuid, tx: mpsc::Sender<OutFrame>) {
@@ -317,12 +327,7 @@ impl PtyManager {
             .await;
     }
 
-    async fn workspace_create(
-        &self,
-        request_id: Uuid,
-        name: String,
-        tx: mpsc::Sender<OutFrame>,
-    ) {
+    async fn workspace_create(&self, request_id: Uuid, name: String, tx: mpsc::Sender<OutFrame>) {
         let error = match validate_workspace_name(&name) {
             Err(e) => Some(e),
             Ok(()) => {
@@ -344,12 +349,7 @@ impl PtyManager {
             .await;
     }
 
-    async fn workspace_delete(
-        &self,
-        request_id: Uuid,
-        name: String,
-        tx: mpsc::Sender<OutFrame>,
-    ) {
+    async fn workspace_delete(&self, request_id: Uuid, name: String, tx: mpsc::Sender<OutFrame>) {
         let error = match validate_workspace_name(&name) {
             Err(e) => Some(e),
             Ok(()) => {
@@ -380,7 +380,9 @@ impl PtyManager {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn pty_reader_loop(
+    handle: Arc<PtyHandle>,
     mut reader: Box<dyn Read + Send>,
     session_id: Uuid,
     sessions: Arc<DashMap<Uuid, Arc<PtyHandle>>>,
@@ -408,13 +410,23 @@ fn pty_reader_loop(
             }
         }
     }
-    sessions.remove(&session_id);
-    // Drain the child status if it's already exited.
-    let _ = child.try_wait();
-    let _ = tx_out.blocking_send(OutFrame::Text(ClientMsg::PtyClosed {
-        session_id,
-        reason: Some("pty closed".into()),
-    }));
+    // Only emit PtyClosed if the session map still points at *us* — a
+    // workspace swap replaces the entry with a fresh handle, and we don't
+    // want the old reader to tell the hub the session ended.
+    let still_us = sessions
+        .get(&session_id)
+        .map(|e| Arc::ptr_eq(e.value(), &handle))
+        .unwrap_or(false);
+    if still_us {
+        sessions.remove(&session_id);
+        let _ = child.try_wait();
+        let _ = tx_out.blocking_send(OutFrame::Text(ClientMsg::PtyClosed {
+            session_id,
+            reason: Some("pty closed".into()),
+        }));
+    } else {
+        let _ = child.try_wait();
+    }
 }
 
 // ---------------------------------------------------------------------------

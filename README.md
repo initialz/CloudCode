@@ -12,9 +12,9 @@ If you use this software to violate any provider's Terms of Service or applicabl
 
 ## Components
 
-- **`cloudcode-hub`** — public-facing gateway: account-token auth, ACL, workspace mutex, JSONL audit log. Routes session traffic between clients and agents.
-- **`cloudcode-agent`** — long-running daemon on a host where you've `claude /login`'d. Dials out to the hub over WSS. When the hub pushes a user turn, the agent fork+execs `claude -p --output-format stream-json` in the selected workspace and streams the result back. Multi-turn conversations are stitched together with `--resume <session_id>`.
-- **`cloudcode`** — TUI client on your laptop. Run `cloudcode` to open an interactive session with claude on a remote agent; slash commands manage workspaces on the agent side.
+- **`cloudcode-hub`** — public-facing gateway: account-token auth, workspace mutex, JSONL audit log. Relays PTY traffic between clients and agents.
+- **`cloudcode-agent`** — long-running daemon on a host where you've `claude /login`'d. Requires `tmux`. Dials out to the hub over WSS. When the hub asks for a session, the agent spawns `tmux new -A -s cloudcode-<workspace> -c <cwd> claude` and pipes the PTY master to/from the hub. tmux session **persists across reconnects** — close `cloudcode` and reopen later, you're back where you left off.
+- **`cloudcode`** — relay client on your laptop. Puts your local terminal in raw mode and shovels bytes to/from the remote PTY, so you see the **native claude TUI** (status bar, todo board, diffs, permission prompts, claude's own `/clear`/`/login`/etc — everything). `Ctrl+\` enters cloudcode's own escape mode for workspace and agent switching.
 
 ## Architecture
 
@@ -76,7 +76,11 @@ cloudcode-hub daemon start --config ./hub.toml   # background
 
 ### Agent (one-time setup)
 
-Run the agent as the same OS user that did `claude /login`. The agent never reads OAuth credentials itself; it just `fork+exec`s `claude`, and `claude` finds its own credentials (keychain on macOS, `~/.claude/.credentials.json` on Linux).
+**Prerequisites on the agent host:**
+- `tmux` installed (`brew install tmux` / `apt install tmux`)
+- `claude` installed and `claude /login` done as the same OS user that will run the agent
+
+The agent itself never reads OAuth credentials; it just runs `tmux ... claude` under the same user, and claude finds its own credentials (keychain on macOS, `~/.claude/.credentials.json` on Linux).
 
 ```bash
 cloudcode-agent --init                   # writes ./agent.toml template
@@ -99,7 +103,7 @@ hub_url = "https://your-hub-host"
 token   = "cc_xxx_from_admin"
 ```
 
-Run `cloudcode` — drops you into a TUI:
+Run `cloudcode` — your terminal becomes the remote claude:
 
 ```bash
 cloudcode                            # uses workspace "default"
@@ -107,34 +111,31 @@ cloudcode --workspace projA          # open straight into a named workspace
 cloudcode --agent peter-mbp          # pin a specific agent
 ```
 
-#### TUI keybindings
+Inside the session, **every keystroke goes to remote claude as-is** — claude's own slash commands (`/clear`, `/login`, …) work normally because they're claude's, not ours.
 
-| Key | Action |
-|---|---|
-| `Enter` | Send the typed message |
-| `Alt+Enter` | Insert newline |
-| `Ctrl+C` | Interrupt the running turn (sends SIGINT to claude); if no turn is active, quit |
-| `Ctrl+D` | Quit |
-| `PgUp` / `PgDn` | Scroll history |
+#### Cloudcode escape mode — `Ctrl+\`
 
-#### Slash commands (parsed locally, not sent to claude)
+To run a cloudcode command (workspace / agent switch, etc), hit `Ctrl+\`. The bottom row turns into a `cc> ` prompt; type a command and press Enter. `Esc` cancels.
 
 | Command | Effect |
 |---|---|
-| `/agent list` | Show all online agents (current one prefixed with `*`) |
-| `/agent use <name>` | Reconnect onto a different agent; the client persists this choice as the default for next time |
-| `/ws list` | Ask the agent to list workspace directories |
-| `/ws create <name>` | Create a new workspace dir on the agent |
-| `/ws use <name>` | Switch the current session to a different workspace; conversation starts fresh |
-| `/ws remove <name>` | Delete a workspace (refused if any session has it open) |
-| `/reset` | Drop the current conversation, stay in the same workspace |
-| `/status` | Show session info |
-| `/help` | List commands |
-| `/exit` / `/quit` | Close the session |
+| `a` or `a list` | Show online agents (current prefixed with `*`) |
+| `a use <name>` | Reconnect to a different agent; persisted as default for next time |
+| `w` or `w list` | List workspaces on the current agent |
+| `w use <name>` | Switch this session to a different workspace (tmux session swap) |
+| `w create <name>` | Create a new workspace dir |
+| `w rm <name>` | Delete a workspace (refused if a session has it open) |
+| `status` | Print current agent + workspace |
+| `help` | List commands |
+| `quit` / `q` / `exit` | Close cloudcode (tmux session keeps running on the agent) |
 
-Workspaces are named directories under `<workspace_root>` on the agent host (default `~/cloudcode-agent/workspaces/<name>`). A given workspace can be held by at most one session at a time across the whole fleet — the hub enforces this.
+Workspaces are named directories under `<workspace_root>` on the agent host (default `~/cloudcode-agent/workspaces/<name>`). Each workspace maps 1:1 to a tmux session named `cloudcode-<workspace>`. A given workspace can be held by **at most one cloudcode session at a time** — the hub enforces this. Closing cloudcode does **not** kill the tmux session; long-running claude tasks (think: background fixes, agentic loops) keep going, and reopening the same workspace re-attaches to the running claude.
 
-The last agent you connected to is remembered in `$XDG_STATE_HOME/cloudcode/last_agent` (default `~/.local/state/cloudcode/last_agent`); next time `cloudcode` runs without `--agent`, it prefers that name and falls back to "any online" if the previous choice is offline.
+The last agent you connected to is remembered in `$XDG_STATE_HOME/cloudcode/last_agent` (default `~/.local/state/cloudcode/last_agent`).
+
+#### Recording
+
+Every session is recorded to an asciinema cast file on the agent at `~/.local/state/cloudcode/agent/recordings/<workspace>/<session_id>.cast`. Replay with `asciinema play <file>` for audit / debugging. Output only; keystrokes are not recorded (avoids leaking pasted tokens).
 
 > Daemon-mode logs: `~/.local/state/cloudcode/{hub,agent}.log`. Lifecycle: `cloudcode-{hub,agent} daemon {status,stop,restart}`.
 
