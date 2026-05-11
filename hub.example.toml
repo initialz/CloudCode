@@ -1,0 +1,24 @@
+# Cloudcode Hub 配置示例
+# 复制为 hub.toml 后填入真实值，启动：cloudcode-hub serve --config hub.toml
+
+[server]
+listen = "0.0.0.0:7000"
+audit_log = "./audit.jsonl"
+
+[anthropic]
+# 上游地址，一般无需改动
+upstream = "https://api.anthropic.com"
+# 真实的 Anthropic API key（持有人=管理员）
+api_key = "sk-ant-xxxxxxxxxxxxxxxxxxxx"
+
+# 账号通过 `cloudcode-hub gen-token <name>` 生成 token 与 hash，
+# 把 hash 粘贴到这里。明文 token 只在生成时显示一次，交给用户保存。
+[[accounts]]
+name = "alice"
+token_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
+allowed_providers = ["anthropic"]
+
+# [[accounts]]
+# name = "bob"
+# token_hash = "$argon2id$..."
+# allowed_providers = ["*"]

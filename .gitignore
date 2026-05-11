@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# 本地配置（含密钥），不要提交
+hub.toml
+config.toml
+audit.jsonl
