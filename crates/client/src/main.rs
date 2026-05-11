@@ -57,6 +57,10 @@ fn load_config() -> Result<ClientConfig> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Pick rustls' ring CryptoProvider before any TLS code runs; rustls 0.23
+    // requires this when crate features can't disambiguate a default.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
     let result = match cli.cmd {
         None => run_chat(cli.agent, cli.workspace).await,

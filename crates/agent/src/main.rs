@@ -51,6 +51,10 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Pick rustls' ring CryptoProvider before any TLS code runs; rustls 0.23
+    // requires this when crate features can't disambiguate a default.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

@@ -27,6 +27,7 @@ gethostname.workspace = true
 whoami.workspace = true
 uuid.workspace = true
 dashmap.workspace = true
+rustls.workspace = true
 cloudcode-daemon = { path = "../daemon" }
 
 [target.'cfg(unix)'.dependencies]

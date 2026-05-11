@@ -38,3 +38,4 @@ libc = "0.2"
 ratatui = "0.28"
 crossterm = "0.28"
 unicode-width = "0.1"
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
