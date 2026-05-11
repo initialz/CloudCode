@@ -1,68 +1,76 @@
 # cloudcode
 
-> 自托管 LLM 网关：集中管理凭据，团队透明使用 Claude Code，每次请求留审计。
+> Self-hosted LLM gateway: centralise credentials, let your team use Claude Code transparently, and keep a per-request audit trail.
 
-## 组件
+## Intended use & disclaimer
 
-- **`cloudcode-hub`** —— 中转层，做账号鉴权、ACL、JSONL 审计；公网部署
-- **`cloudcode-agent`** —— 出站连 hub 的 WS 隧道端点，按订阅凭据转发请求；与日常 `claude /login` 同一系统账号下运行即可
-- **`cloudcode`** —— 客户端 launcher，开发者本地启动 claude
+**This project is only for remotely controlling _your own_ coding CLI** — typically so you can run `claude` from a laptop while the OAuth credentials stay on a different machine (a workstation, a server, a sandbox) that you also own and logged into with `claude /login`.
 
-## 架构
+**Do not share a subscription account across multiple people.** Subscription plans (e.g. Claude Max / Pro) are issued per individual under the provider's Terms of Service. Running one agent that proxies multiple humans' traffic onto a single subscription violates those terms. The recommended topology is **one user → one subscription → one agent**.
 
-![cloudcode 架构](docs/architecture.svg)
+If you use this software to violate any provider's Terms of Service or applicable laws, **you are solely responsible for the consequences**. The authors and contributors of cloudcode provide this software as-is, with no warranty, and accept no liability for your usage.
 
-源文件见 [`docs/architecture.drawio`](docs/architecture.drawio)（[diagrams.net](https://app.diagrams.net) 可编辑）。
+## Components
 
-## 安装
+- **`cloudcode-hub`** — gateway: account-token auth, ACL, JSONL audit log; runs on a publicly reachable host.
+- **`cloudcode-agent`** — outbound WS tunnel endpoint that forwards requests using the locally stored claude OAuth credentials; run it as the same OS user that did `claude /login`.
+- **`cloudcode`** — client launcher that starts `claude` on a developer's machine and routes its traffic through the hub.
 
-Hub（公网机器）：
+## Architecture
+
+![cloudcode architecture](docs/architecture.svg)
+
+Source: [`docs/architecture.drawio`](docs/architecture.drawio) (open with [diagrams.net](https://app.diagrams.net)).
+
+## Install
+
+Hub (public host):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sh -s -- hub
 ```
 
-Agent（任意已 `claude /login` 的机器，NAT 后也可以）：
+Agent (any machine where you've run `claude /login`; behind NAT is fine):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sh -s -- agent
 ```
 
-Client（开发者本机）：
+Client (developer workstation):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sh -s -- client
 ```
 
-支持 Linux x86_64/aarch64、macOS aarch64。
+Supported: Linux x86_64 / aarch64, macOS aarch64.
 
-## 使用
+## Usage
 
-### Hub（管理员）
-
-```bash
-cloudcode-hub gen-token alice      # 为每个用户生成 token
-$EDITOR ./hub.toml                 # 加 [[accounts]] 和 [[agents]]
-cloudcode-hub serve --config ./hub.toml          # 前台运行，日志打到 stdout
-# 或
-cloudcode-hub daemon start --config ./hub.toml   # 后台运行
-```
-
-### Agent（一次性设置）
-
-跟你日常 `claude /login` 同一个系统账号下运行就好，agent 会自己读 `~/.claude/.credentials.json`，不用复制文件或改权限。
+### Hub (administrator)
 
 ```bash
-cloudcode-agent gen-secret         # 一次性生成 shared_secret + 哈希
-$EDITOR ./agent.toml               # 粘 [hub].url + [auth].shared_secret
-cloudcode-agent serve --config ./agent.toml          # 前台运行，日志打到 stdout
-# 或
-cloudcode-agent daemon start --config ./agent.toml   # 后台运行
+cloudcode-hub gen-token alice                    # one token per user
+$EDITOR ./hub.toml                               # paste [[accounts]] and [[agents]] blocks
+cloudcode-hub serve --config ./hub.toml          # foreground; logs to stdout
+# or
+cloudcode-hub daemon start --config ./hub.toml   # background
 ```
 
-`gen-secret` 的输出里还包含 `[[agents]]` 段落 —— 把那段交给 hub 管理员加到 `hub.toml`。
+### Agent (one-time setup)
 
-### Client（开发者）
+Run the agent as the same OS user that did `claude /login`. The agent will read `~/.claude/.credentials.json` automatically — no file copying or `chmod` required.
+
+```bash
+cloudcode-agent gen-secret                          # one-shot: prints both halves
+$EDITOR ./agent.toml                                # paste [hub].url and [auth].shared_secret
+cloudcode-agent serve --config ./agent.toml         # foreground; logs to stdout
+# or
+cloudcode-agent daemon start --config ./agent.toml  # background
+```
+
+The `gen-secret` output also includes an `[[agents]]` block — hand that block to your hub admin to paste into `hub.toml`.
+
+### Client (developer)
 
 ```toml
 # ~/.config/cloudcode/config.toml
@@ -75,16 +83,14 @@ cd ~/code/myproj
 cloudcode run claude
 ```
 
-体验和原生 `claude` 一致——所有 API 调用经 hub 鉴权、路由、留审计。
+The experience is identical to running `claude` directly — every API call flows through the hub for auth, routing, and audit.
 
-> Daemon 模式日志写到 `~/.local/state/cloudcode/{hub,agent}.log`，用 `cloudcode-hub|cloudcode-agent daemon {status,stop,restart}` 管理生命周期。
+> Daemon-mode logs land in `~/.local/state/cloudcode/{hub,agent}.log`. Lifecycle: `cloudcode-hub|cloudcode-agent daemon {status,stop,restart}`.
 
-## 配置参考
+## Configuration reference
 
 [`hub.example.toml`](hub.example.toml) · [`agent.example.toml`](agent.example.toml)
 
-> ⚠️ 共享订阅给多人使用违反 Anthropic ToS，建议每位用户绑自己的订阅（一人一个 agent）。
-
 ## License
 
-MIT
+MIT. The software is provided "as is", without warranty of any kind. The authors are not liable for any use that violates third-party terms of service.
