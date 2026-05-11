@@ -387,6 +387,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "toml_edit",
  "tower",
  "tower-http",
  "tracing",

@@ -118,38 +118,89 @@ fn gen_token(name: &str, config_path: &Path) -> anyhow::Result<()> {
             config_path.display()
         ));
     }
-    let existing = Config::load(config_path)
-        .with_context(|| format!("loading {}", config_path.display()))?;
-    if existing.accounts.iter().any(|a| a.name == name) {
-        return Err(anyhow!(
-            "account '{}' already exists in {}; remove that [[accounts]] block first if you really want to rotate",
-            name,
-            config_path.display()
-        ));
-    }
+
+    let original = std::fs::read_to_string(config_path)
+        .with_context(|| format!("reading {}", config_path.display()))?;
+    let mut doc: toml_edit::DocumentMut = original
+        .parse()
+        .with_context(|| format!("parsing {}", config_path.display()))?;
+
+    let account_exists = doc
+        .get("accounts")
+        .and_then(|v| v.as_array_of_tables())
+        .map(|arr| {
+            arr.iter()
+                .any(|t| t.get("name").and_then(|v| v.as_str()) == Some(name))
+        })
+        .unwrap_or(false);
+
+    let action = if account_exists {
+        if !confirm_overwrite(name)? {
+            println!("aborted; existing token for '{}' kept.", name);
+            return Ok(());
+        }
+        "rotated"
+    } else {
+        "added"
+    };
 
     let token = auth::generate_token();
     let hash = auth::hash_token(&token)?;
 
-    let block = format!(
-        "\n[[accounts]]\nname = \"{}\"\ntoken_hash = \"{}\"\n",
-        name, hash
-    );
+    if account_exists {
+        // Rotate in place — keep the user's surrounding comments / order.
+        let arr = doc
+            .get_mut("accounts")
+            .and_then(|v| v.as_array_of_tables_mut())
+            .expect("checked above");
+        for table in arr.iter_mut() {
+            if table.get("name").and_then(|v| v.as_str()) == Some(name) {
+                table["token_hash"] = toml_edit::value(hash.clone());
+                break;
+            }
+        }
+    } else {
+        // Append a new [[accounts]] entry.
+        let arr = doc
+            .entry("accounts")
+            .or_insert_with(|| toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()))
+            .as_array_of_tables_mut()
+            .ok_or_else(|| anyhow!("`accounts` exists but is not an array of tables"))?;
+        let mut table = toml_edit::Table::new();
+        table["name"] = toml_edit::value(name);
+        table["token_hash"] = toml_edit::value(hash.clone());
+        arr.push(table);
+    }
 
-    let mut f = std::fs::OpenOptions::new()
-        .append(true)
-        .open(config_path)
-        .with_context(|| format!("opening {} for append", config_path.display()))?;
-    std::io::Write::write_all(&mut f, block.as_bytes())
-        .with_context(|| format!("appending to {}", config_path.display()))?;
+    let new_contents = doc.to_string();
+    std::fs::write(config_path, new_contents)
+        .with_context(|| format!("writing {}", config_path.display()))?;
 
     println!("# Account: {}", name);
     println!("# Token (give to user, will not be shown again):");
     println!("{}", token);
     println!();
-    println!("# Appended [[accounts]] block to {}.", config_path.display());
-    println!("# Restart the hub for the new account to take effect.");
+    println!("# {} account in {}.", action, config_path.display());
+    println!("# Restart the hub for the change to take effect.");
     Ok(())
+}
+
+fn confirm_overwrite(name: &str) -> anyhow::Result<bool> {
+    use std::io::{BufRead, IsTerminal, Write};
+    eprint!(
+        "account '{}' already exists. Overwrite token? [y/N] ",
+        name
+    );
+    std::io::stderr().flush().ok();
+    if !std::io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "stdin is not a tty; refusing to clobber. Re-run from an interactive shell, \
+             or delete the existing [[accounts]] block manually."
+        ));
+    }
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(matches!(line.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
 /// Write a fresh hub.toml. Refuses to overwrite an existing file.
