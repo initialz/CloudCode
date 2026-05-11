@@ -37,6 +37,11 @@ enum Cmd {
         /// 账号名称
         name: String,
     },
+    /// 后台管理 hub daemon（start/stop/restart/status）
+    Daemon {
+        #[command(subcommand)]
+        cmd: cloudcode_daemon::DaemonCmd,
+    },
 }
 
 #[tokio::main]
@@ -51,6 +56,7 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Cmd::Serve { config } => serve(config).await,
         Cmd::GenToken { name } => gen_token(&name),
+        Cmd::Daemon { cmd } => cloudcode_daemon::run("hub", "hub.toml", cmd),
     }
 }
 

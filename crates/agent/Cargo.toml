@@ -28,3 +28,4 @@ argon2.workspace = true
 rand.workspace = true
 chrono.workspace = true
 dirs.workspace = true
+cloudcode-daemon = { path = "../daemon" }

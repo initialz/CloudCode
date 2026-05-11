@@ -38,6 +38,11 @@ enum Cmd {
     },
     /// Generate a new shared secret + hash for hub<->agent auth.
     GenSecret,
+    /// 后台管理 agent daemon（start/stop/restart/status）
+    Daemon {
+        #[command(subcommand)]
+        cmd: cloudcode_daemon::DaemonCmd,
+    },
 }
 
 #[tokio::main]
@@ -52,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Cmd::Serve { config } => serve(config).await,
         Cmd::GenSecret => gen_secret(),
+        Cmd::Daemon { cmd } => cloudcode_daemon::run("agent", "agent.toml", cmd),
     }
 }
 

@@ -297,6 +297,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "cloudcode-daemon",
  "dirs",
  "futures",
  "rand 0.8.6",
@@ -326,6 +327,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cloudcode-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "dirs",
+ "libc",
+]
+
+[[package]]
 name = "cloudcode-hub"
 version = "0.1.0"
 dependencies = [
@@ -335,6 +346,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "cloudcode-daemon",
  "futures",
  "rand 0.8.6",
  "reqwest",

@@ -3,13 +3,12 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sh -s -- hub
+#   curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sh -s -- agent
 #   curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sh -s -- client
 #
 # Flags:
 #   --version vX.Y.Z   Pin to specific release (default: latest)
 #   --prefix DIR       Install root (default: /usr/local)
-#   --no-service       Hub mode: skip systemd unit
-#   --service          Hub mode: install systemd unit even if already present
 set -euo pipefail
 
 REPO="initialz/cloudcode"
@@ -18,17 +17,14 @@ shift || true
 
 VERSION="latest"
 PREFIX="/usr/local"
-INSTALL_SERVICE="auto"   # auto: yes for hub on linux, no otherwise
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) VERSION="$2"; shift ;;
     --prefix)  PREFIX="$2"; shift ;;
-    --service) INSTALL_SERVICE=1 ;;
-    --no-service) INSTALL_SERVICE=0 ;;
     -h|--help)
       sed -n '2,12p' "$0" 2>/dev/null || cat <<'EOF'
-Usage: install.sh {hub|client} [--version vX.Y.Z] [--prefix DIR] [--service|--no-service]
+Usage: install.sh {hub|agent|client} [--version vX.Y.Z] [--prefix DIR]
 EOF
       exit 0
       ;;
@@ -99,124 +95,10 @@ install_bin() {
   $SUDO install -m 755 "$SRC/$name" "$BIN_DIR/$name"
 }
 
-# ---- common setup shared by hub & agent ----
-ensure_cloudcode_user() {
-  if ! id cloudcode >/dev/null 2>&1; then
-    echo "Creating system user 'cloudcode'..."
-    $SUDO useradd --system --no-create-home --shell /usr/sbin/nologin cloudcode
-  fi
-  $SUDO mkdir -p /etc/cloudcode /var/log/cloudcode
-}
-
-systemd_preflight() {
-  if [ "$OS" != "Linux" ]; then
-    echo "systemd unit only supported on Linux; skipping" >&2
-    return 1
-  fi
-  if ! command -v systemctl >/dev/null 2>&1; then
-    echo "systemctl not found; skipping service install" >&2
-    return 1
-  fi
-  return 0
-}
-
-# ---- hub-specific systemd install ----
-install_hub_systemd_unit() {
-  systemd_preflight || return 0
-  ensure_cloudcode_user
-  $SUDO mkdir -p /var/lib/cloudcode
-  $SUDO chown cloudcode:cloudcode /var/log/cloudcode /var/lib/cloudcode
-
-  if [ ! -f /etc/cloudcode/hub.example.toml ]; then
-    $SUDO install -m 644 "$SRC/hub.example.toml" /etc/cloudcode/hub.example.toml
-  fi
-
-  UNIT=/etc/systemd/system/cloudcode-hub.service
-  echo "Writing $UNIT"
-  $SUDO tee "$UNIT" >/dev/null <<EOF
-[Unit]
-Description=Cloudcode Hub (LLM API gateway)
-Documentation=https://github.com/${REPO}
-After=network.target
-
-[Service]
-Type=simple
-User=cloudcode
-Group=cloudcode
-WorkingDirectory=/var/lib/cloudcode
-ExecStart=${BIN_DIR}/cloudcode-hub serve --config /etc/cloudcode/hub.toml
-Restart=on-failure
-RestartSec=5s
-StandardOutput=journal
-StandardError=journal
-
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/log/cloudcode /var/lib/cloudcode
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  $SUDO systemctl daemon-reload
-}
-
-# ---- agent-specific systemd install ----
-install_agent_systemd_unit() {
-  systemd_preflight || return 0
-  ensure_cloudcode_user
-  $SUDO mkdir -p /var/lib/cloudcode-agent
-  $SUDO chown cloudcode:cloudcode /var/lib/cloudcode-agent
-  $SUDO chmod 700 /var/lib/cloudcode-agent
-
-  if [ ! -f /etc/cloudcode/agent.example.toml ]; then
-    $SUDO install -m 644 "$SRC/agent.example.toml" /etc/cloudcode/agent.example.toml
-  fi
-
-  UNIT=/etc/systemd/system/cloudcode-agent.service
-  echo "Writing $UNIT"
-  $SUDO tee "$UNIT" >/dev/null <<EOF
-[Unit]
-Description=Cloudcode Agent (claude subscription forwarder)
-Documentation=https://github.com/${REPO}
-After=network.target
-
-[Service]
-Type=simple
-User=cloudcode
-Group=cloudcode
-WorkingDirectory=/var/lib/cloudcode-agent
-ExecStart=${BIN_DIR}/cloudcode-agent serve --config /etc/cloudcode/agent.toml
-Restart=on-failure
-RestartSec=5s
-StandardOutput=journal
-StandardError=journal
-
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/log/cloudcode /var/lib/cloudcode-agent
-PrivateTmp=true
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  $SUDO systemctl daemon-reload
-}
-
 # ---- run ----
 case "$COMPONENT" in
   hub)
     install_bin cloudcode-hub
-    install_bin cloudcode    # bundled, harmless
-
-    DO_SERVICE=0
-    if [ "$INSTALL_SERVICE" = "auto" ] && [ "$OS" = "Linux" ]; then DO_SERVICE=1; fi
-    if [ "$INSTALL_SERVICE" = "1" ]; then DO_SERVICE=1; fi
-    if [ "$INSTALL_SERVICE" = "0" ]; then DO_SERVICE=0; fi
-
-    if [ "$DO_SERVICE" = "1" ]; then install_hub_systemd_unit; fi
 
     cat <<EOF
 
@@ -226,29 +108,24 @@ Next steps:
   1) Generate a token for a user:
        cloudcode-hub gen-token alice
 
-  2) Create /etc/cloudcode/hub.toml from the example, paste your
-     Anthropic API key and the token hash from step 1:
-       sudo cp /etc/cloudcode/hub.example.toml /etc/cloudcode/hub.toml
-       sudo \$EDITOR /etc/cloudcode/hub.toml
-       sudo chown cloudcode:cloudcode /etc/cloudcode/hub.toml
-       sudo chmod 640 /etc/cloudcode/hub.toml
+  2) Create hub.toml from the example, paste your Anthropic API key
+     and the token hash from step 1:
+       cp $SRC/hub.example.toml ./hub.toml
+       \$EDITOR ./hub.toml
 
-  3) Start the service:
-       sudo systemctl enable --now cloudcode-hub
-       systemctl status cloudcode-hub
-       journalctl -u cloudcode-hub -f
+  3) Start the hub daemon (logs → ~/.local/state/cloudcode/hub.log):
+       cloudcode-hub daemon start --config ./hub.toml
+       cloudcode-hub daemon status
+       tail -f ~/.local/state/cloudcode/hub.log
+
+     Other lifecycle commands:
+       cloudcode-hub daemon stop
+       cloudcode-hub daemon restart --config ./hub.toml
 EOF
     ;;
 
   agent)
     install_bin cloudcode-agent
-
-    DO_SERVICE=0
-    if [ "$INSTALL_SERVICE" = "auto" ] && [ "$OS" = "Linux" ]; then DO_SERVICE=1; fi
-    if [ "$INSTALL_SERVICE" = "1" ]; then DO_SERVICE=1; fi
-    if [ "$INSTALL_SERVICE" = "0" ]; then DO_SERVICE=0; fi
-
-    if [ "$DO_SERVICE" = "1" ]; then install_agent_systemd_unit; fi
 
     cat <<EOF
 
@@ -263,23 +140,20 @@ Next steps:
        claude            # then run /login inside, complete OAuth
        # the credentials end up in ~/.claude/.credentials.json
 
-  3) Copy the credentials onto this server:
-       scp ~/.claude/.credentials.json THIS-SERVER:/tmp/cc-credentials.json
-       sudo install -o cloudcode -g cloudcode -m 600 \\
-            /tmp/cc-credentials.json /var/lib/cloudcode-agent/credentials.json
-       sudo rm /tmp/cc-credentials.json
+  3) Copy the credentials onto this server (path is up to you, just
+     point agent.toml's [claude].credentials_path at it):
+       scp ~/.claude/.credentials.json THIS-SERVER:~/.claude-credentials.json
+       chmod 600 ~/.claude-credentials.json
 
-  4) Create /etc/cloudcode/agent.toml from the example, paste the
-     shared_secret_hash from step 1, leave credentials_path at the
-     default /var/lib/cloudcode-agent/credentials.json:
-       sudo cp /etc/cloudcode/agent.example.toml /etc/cloudcode/agent.toml
-       sudo \$EDITOR /etc/cloudcode/agent.toml
-       sudo chown cloudcode:cloudcode /etc/cloudcode/agent.toml
-       sudo chmod 640 /etc/cloudcode/agent.toml
+  4) Create agent.toml from the example, paste the shared_secret_hash
+     from step 1 and the credentials_path from step 3:
+       cp $SRC/agent.example.toml ./agent.toml
+       \$EDITOR ./agent.toml
 
-  5) Start the service:
-       sudo systemctl enable --now cloudcode-agent
-       journalctl -u cloudcode-agent -f
+  5) Start the agent daemon (logs → ~/.local/state/cloudcode/agent.log):
+       cloudcode-agent daemon start --config ./agent.toml
+       cloudcode-agent daemon status
+       tail -f ~/.local/state/cloudcode/agent.log
 
   6) On the hub host, add this agent to hub.toml:
        [[agents]]

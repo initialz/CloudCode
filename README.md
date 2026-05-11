@@ -34,20 +34,21 @@ curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh 
 在一台已 `claude /login` 过的机器：
 
 ```bash
-cloudcode-agent gen-secret              # 生成 hub<->agent 共享密钥
-sudo install -o cloudcode -g cloudcode -m 600 \
-     ~/.claude/.credentials.json /var/lib/cloudcode-agent/credentials.json
-sudo $EDITOR /etc/cloudcode/agent.toml  # 粘 shared_secret_hash
-sudo systemctl enable --now cloudcode-agent
+cloudcode-agent gen-secret               # 生成 hub<->agent 共享密钥
+chmod 600 ~/.claude/.credentials.json    # 让 agent 能读
+$EDITOR ./agent.toml                     # 粘 shared_secret_hash + credentials_path
+cloudcode-agent daemon start --config ./agent.toml
 ```
 
 ### Hub（管理员）
 
 ```bash
-cloudcode-hub gen-token alice           # 为每个用户生成 token
-sudo $EDITOR /etc/cloudcode/hub.toml    # 加 [[agents]] 与 [[accounts]]
-sudo systemctl enable --now cloudcode-hub
+cloudcode-hub gen-token alice            # 为每个用户生成 token
+$EDITOR ./hub.toml                       # 加 [[agents]] 与 [[accounts]]
+cloudcode-hub daemon start --config ./hub.toml
 ```
+
+> Daemon 日志在 `~/.local/state/cloudcode/{hub,agent}.log`，`cloudcode-hub|cloudcode-agent daemon {status,stop,restart}` 管理生命周期。
 
 ### Client（开发者）
 
