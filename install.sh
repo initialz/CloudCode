@@ -83,12 +83,14 @@ curl -fsSL "$URL" -o "$TMP/asset.tar.gz" || {
 tar -xzf "$TMP/asset.tar.gz" -C "$TMP"
 SRC="$TMP/${ASSET}"
 
-# ---- pick sudo if needed ----
+# ---- pick sudo if needed (check writability of closest existing ancestor) ----
 BIN_DIR="${PREFIX}/bin"
 SUDO=""
-if [ ! -d "$BIN_DIR" ] || [ ! -w "$BIN_DIR" ]; then
-  if [ "$(id -u)" != "0" ]; then SUDO="sudo"; fi
-fi
+PROBE="$BIN_DIR"
+while [ ! -d "$PROBE" ] && [ "$PROBE" != "/" ] && [ "$PROBE" != "." ]; do
+  PROBE="$(dirname "$PROBE")"
+done
+if [ ! -w "$PROBE" ] && [ "$(id -u)" != "0" ]; then SUDO="sudo"; fi
 $SUDO mkdir -p "$BIN_DIR"
 
 install_bin() {
