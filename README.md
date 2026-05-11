@@ -24,6 +24,8 @@ Source: [`docs/architecture.drawio`](docs/architecture.drawio) (open with [diagr
 
 ## Install
 
+### Option A — Prebuilt binary (recommended)
+
 Hub (public host):
 
 ```bash
@@ -44,11 +46,32 @@ curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh 
 
 Supported: Linux x86_64 / aarch64, macOS aarch64.
 
+### Option B — Build from source
+
+Requires a recent stable Rust toolchain (`rustup` recommended).
+
+```bash
+git clone https://github.com/initialz/cloudcode.git
+cd cloudcode
+cargo build --release --workspace
+
+# Pick whichever subset you need on this host:
+sudo install -m 0755 target/release/cloudcode-hub   /usr/local/bin/
+sudo install -m 0755 target/release/cloudcode-agent /usr/local/bin/
+sudo install -m 0755 target/release/cloudcode       /usr/local/bin/
+```
+
+Or just run the binaries directly out of `target/release/` without installing.
+
 ## Usage
 
 ### Hub (administrator)
 
 ```bash
+# One-time: write a fresh hub.toml in the current directory.
+# Refuses to overwrite if hub.toml already exists.
+cloudcode-hub --init                     # or: --init --config /custom/path.toml
+
 cloudcode-hub gen-token alice            # one token per user
 $EDITOR ./hub.toml                       # paste [[accounts]] and [[agents]] blocks
 cloudcode-hub --config ./hub.toml        # foreground; logs to stdout
@@ -61,10 +84,10 @@ cloudcode-hub daemon start --config ./hub.toml   # background
 Run the agent as the same OS user that did `claude /login`. The agent will read `~/.claude/.credentials.json` automatically — no file copying or `chmod` required.
 
 ```bash
-# One-time: write a fresh agent.toml with an auto-generated shared_secret,
-# and print an [[agents]] block to hand to your hub admin. Refuses to
-# overwrite if agent.toml already exists.
-cloudcode-agent --init --config ./agent.toml
+# One-time: write a fresh agent.toml in the current directory, with an
+# auto-generated shared_secret, and print an [[agents]] block to hand to
+# your hub admin. Refuses to overwrite if agent.toml already exists.
+cloudcode-agent --init                   # or: --init --config /custom/path.toml
 
 $EDITOR ./agent.toml                     # edit [hub].url
 
