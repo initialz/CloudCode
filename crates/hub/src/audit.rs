@@ -2,17 +2,18 @@ use chrono::SecondsFormat;
 use serde::Serialize;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
+#[derive(Clone)]
 pub struct AuditLog {
-    file: Mutex<std::fs::File>,
+    file: Arc<Mutex<std::fs::File>>,
 }
 
 impl AuditLog {
     pub fn open(path: &str) -> anyhow::Result<Self> {
         let f = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
-            file: Mutex::new(f),
+            file: Arc::new(Mutex::new(f)),
         })
     }
 
@@ -33,15 +34,15 @@ pub struct AuditEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub provider: Option<String>,
+    pub agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub backend: Option<String>,
+    pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub model: Option<String>,
+    pub workspace: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub stream: Option<bool>,
+    pub exit_code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }
@@ -56,11 +57,11 @@ impl AuditEvent {
             ts: Self::now_ts(),
             event,
             account: None,
-            provider: None,
-            backend: None,
-            model: None,
+            agent: None,
+            session_id: None,
+            workspace: None,
             status: None,
-            stream: None,
+            exit_code: None,
             reason: None,
         }
     }

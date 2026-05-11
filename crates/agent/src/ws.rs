@@ -120,20 +120,6 @@ where
         let msg = item.map_err(|e| RunError::Transient(format!("ws: {}", e)))?;
         match msg {
             Message::Text(s) => match serde_json::from_str::<ServerMsg>(&s) {
-                Ok(ServerMsg::Request {
-                    req_id,
-                    method,
-                    path,
-                    headers,
-                    body_b64,
-                }) => {
-                    let st = state.clone();
-                    let send = tx.clone();
-                    tokio::spawn(async move {
-                        crate::proxy::forward(st, req_id, method, path, headers, body_b64, send)
-                            .await;
-                    });
-                }
                 Ok(ServerMsg::Ping) => {
                     let _ = tx.send(ClientMsg::Pong).await;
                 }
@@ -142,6 +128,13 @@ where
                 }
                 Ok(ServerMsg::Rejected { reason }) => {
                     return Err(RunError::Fatal(reject_label(reason).into()));
+                }
+                Ok(frame) => {
+                    let mgr = state.manager.clone();
+                    let send = tx.clone();
+                    tokio::spawn(async move {
+                        mgr.handle(frame, send).await;
+                    });
                 }
                 Err(e) => tracing::warn!(error = %e, "bad frame from hub"),
             },

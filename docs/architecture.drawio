@@ -1,57 +1,52 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <mxfile host="app.diagrams.net" agent="cloudcode" version="24.0.0">
   <diagram name="cloudcode" id="arch1">
-    <mxGraphModel dx="1200" dy="700" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1100" pageHeight="520" math="0" shadow="0">
+    <mxGraphModel dx="1200" dy="700" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1180" pageHeight="520" math="0" shadow="0">
       <root>
         <mxCell id="0"/>
         <mxCell id="1" parent="0"/>
 
         <mxCell id="title" value="cloudcode architecture" style="text;html=1;align=center;fontSize=16;fontStyle=1;fontColor=#111827;" vertex="1" parent="1">
-          <mxGeometry x="240" y="10" width="600" height="26" as="geometry"/>
+          <mxGeometry x="240" y="10" width="700" height="26" as="geometry"/>
         </mxCell>
-        <mxCell id="subtitle" value="Credentials never leave the agent; hub only does auth / routing / audit" style="text;html=1;align=center;fontSize=12;fontColor=#4b5563;" vertex="1" parent="1">
-          <mxGeometry x="240" y="36" width="600" height="20" as="geometry"/>
-        </mxCell>
-
-        <mxCell id="client" value="&lt;b&gt;Client&lt;/b&gt;&#xa;&lt;font color=&quot;#1d4ed8&quot;&gt;cloudcode + claude&lt;/font&gt;&#xa;&#xa;&lt;tt&gt;cd ~/myproj&lt;/tt&gt;&#xa;&lt;tt&gt;cloudcode run claude&lt;/tt&gt;&#xa;&#xa;&lt;i&gt;Developer machine&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#1d4ed8;align=center;verticalAlign=middle;fontColor=#1e3a8a;fontSize=12;" vertex="1" parent="1">
-          <mxGeometry x="40" y="110" width="180" height="160" as="geometry"/>
+        <mxCell id="subtitle" value="A TUI client drives a remote `claude` via the hub; agent spawns `claude` per turn" style="text;html=1;align=center;fontSize=12;fontColor=#4b5563;" vertex="1" parent="1">
+          <mxGeometry x="180" y="36" width="820" height="20" as="geometry"/>
         </mxCell>
 
-        <mxCell id="hub" value="&lt;b&gt;Hub&lt;/b&gt;&#xa;&lt;font color=&quot;#047857&quot;&gt;cloudcode-hub&lt;/font&gt;&#xa;&#xa;- account token auth&#xa;- ACL / routing&#xa;- JSONL audit log&#xa;&#xa;&lt;i&gt;Public-facing host&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d1fae5;strokeColor=#047857;align=center;verticalAlign=middle;fontColor=#065f46;fontSize=12;" vertex="1" parent="1">
-          <mxGeometry x="280" y="110" width="220" height="160" as="geometry"/>
+        <mxCell id="client" value="&lt;b&gt;Client (TUI)&lt;/b&gt;&#xa;&lt;font color=&quot;#1d4ed8&quot;&gt;cloudcode chat&lt;/font&gt;&#xa;&#xa;multi-line input&#xa;slash commands&#xa;streaming output&#xa;&#xa;&lt;i&gt;Laptop / phone / SSH&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dbeafe;strokeColor=#1d4ed8;align=center;verticalAlign=middle;fontColor=#1e3a8a;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="40" y="120" width="190" height="180" as="geometry"/>
         </mxCell>
 
-        <mxCell id="agent" value="&lt;b&gt;Agent&lt;/b&gt;&#xa;&lt;font color=&quot;#9a3412&quot;&gt;cloudcode-agent&lt;/font&gt;&#xa;&#xa;reads ~/.claude/.credentials.json&#xa;OAuth Bearer + auto-refresh&#xa;dials hub over WSS (outbound)&#xa;&#xa;&lt;i&gt;host with `claude /login` (NAT OK)&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd5;strokeColor=#c2410c;align=center;verticalAlign=middle;fontColor=#7c2d12;fontSize=12;" vertex="1" parent="1">
-          <mxGeometry x="560" y="110" width="240" height="160" as="geometry"/>
+        <mxCell id="hub" value="&lt;b&gt;Hub&lt;/b&gt;&#xa;&lt;font color=&quot;#047857&quot;&gt;cloudcode-hub&lt;/font&gt;&#xa;&#xa;- account token auth&#xa;- session routing&#xa;- workspace mutex&#xa;- JSONL audit log&#xa;&#xa;&lt;i&gt;Public-facing host&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d1fae5;strokeColor=#047857;align=center;verticalAlign=middle;fontColor=#065f46;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="280" y="120" width="220" height="180" as="geometry"/>
         </mxCell>
 
-        <mxCell id="anthropic" value="&lt;b&gt;Anthropic&lt;/b&gt;&#xa;&lt;font color=&quot;#6d28d9&quot;&gt;api.anthropic.com&lt;/font&gt;&#xa;&#xa;&lt;tt&gt;/v1/messages&lt;/tt&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ede9fe;strokeColor=#6d28d9;align=center;verticalAlign=middle;fontColor=#4c1d95;fontSize=12;" vertex="1" parent="1">
-          <mxGeometry x="860" y="110" width="180" height="160" as="geometry"/>
+        <mxCell id="agent" value="&lt;b&gt;Agent&lt;/b&gt;&#xa;&lt;font color=&quot;#9a3412&quot;&gt;cloudcode-agent&lt;/font&gt;&#xa;&#xa;dials hub over WSS&#xa;per-turn fork+exec claude&#xa;workspaces on local disk" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffedd5;strokeColor=#c2410c;align=center;verticalAlign=top;fontColor=#7c2d12;fontSize=12;spacingTop=10;" vertex="1" parent="1">
+          <mxGeometry x="560" y="100" width="290" height="220" as="geometry"/>
+        </mxCell>
+        <mxCell id="subproc" value="&lt;b&gt;claude (per turn)&lt;/b&gt;&#xa;&lt;tt&gt;claude -p --output-format stream-json&lt;/tt&gt;&#xa;&lt;tt&gt;--resume &amp;lt;session_id&amp;gt; (turns 2+)&lt;/tt&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff;strokeColor=#c2410c;dashed=1;align=center;verticalAlign=middle;fontColor=#7c2d12;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="580" y="234" width="250" height="74" as="geometry"/>
         </mxCell>
 
-        <mxCell id="audit" value="&lt;tt&gt;audit.jsonl&lt;/tt&gt;&#xa;&lt;font color=&quot;#6b7280&quot; size=&quot;1&quot;&gt;one line per request&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f3f4f6;strokeColor=#6b7280;dashed=1;align=center;verticalAlign=middle;fontColor=#374151;fontSize=11;" vertex="1" parent="1">
-          <mxGeometry x="320" y="350" width="140" height="50" as="geometry"/>
+        <mxCell id="anthropic" value="&lt;b&gt;Anthropic&lt;/b&gt;&#xa;&lt;font color=&quot;#6d28d9&quot;&gt;api.anthropic.com&lt;/font&gt;&#xa;&#xa;&lt;i&gt;claude handles auth&lt;/i&gt;&#xa;&lt;i&gt;via local /login&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ede9fe;strokeColor=#6d28d9;align=center;verticalAlign=middle;fontColor=#4c1d95;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="900" y="120" width="210" height="180" as="geometry"/>
         </mxCell>
 
-        <mxCell id="e1" value="HTTPS&#xa;Bearer cc_*" style="endArrow=classic;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;fontSize=10;" edge="1" parent="1" source="client" target="hub">
+        <mxCell id="audit" value="&lt;tt&gt;audit.jsonl&lt;/tt&gt;&#xa;&lt;font color=&quot;#6b7280&quot; size=&quot;1&quot;&gt;session / turn / workspace&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f3f4f6;strokeColor=#6b7280;dashed=1;align=center;verticalAlign=middle;fontColor=#374151;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="310" y="380" width="160" height="50" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="e1" value="WSS&#xa;session frames" style="startArrow=classic;endArrow=classic;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;fontSize=10;strokeWidth=2;" edge="1" parent="1" source="client" target="hub">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
         <mxCell id="e2" value="WSS tunnel&#xa;(agent dials)" style="startArrow=classic;endArrow=classic;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;fontSize=10;strokeWidth=2;" edge="1" parent="1" source="hub" target="agent">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
-        <mxCell id="e3" value="HTTPS&#xa;Bearer oauth" style="endArrow=classic;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;fontSize=10;" edge="1" parent="1" source="agent" target="anthropic">
+        <mxCell id="e3" value="HTTPS" style="endArrow=classic;html=1;exitX=1;exitY=0.5;entryX=0;entryY=0.5;fontSize=10;" edge="1" parent="1" source="subproc" target="anthropic">
           <mxGeometry relative="1" as="geometry"/>
         </mxCell>
         <mxCell id="e4" value="" style="endArrow=classic;html=1;exitX=0.5;exitY=1;entryX=0.5;entryY=0;dashed=1;strokeColor=#9ca3af;" edge="1" parent="1" source="hub" target="audit">
           <mxGeometry relative="1" as="geometry"/>
-        </mxCell>
-        <mxCell id="e5" value="api-key fallback" style="edgeStyle=orthogonalEdgeStyle;rounded=1;html=1;exitX=1;exitY=1;entryX=0;entryY=1;endArrow=classic;dashed=1;strokeColor=#9ca3af;fontStyle=2;fontColor=#6b7280;fontSize=10;" edge="1" parent="1" source="hub" target="anthropic">
-          <mxGeometry relative="1" as="geometry">
-            <Array as="points">
-              <mxPoint x="500" y="320"/>
-              <mxPoint x="860" y="320"/>
-            </Array>
-          </mxGeometry>
         </mxCell>
       </root>
     </mxGraphModel>

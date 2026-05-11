@@ -16,14 +16,17 @@ url = "wss://hub.example.com/v1/agent/ws"
 # name = "peter-mbp"
 
 [auth]
-# 由 `cloudcode-agent gen-secret` 生成的明文 secret。hub 端持其 argon2id 哈希。
+# 由 `cloudcode-agent --init` 生成的明文 secret。hub 端持其 argon2id 哈希。
 shared_secret = "ag_xxxxxxxxxxxxxxxxxxxx"
 
-# [claude] 段可整段省略 —— 默认就够用：
-# - credentials_path 默认 ~/.claude/.credentials.json
-# - 推荐 agent 跟你日常 `claude /login` 同一系统账号下运行，直接读默认路径
-#   即可，不必复制文件或改权限。
+# [claude] 段可整段省略 —— 默认就够：
+# - executable     = "claude"                          # PATH 查找
+# - workspace_root = "~/cloudcode-agent/workspaces"    # 每个 workspace 一个目录
+# - extra_args     = []                                # 追加到每次 claude 调用末尾
+# Agent 每接到一个 user turn 都会 fork+exec `claude` 子进程，跨 turn 用
+# `--resume <session_id>` 串联对话历史。务必让 agent 跟 `claude /login` 在
+# 同一个系统账号下跑（claude 自己读 keychain / 文件凭据）。
 # [claude]
-# credentials_path = "/custom/path/credentials.json"
-# upstream         = "https://api.anthropic.com"
-# anthropic_beta   = ["oauth-2025-04-20"]
+# executable     = "claude"
+# workspace_root = "~/cloudcode-agent/workspaces"
+# extra_args     = []

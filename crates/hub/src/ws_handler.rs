@@ -102,7 +102,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         };
         match msg {
             Message::Text(s) => match serde_json::from_str::<ClientMsg>(&s) {
-                Ok(frame) => conn.handle_frame(frame),
+                Ok(frame) => conn.handle_frame(frame).await,
                 Err(e) => tracing::warn!(agent = %name, error = %e, "bad frame"),
             },
             Message::Binary(_) => {

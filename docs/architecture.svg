@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 440"
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1100 460"
      font-family="system-ui, -apple-system, 'Helvetica Neue', Arial, sans-serif" font-size="13">
   <defs>
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
@@ -16,64 +16,68 @@
     </marker>
   </defs>
 
-  <text x="540" y="32" text-anchor="middle" font-size="16" font-weight="700" fill="#111827">cloudcode architecture</text>
-  <text x="540" y="52" text-anchor="middle" font-size="12" fill="#4b5563">Credentials never leave the agent; hub only does auth / routing / audit</text>
+  <text x="550" y="32" text-anchor="middle" font-size="16" font-weight="700" fill="#111827">cloudcode architecture</text>
+  <text x="550" y="52" text-anchor="middle" font-size="12" fill="#4b5563">A TUI client drives a remote `claude` via the hub; agent spawns `claude` per turn</text>
 
   <!-- Client -->
-  <rect x="20" y="110" width="180" height="150" rx="10" fill="#dbeafe" stroke="#1d4ed8" stroke-width="1.5"/>
-  <text x="110" y="140" text-anchor="middle" font-size="14" font-weight="700" fill="#1e3a8a">Client</text>
-  <text x="110" y="160" text-anchor="middle" font-size="12" fill="#1d4ed8">cloudcode + claude</text>
-  <text x="110" y="188" text-anchor="middle" font-size="11" fill="#1f2937" font-family="ui-monospace, Menlo, monospace">cd ~/myproj</text>
-  <text x="110" y="206" text-anchor="middle" font-size="11" fill="#1f2937" font-family="ui-monospace, Menlo, monospace">cloudcode run claude</text>
-  <text x="110" y="232" text-anchor="middle" font-size="11" fill="#475569" font-style="italic">Developer machine</text>
+  <rect x="20" y="110" width="190" height="170" rx="10" fill="#dbeafe" stroke="#1d4ed8" stroke-width="1.5"/>
+  <text x="115" y="138" text-anchor="middle" font-size="14" font-weight="700" fill="#1e3a8a">Client (TUI)</text>
+  <text x="115" y="158" text-anchor="middle" font-size="12" fill="#1d4ed8">cloudcode chat</text>
+  <text x="115" y="186" text-anchor="middle" font-size="11" fill="#1f2937">multi-line input</text>
+  <text x="115" y="204" text-anchor="middle" font-size="11" fill="#1f2937">slash commands</text>
+  <text x="115" y="222" text-anchor="middle" font-size="11" fill="#1f2937">streaming output</text>
+  <text x="115" y="250" text-anchor="middle" font-size="11" fill="#475569" font-style="italic">Laptop / phone / SSH</text>
 
   <!-- Hub -->
-  <rect x="250" y="110" width="220" height="150" rx="10" fill="#d1fae5" stroke="#047857" stroke-width="1.5"/>
-  <text x="360" y="140" text-anchor="middle" font-size="14" font-weight="700" fill="#065f46">Hub</text>
-  <text x="360" y="160" text-anchor="middle" font-size="12" fill="#047857">cloudcode-hub</text>
-  <text x="360" y="186" text-anchor="middle" font-size="11" fill="#1f2937">- account token auth</text>
-  <text x="360" y="204" text-anchor="middle" font-size="11" fill="#1f2937">- ACL / routing</text>
-  <text x="360" y="222" text-anchor="middle" font-size="11" fill="#1f2937">- JSONL audit log</text>
-  <text x="360" y="246" text-anchor="middle" font-size="11" fill="#475569" font-style="italic">Public-facing host</text>
+  <rect x="260" y="110" width="220" height="170" rx="10" fill="#d1fae5" stroke="#047857" stroke-width="1.5"/>
+  <text x="370" y="138" text-anchor="middle" font-size="14" font-weight="700" fill="#065f46">Hub</text>
+  <text x="370" y="158" text-anchor="middle" font-size="12" fill="#047857">cloudcode-hub</text>
+  <text x="370" y="186" text-anchor="middle" font-size="11" fill="#1f2937">- account token auth</text>
+  <text x="370" y="204" text-anchor="middle" font-size="11" fill="#1f2937">- session routing</text>
+  <text x="370" y="222" text-anchor="middle" font-size="11" fill="#1f2937">- workspace mutex</text>
+  <text x="370" y="240" text-anchor="middle" font-size="11" fill="#1f2937">- JSONL audit log</text>
+  <text x="370" y="266" text-anchor="middle" font-size="11" fill="#475569" font-style="italic">Public-facing host</text>
 
-  <!-- Agent -->
-  <rect x="520" y="110" width="240" height="150" rx="10" fill="#ffedd5" stroke="#c2410c" stroke-width="1.5"/>
-  <text x="640" y="140" text-anchor="middle" font-size="14" font-weight="700" fill="#7c2d12">Agent</text>
-  <text x="640" y="160" text-anchor="middle" font-size="12" fill="#9a3412">cloudcode-agent</text>
-  <text x="640" y="186" text-anchor="middle" font-size="11" fill="#1f2937">reads ~/.claude/.credentials.json</text>
-  <text x="640" y="204" text-anchor="middle" font-size="11" fill="#1f2937">OAuth Bearer + auto-refresh</text>
-  <text x="640" y="222" text-anchor="middle" font-size="11" fill="#1f2937">dials hub over WSS (outbound)</text>
-  <text x="640" y="246" text-anchor="middle" font-size="11" fill="#475569" font-style="italic">host with `claude /login` (NAT OK)</text>
+  <!-- Agent (with internal claude per-turn spawn) -->
+  <rect x="530" y="100" width="290" height="200" rx="10" fill="#ffedd5" stroke="#c2410c" stroke-width="1.5"/>
+  <text x="675" y="128" text-anchor="middle" font-size="14" font-weight="700" fill="#7c2d12">Agent</text>
+  <text x="675" y="148" text-anchor="middle" font-size="12" fill="#9a3412">cloudcode-agent</text>
+  <text x="675" y="172" text-anchor="middle" font-size="11" fill="#1f2937">dials hub over WSS</text>
+  <text x="675" y="190" text-anchor="middle" font-size="11" fill="#1f2937">per-turn fork+exec claude</text>
+  <text x="675" y="208" text-anchor="middle" font-size="11" fill="#1f2937">workspaces on local disk</text>
+
+  <!-- subprocess box -->
+  <rect x="550" y="222" width="250" height="64" rx="6" fill="#fff" stroke="#c2410c" stroke-width="1" stroke-dasharray="4,3"/>
+  <text x="675" y="242" text-anchor="middle" font-size="11" font-weight="600" fill="#7c2d12">claude (per turn)</text>
+  <text x="675" y="260" text-anchor="middle" font-size="10" font-family="ui-monospace, Menlo, monospace" fill="#1f2937">claude -p --output-format stream-json</text>
+  <text x="675" y="274" text-anchor="middle" font-size="10" font-family="ui-monospace, Menlo, monospace" fill="#1f2937">--resume &lt;session_id&gt; (turns 2+)</text>
 
   <!-- Anthropic -->
-  <rect x="810" y="110" width="180" height="150" rx="10" fill="#ede9fe" stroke="#6d28d9" stroke-width="1.5"/>
-  <text x="900" y="140" text-anchor="middle" font-size="14" font-weight="700" fill="#4c1d95">Anthropic</text>
-  <text x="900" y="160" text-anchor="middle" font-size="12" fill="#6d28d9">api.anthropic.com</text>
-  <text x="900" y="194" text-anchor="middle" font-size="11" fill="#1f2937" font-family="ui-monospace, Menlo, monospace">/v1/messages</text>
+  <rect x="870" y="110" width="210" height="170" rx="10" fill="#ede9fe" stroke="#6d28d9" stroke-width="1.5"/>
+  <text x="975" y="138" text-anchor="middle" font-size="14" font-weight="700" fill="#4c1d95">Anthropic</text>
+  <text x="975" y="158" text-anchor="middle" font-size="12" fill="#6d28d9">api.anthropic.com</text>
+  <text x="975" y="186" text-anchor="middle" font-size="11" fill="#475569" font-style="italic">claude handles auth</text>
+  <text x="975" y="204" text-anchor="middle" font-size="11" fill="#475569" font-style="italic">via local /login</text>
 
-  <!-- Client -> Hub -->
-  <line x1="200" y1="185" x2="250" y2="185" stroke="#374151" stroke-width="1.6" marker-end="url(#arrow)"/>
-  <text x="225" y="175" text-anchor="middle" font-size="10" fill="#374151">HTTPS</text>
-  <text x="225" y="199" text-anchor="middle" font-size="10" fill="#6b7280">Bearer cc_*</text>
-
-  <!-- Agent <-> Hub : bidirectional tunnel; dial direction = agent -> hub -->
-  <line x1="470" y1="185" x2="520" y2="185" stroke="#374151" stroke-width="2"
+  <!-- Client -> Hub (WSS bidirectional session) -->
+  <line x1="210" y1="190" x2="260" y2="190" stroke="#374151" stroke-width="2"
         marker-end="url(#arrow)" marker-start="url(#arrow-start)"/>
-  <text x="495" y="175" text-anchor="middle" font-size="10" fill="#374151">WSS tunnel</text>
-  <text x="495" y="201" text-anchor="middle" font-size="10" fill="#6b7280">agent dials</text>
+  <text x="235" y="180" text-anchor="middle" font-size="10" fill="#374151">WSS</text>
+  <text x="235" y="206" text-anchor="middle" font-size="10" fill="#6b7280">session frames</text>
 
-  <!-- Agent -> Anthropic -->
-  <line x1="760" y1="185" x2="810" y2="185" stroke="#374151" stroke-width="1.6" marker-end="url(#arrow)"/>
-  <text x="785" y="175" text-anchor="middle" font-size="10" fill="#374151">HTTPS</text>
-  <text x="785" y="199" text-anchor="middle" font-size="10" fill="#6b7280">Bearer oauth</text>
+  <!-- Hub <-> Agent : bidirectional WSS tunnel -->
+  <line x1="480" y1="190" x2="530" y2="190" stroke="#374151" stroke-width="2"
+        marker-end="url(#arrow)" marker-start="url(#arrow-start)"/>
+  <text x="505" y="180" text-anchor="middle" font-size="10" fill="#374151">WSS tunnel</text>
+  <text x="505" y="206" text-anchor="middle" font-size="10" fill="#6b7280">agent dials</text>
+
+  <!-- claude subprocess -> Anthropic -->
+  <line x1="820" y1="254" x2="870" y2="200" stroke="#374151" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="860" y="244" text-anchor="end" font-size="10" fill="#374151">HTTPS</text>
 
   <!-- Audit (dashed box + dashed link from hub) -->
-  <rect x="290" y="330" width="140" height="46" rx="6" fill="#f3f4f6" stroke="#6b7280" stroke-width="1.2" stroke-dasharray="4,3"/>
-  <text x="360" y="352" text-anchor="middle" font-size="12" fill="#374151" font-family="ui-monospace, Menlo, monospace">audit.jsonl</text>
-  <text x="360" y="369" text-anchor="middle" font-size="10" fill="#6b7280">one line per request</text>
-  <line x1="360" y1="260" x2="360" y2="330" stroke="#9ca3af" stroke-width="1.2" stroke-dasharray="3,3" marker-end="url(#arrow-dashed)"/>
-
-  <!-- Fallback dashed arc: hub bottom-right -> anthropic bottom -->
-  <path d="M 430 260 C 500 370, 820 370, 900 260" fill="none" stroke="#9ca3af" stroke-width="1.4" stroke-dasharray="6,4" marker-end="url(#arrow-dashed)"/>
-  <text x="665" y="382" text-anchor="middle" font-size="11" font-style="italic" fill="#6b7280">api-key fallback (x-api-key)</text>
+  <rect x="300" y="350" width="140" height="46" rx="6" fill="#f3f4f6" stroke="#6b7280" stroke-width="1.2" stroke-dasharray="4,3"/>
+  <text x="370" y="372" text-anchor="middle" font-size="12" fill="#374151" font-family="ui-monospace, Menlo, monospace">audit.jsonl</text>
+  <text x="370" y="389" text-anchor="middle" font-size="10" fill="#6b7280">session / turn / workspace</text>
+  <line x1="370" y1="280" x2="370" y2="350" stroke="#9ca3af" stroke-width="1.2" stroke-dasharray="3,3" marker-end="url(#arrow-dashed)"/>
 </svg>

@@ -1,5 +1,6 @@
 # Cloudcode Hub 配置示例
-# 复制为 hub.toml 后填入真实值。
+# 一次性初始化：cloudcode-hub --init --config hub.toml
+#
 # 启动（前台，日志到 stdout）：cloudcode-hub --config hub.toml
 # 启动（守护）：             cloudcode-hub daemon start --config hub.toml
 
@@ -8,14 +9,8 @@
 listen = "0.0.0.0:7000"
 audit_log = "./audit.jsonl"
 
-# 可选：API key 模式回退后端。配了则使用此 key 直连 Anthropic。
-# 删除整个 [anthropic] 段表示「只允许订阅模式」。
-[anthropic]
-upstream = "https://api.anthropic.com"
-api_key = "sk-ant-xxxxxxxxxxxxxxxxxxxx"
-
-# 订阅模式 agent 槽位。每个槽位代表一台允许连入的 agent；
-# agent 通过出站 WebSocket 连接 /v1/agent/ws，并在 hello 帧上报 name + secret。
+# Agent 槽位。每个槽位代表一台允许连入的 agent；
+# agent 通过出站 WebSocket 连接 /v1/agent/ws，并在 hello 帧上报 (name, plaintext secret)。
 # secret 必须 argon2 verify 出与 `shared_secret_hash` 一致，且 name 与本条匹配。
 # 同 name 多连接：先到先得，后到的会被拒。
 # [[agents]]
@@ -23,19 +18,14 @@ api_key = "sk-ant-xxxxxxxxxxxxxxxxxxxx"
 # shared_secret_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
 
 # 账号：通过 `cloudcode-hub gen-token <name>` 生成 token 与 hash。
-# - allowed_providers: API key 模式访问权限。["anthropic"] 或 ["*"]。
-# - allowed_agents: 订阅模式可路由到的 agent 名字列表，按顺序匹配，第一个在线的胜出。
-# 路由策略：先按 allowed_agents 顺序选第一个「在线」agent；
-# 没有可用 agent 时回落到 [anthropic] API key（需 allowed_providers 含 "anthropic"）；
-# 两者都没有则 403。在线 agent 不存在 ⇒ 503（让 client 自己决定重试或换 agent）。
+# allowed_agents: 该账号能 dispatch task 的 agent 列表，POST /v1/tasks 不显式带 `agent`
+#                 时按本顺序选第一个在线的；显式带 `agent` 则必须在本列表中。
 [[accounts]]
 name = "alice"
 token_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
-allowed_providers = ["anthropic"]
 allowed_agents = []
 
 # [[accounts]]
 # name = "bob"
 # token_hash = "$argon2id$..."
-# allowed_providers = []
 # allowed_agents = ["peter-mbp"]

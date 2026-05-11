@@ -1,11 +1,9 @@
 use crate::tunnel::{ClientMsg, ServerMsg};
-use base64::Engine;
-use bytes::Bytes;
 use dashmap::DashMap;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -27,16 +25,15 @@ impl AgentRegistry {
         name: String,
         send: mpsc::Sender<ServerMsg>,
     ) -> Option<Arc<AgentConn>> {
-        let entry = self.agents.entry(name.clone());
-        match entry {
+        match self.agents.entry(name.clone()) {
             dashmap::mapref::entry::Entry::Occupied(_) => None,
             dashmap::mapref::entry::Entry::Vacant(v) => {
                 let conn = Arc::new(AgentConn {
                     name,
                     id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
                     send,
-                    next_req_id: AtomicU64::new(1),
-                    inflight: DashMap::new(),
+                    sessions: DashMap::new(),
+                    workspace_requests: DashMap::new(),
                 });
                 v.insert(conn.clone());
                 Some(conn)
@@ -44,8 +41,8 @@ impl AgentRegistry {
         }
     }
 
-    /// Remove the entry only if it still matches `conn`'s id. This avoids
-    /// a stale reader loop deleting a fresh connection of the same name.
+    /// Remove the entry only if it still matches `conn`'s id. Tells every
+    /// in-flight session / pending workspace request that the agent vanished.
     pub fn unregister(&self, conn: &AgentConn) {
         let should_remove = self
             .agents
@@ -55,17 +52,19 @@ impl AgentRegistry {
         if should_remove {
             self.agents.remove(&conn.name);
         }
-        // Fail any in-flight requests so callers wake up with an error.
-        for entry in conn.inflight.iter() {
-            if let Some(tx) = entry.value().head.lock().unwrap().take() {
-                let _ = tx.send(Err("agent disconnected".into()));
+        // Drain sessions and signal disconnect.
+        let sids: Vec<Uuid> = conn.sessions.iter().map(|e| *e.key()).collect();
+        for sid in sids {
+            if let Some((_, tx)) = conn.sessions.remove(&sid) {
+                let _ = tx.try_send(ClientMsg::SessionClosed {
+                    session_id: sid,
+                    reason: Some("agent disconnected".into()),
+                });
             }
-            let _ = entry
-                .value()
-                .body
-                .try_send(Err("agent disconnected".into()));
         }
-        conn.inflight.clear();
+        // Drop all pending workspace request oneshots; receivers wake with
+        // RecvError and surface "agent disconnected" themselves.
+        conn.workspace_requests.clear();
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<AgentConn>> {
@@ -83,45 +82,11 @@ pub struct AgentConn {
     pub name: String,
     id: u64,
     send: mpsc::Sender<ServerMsg>,
-    next_req_id: AtomicU64,
-    inflight: DashMap<u64, InflightSlot>,
-}
-
-struct InflightSlot {
-    head: Mutex<Option<oneshot::Sender<Result<HeadOk, String>>>>,
-    body: mpsc::Sender<Result<Bytes, String>>,
-}
-
-pub struct HeadOk {
-    pub status: u16,
-    pub headers: HashMap<String, String>,
-}
-
-pub struct ForwardRequest {
-    pub method: String,
-    pub path: String,
-    pub headers: HashMap<String, String>,
-    pub body: Vec<u8>,
-}
-
-pub struct InflightResponse {
-    pub head: oneshot::Receiver<Result<HeadOk, String>>,
-    pub body: mpsc::Receiver<Result<Bytes, String>>,
-    pub guard: InflightGuard,
-}
-
-/// Removes the in-flight slot from the agent's table when dropped. Keep it
-/// alive until the body stream finishes, otherwise late chunks would land in
-/// a vacant slot and be dropped silently.
-pub struct InflightGuard {
-    conn: Arc<AgentConn>,
-    req_id: u64,
-}
-
-impl Drop for InflightGuard {
-    fn drop(&mut self) {
-        self.conn.inflight.remove(&self.req_id);
-    }
+    /// Per-session forward queue. Filled by hub session router when a session
+    /// opens; drained by handle_frame when agent emits Session* frames.
+    sessions: DashMap<Uuid, mpsc::Sender<ClientMsg>>,
+    /// One-shot reply slots keyed by request_id for workspace ops.
+    workspace_requests: DashMap<Uuid, oneshot::Sender<ClientMsg>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -131,79 +96,69 @@ pub enum DispatchError {
 }
 
 impl AgentConn {
-    pub async fn dispatch(
-        self: &Arc<Self>,
-        req: ForwardRequest,
-    ) -> Result<InflightResponse, DispatchError> {
-        let req_id = self.next_req_id.fetch_add(1, Ordering::Relaxed);
-        let (head_tx, head_rx) = oneshot::channel();
-        let (body_tx, body_rx) = mpsc::channel(64);
-        self.inflight.insert(
-            req_id,
-            InflightSlot {
-                head: Mutex::new(Some(head_tx)),
-                body: body_tx,
-            },
-        );
-        let msg = ServerMsg::Request {
-            req_id,
-            method: req.method,
-            path: req.path,
-            headers: req.headers,
-            body_b64: base64::engine::general_purpose::STANDARD.encode(&req.body),
-        };
-        if self.send.send(msg).await.is_err() {
-            self.inflight.remove(&req_id);
-            return Err(DispatchError::Disconnected);
-        }
-        Ok(InflightResponse {
-            head: head_rx,
-            body: body_rx,
-            guard: InflightGuard {
-                conn: self.clone(),
-                req_id,
-            },
-        })
+    /// Send any ServerMsg to the agent over the WS tunnel.
+    pub async fn send(&self, msg: ServerMsg) -> Result<(), DispatchError> {
+        self.send
+            .send(msg)
+            .await
+            .map_err(|_| DispatchError::Disconnected)
     }
 
-    /// Apply an incoming agent frame to in-flight state.
-    pub fn handle_frame(&self, frame: ClientMsg) {
-        match frame {
-            ClientMsg::RespHead {
-                req_id,
-                status,
-                headers,
-            } => {
-                if let Some(slot) = self.inflight.get(&req_id) {
-                    if let Some(tx) = slot.head.lock().unwrap().take() {
-                        let _ = tx.send(Ok(HeadOk { status, headers }));
-                    }
+    /// Register a per-session forward channel. Replaces any previous entry.
+    pub fn register_session(&self, session_id: Uuid, tx: mpsc::Sender<ClientMsg>) {
+        self.sessions.insert(session_id, tx);
+    }
+
+    pub fn unregister_session(&self, session_id: Uuid) {
+        self.sessions.remove(&session_id);
+    }
+
+    /// Register a one-shot reply slot for a workspace op.
+    pub fn register_workspace_request(&self, request_id: Uuid, tx: oneshot::Sender<ClientMsg>) {
+        self.workspace_requests.insert(request_id, tx);
+    }
+
+    /// Apply an incoming agent frame.
+    pub async fn handle_frame(&self, frame: ClientMsg) {
+        match classify(&frame) {
+            Routing::Session(sid) => {
+                let tx = self.sessions.get(&sid).map(|e| e.value().clone());
+                if let Some(tx) = tx {
+                    let _ = tx.send(frame).await;
+                } else {
+                    tracing::warn!(session = %sid, "no session route for frame; dropping");
                 }
             }
-            ClientMsg::RespChunk { req_id, data_b64 } => {
-                let Ok(bytes) =
-                    base64::engine::general_purpose::STANDARD.decode(data_b64.as_bytes())
-                else {
-                    return;
-                };
-                if let Some(slot) = self.inflight.get(&req_id) {
-                    let _ = slot.body.try_send(Ok(Bytes::from(bytes)));
+            Routing::Workspace(rid) => {
+                if let Some((_, tx)) = self.workspace_requests.remove(&rid) {
+                    let _ = tx.send(frame);
+                } else {
+                    tracing::warn!(request = %rid, "no workspace request route");
                 }
             }
-            ClientMsg::RespEnd { req_id } => {
-                // Drop the body sender so the receiver stream completes.
-                self.inflight.remove(&req_id);
-            }
-            ClientMsg::RespError { req_id, message } => {
-                if let Some((_, slot)) = self.inflight.remove(&req_id) {
-                    if let Some(tx) = slot.head.lock().unwrap().take() {
-                        let _ = tx.send(Err(message));
-                    } else {
-                        let _ = slot.body.try_send(Err(message));
-                    }
-                }
-            }
-            ClientMsg::Hello { .. } | ClientMsg::Pong => {}
+            Routing::Discard => {}
         }
+    }
+}
+
+enum Routing {
+    Session(Uuid),
+    Workspace(Uuid),
+    Discard,
+}
+
+fn classify(frame: &ClientMsg) -> Routing {
+    match frame {
+        ClientMsg::SessionOpened { session_id, .. }
+        | ClientMsg::SessionTurnStarted { session_id, .. }
+        | ClientMsg::SessionEvent { session_id, .. }
+        | ClientMsg::SessionTurnEnded { session_id, .. }
+        | ClientMsg::SessionWorkspaceSwitched { session_id, .. }
+        | ClientMsg::SessionClosed { session_id, .. }
+        | ClientMsg::SessionError { session_id, .. } => Routing::Session(*session_id),
+        ClientMsg::WorkspaceListResult { request_id, .. }
+        | ClientMsg::WorkspaceCreateResult { request_id, .. }
+        | ClientMsg::WorkspaceDeleteResult { request_id, .. } => Routing::Workspace(*request_id),
+        ClientMsg::Hello { .. } | ClientMsg::Pong => Routing::Discard,
     }
 }

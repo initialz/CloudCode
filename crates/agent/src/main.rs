@@ -1,9 +1,7 @@
 mod auth;
+mod claude;
 mod config;
-mod credentials;
 mod name;
-mod proxy;
-mod refresh;
 mod tunnel;
 mod ws;
 
@@ -12,20 +10,19 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::claude::SessionManager;
 use crate::config::Config;
-use crate::credentials::CredentialsStore;
 
 pub struct AppState {
     pub name: String,
     pub config: Config,
-    pub http: reqwest::Client,
-    pub credentials: Arc<CredentialsStore>,
+    pub manager: Arc<SessionManager>,
 }
 
 #[derive(Parser)]
 #[command(
     name = "cloudcode-agent",
-    about = "Cloudcode agent: dials out to a hub via WebSocket and serves its claude OAuth credentials"
+    about = "Cloudcode agent: dials a hub via WebSocket and runs claude subprocesses on demand"
 )]
 struct Cli {
     /// Path to agent config. With no subcommand, agent runs in the foreground
@@ -85,15 +82,6 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
 
     let config =
         Config::load(&config_path).with_context(|| format!("loading {}", config_path.display()))?;
-    let credentials = Arc::new(
-        CredentialsStore::load(config.claude.credentials_path.clone()).with_context(|| {
-            format!(
-                "loading credentials from {}",
-                config.claude.credentials_path.display()
-            )
-        })?,
-    );
-    let http = reqwest::Client::builder().build()?;
 
     let name = config
         .agent
@@ -102,21 +90,17 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         .unwrap_or_else(name::default_agent_name);
     tracing::info!(agent = %name, "starting cloudcode-agent");
 
-    refresh::spawn(credentials.clone(), http.clone());
+    let manager = Arc::new(SessionManager::new(config.claude.clone()));
 
     let state = Arc::new(AppState {
         name,
         config,
-        http,
-        credentials,
+        manager,
     });
 
     ws::run(state).await
 }
 
-/// Write a fresh agent.toml with an auto-generated shared_secret, and print
-/// the matching [[agents]] block (containing the argon2id hash) so the user
-/// can hand it to the hub admin. Refuses to overwrite an existing file.
 fn init_config(path: &Path) -> anyhow::Result<()> {
     if path.exists() {
         return Err(anyhow!(
@@ -142,11 +126,13 @@ url = "wss://hub.example.com/v1/agent/ws"
 [auth]
 shared_secret = "{secret}"
 
-# [claude] section is optional; defaults read ~/.claude/.credentials.json.
+# [claude] section is optional; defaults below are usually fine. The agent
+# spawns `claude` as a subprocess for every task, so claude must be installed
+# and you must have run `claude /login` once as the same OS user.
 # [claude]
-# credentials_path = "/custom/path/credentials.json"
-# upstream         = "https://api.anthropic.com"
-# anthropic_beta   = ["oauth-2025-04-20"]
+# executable     = "claude"                            # PATH lookup by default
+# workspace_root = "~/cloudcode-agent/workspaces"      # one dir per task
+# extra_args     = []                                  # appended to claude args
 "#
     );
 

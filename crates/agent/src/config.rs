@@ -20,7 +20,6 @@ pub struct HubConfig {
 #[derive(Debug, Deserialize, Default)]
 pub struct AgentSection {
     /// Override the auto-generated agent name (`<hostname>-<user>`).
-    /// Set this when the auto-generated name collides on the hub.
     pub name: Option<String>,
 }
 
@@ -31,43 +30,43 @@ pub struct AuthConfig {
     pub shared_secret: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct ClaudeConfig {
-    /// Path to claude's credentials.json. Defaults to ~/.claude/.credentials.json.
-    #[serde(default = "default_credentials_path")]
-    pub credentials_path: PathBuf,
+    /// Path to the `claude` executable. Defaults to looking up `"claude"` on
+    /// PATH.
+    #[serde(default = "default_executable")]
+    pub executable: PathBuf,
 
-    /// Upstream Anthropic API base URL.
-    #[serde(default = "default_upstream")]
-    pub upstream: String,
+    /// Root directory under which per-task workspaces are created. Defaults
+    /// to `~/cloudcode-agent/workspaces`.
+    #[serde(default = "default_workspace_root")]
+    pub workspace_root: PathBuf,
 
-    /// Anthropic-beta header values to send (joined with ',').
-    #[serde(default = "default_anthropic_beta")]
-    pub anthropic_beta: Vec<String>,
+    /// Extra arguments appended to every `claude` invocation. Use sparingly;
+    /// protocol-critical flags (-p, --output-format, --input-format,
+    /// --permission-mode, --verbose) are managed by the agent.
+    #[serde(default)]
+    pub extra_args: Vec<String>,
 }
 
-fn default_credentials_path() -> PathBuf {
+fn default_executable() -> PathBuf {
+    PathBuf::from("claude")
+}
+
+fn default_workspace_root() -> PathBuf {
     if let Some(home) = dirs::home_dir() {
-        home.join(".claude").join(".credentials.json")
+        home.join("cloudcode-agent").join("workspaces")
     } else {
-        PathBuf::from(".credentials.json")
+        PathBuf::from("./cloudcode-agent-workspaces")
     }
-}
-
-fn default_upstream() -> String {
-    "https://api.anthropic.com".into()
-}
-
-fn default_anthropic_beta() -> Vec<String> {
-    vec!["oauth-2025-04-20".into()]
 }
 
 impl Default for ClaudeConfig {
     fn default() -> Self {
         Self {
-            credentials_path: default_credentials_path(),
-            upstream: default_upstream(),
-            anthropic_beta: default_anthropic_beta(),
+            executable: default_executable(),
+            workspace_root: default_workspace_root(),
+            extra_args: Vec::new(),
         }
     }
 }

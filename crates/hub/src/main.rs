@@ -1,16 +1,19 @@
 mod audit;
 mod auth;
 mod config;
-mod proxy;
 mod registry;
+mod session;
+mod session_proto;
 mod tunnel;
 mod ws_handler;
 
 use anyhow::{anyhow, Context};
-use axum::{routing::get, routing::post, Router};
+use axum::{routing::get, Router};
 use clap::{Parser, Subcommand};
+use dashmap::DashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use uuid::Uuid;
 
 use crate::audit::AuditLog;
 use crate::config::Config;
@@ -18,13 +21,15 @@ use crate::registry::AgentRegistry;
 
 pub struct AppState {
     pub config: Config,
-    pub http: reqwest::Client,
     pub audit: AuditLog,
     pub registry: Arc<AgentRegistry>,
+    /// (agent_name, workspace_name) -> session_id, used as a global mutex
+    /// so two sessions can't drive `claude` in the same workspace at once.
+    pub workspaces: DashMap<(String, String), Uuid>,
 }
 
 #[derive(Parser)]
-#[command(name = "cloudcode-hub", about = "Cloudcode hub: LLM API gateway")]
+#[command(name = "cloudcode-hub", about = "Cloudcode hub: claude task gateway")]
 struct Cli {
     /// Path to hub config. With no subcommand, hub runs in the foreground
     /// using this config and streams logs to stdout.
@@ -81,18 +86,17 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     let config =
         Config::load(&config_path).with_context(|| format!("loading {}", config_path.display()))?;
     let audit = AuditLog::open(&config.server.audit_log)?;
-    let http = reqwest::Client::builder().build()?;
     let listen = config.server.listen.clone();
 
     let state = Arc::new(AppState {
         config,
-        http,
         audit,
         registry: Arc::new(AgentRegistry::new()),
+        workspaces: DashMap::new(),
     });
 
     let app = Router::new()
-        .route("/anthropic/v1/messages", post(proxy::anthropic_messages))
+        .route("/v1/session/ws", get(session::upgrade))
         .route("/v1/agent/ws", get(ws_handler::upgrade))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state);
@@ -117,7 +121,7 @@ fn gen_token(name: &str) -> anyhow::Result<()> {
     println!("[[accounts]]");
     println!("name = \"{}\"", name);
     println!("token_hash = \"{}\"", hash);
-    println!("allowed_providers = [\"anthropic\"]");
+    println!("allowed_agents = []   # fill with the [[agents]] names this user may dispatch to");
     Ok(())
 }
 
@@ -130,38 +134,31 @@ fn init_config(path: &Path) -> anyhow::Result<()> {
         ));
     }
 
-    let template = r#"# Cloudcode Hub config. Reverse-WS gateway for Claude.
+    let template = r#"# Cloudcode Hub config. Task gateway for `claude` subprocesses
+# running on remote agents.
 
 [server]
 # Listen address. Bind behind a TLS-terminating reverse proxy (nginx /
-# caddy) in production. The agent dials wss://<your-host>/v1/agent/ws.
+# caddy) in production. Agents dial wss://<your-host>/v1/agent/ws.
 listen = "0.0.0.0:7000"
 audit_log = "./audit.jsonl"
 
-# Optional: direct API-key fallback. Uncomment and fill if you want
-# accounts with allowed_providers = ["anthropic"] to fall through here
-# when no allowed agent is online.
-# [anthropic]
-# upstream = "https://api.anthropic.com"
-# api_key  = "sk-ant-..."
-
-# Subscription-mode agent slots. Each [[agents]] entry authorises one
-# agent to connect; the agent presents (name, plaintext secret) in its
-# hello frame, hub argon2-verifies against shared_secret_hash.
-# Add entries with the block printed by `cloudcode-agent --init`.
+# Agent slots. Each [[agents]] entry authorises one agent to connect;
+# the agent presents (name, plaintext secret) in its hello frame, and
+# the hub argon2-verifies against shared_secret_hash. Add entries with
+# the block printed by `cloudcode-agent --init`.
 # [[agents]]
 # name = "peter-mbp"
 # shared_secret_hash = "$argon2id$v=19$..."
 
 # Accounts. Generate token + hash with:
 #   cloudcode-hub gen-token alice
-# - allowed_providers: ["anthropic"] or ["*"] to allow the API-key fallback.
-# - allowed_agents:    names of [[agents]] this account may route to
-#                      (first online wins).
+# allowed_agents: names of [[agents]] this account may dispatch tasks
+# to (first online wins when the client does not pass `agent` in the
+# POST /v1/tasks body).
 # [[accounts]]
 # name = "alice"
 # token_hash = "$argon2id$v=19$..."
-# allowed_providers = ["anthropic"]
 # allowed_agents = []
 "#;
 
@@ -187,9 +184,8 @@ audit_log = "./audit.jsonl"
         "#      its printed [[agents]] block into {}.",
         path.display()
     );
-    println!("#   3) Optionally configure [anthropic] for API-key fallback.");
     println!(
-        "#   4) Start the hub: cloudcode-hub --config {}",
+        "#   3) Start the hub: cloudcode-hub --config {}",
         path.display()
     );
     Ok(())

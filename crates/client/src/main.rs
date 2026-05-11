@@ -1,11 +1,16 @@
+mod proto;
+mod tui;
+mod wire;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 #[derive(Parser)]
 #[command(
     name = "cloudcode",
-    about = "Cloudcode client: launch AI CLI tools via cloudcode hub"
+    about = "Cloudcode client: open an interactive claude session on a remote agent"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -14,15 +19,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 启动一个 AI CLI 工具，自动注入 hub 配置
-    Run {
-        /// 工具名称（MVP 仅支持 claude）
-        tool: String,
-        /// 透传给工具的参数
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+    /// Open a TUI chat against a remote claude.
+    Chat {
+        /// Pin the session to a specific agent name.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Open this workspace immediately (default: "default").
+        #[arg(long, default_value = "default")]
+        workspace: String,
     },
-    /// 显示当前 client 配置
+    /// Show the resolved client config (or print init instructions).
     Config,
 }
 
@@ -48,10 +54,19 @@ fn load_config() -> Result<ClientConfig> {
     Ok(toml::from_str(&s)?)
 }
 
-fn main() -> Result<()> {
-    match Cli::parse().cmd {
-        Cmd::Run { tool, args } => run(&tool, args),
+#[tokio::main]
+async fn main() -> ExitCode {
+    let cli = Cli::parse();
+    let result = match cli.cmd {
+        Cmd::Chat { agent, workspace } => run_chat(agent, workspace).await,
         Cmd::Config => show_config(),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("cloudcode: {:#}", e);
+            ExitCode::from(1)
+        }
     }
 }
 
@@ -77,29 +92,19 @@ fn show_config() -> Result<()> {
     Ok(())
 }
 
-fn run(tool: &str, args: Vec<String>) -> Result<()> {
+async fn run_chat(agent: Option<String>, workspace: String) -> Result<()> {
     let cfg = load_config()?;
+    let wire = wire::connect(&cfg.hub_url, &cfg.token).await?;
 
-    let (program, env): (&str, Vec<(&str, String)>) = match tool {
-        "claude" => (
-            "claude",
-            vec![
-                (
-                    "ANTHROPIC_BASE_URL",
-                    format!("{}/anthropic", cfg.hub_url.trim_end_matches('/')),
-                ),
-                ("ANTHROPIC_AUTH_TOKEN", cfg.token.clone()),
-            ],
-        ),
-        other => anyhow::bail!("unsupported tool '{}'. MVP supports: claude", other),
+    // Immediately send OpenSession; the TUI will reflect SessionOpened.
+    wire.tx
+        .send(proto::ClientToHub::OpenSession { agent, workspace })
+        .await
+        .context("hub send")?;
+
+    let app = tui::App {
+        tx: wire.tx,
+        rx: wire.rx,
     };
-
-    use std::os::unix::process::CommandExt;
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(&args);
-    for (k, v) in &env {
-        cmd.env(k, v);
-    }
-    let err = cmd.exec();
-    Err(anyhow::anyhow!("exec {}: {}", program, err))
+    tui::run(app).await
 }

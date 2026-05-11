@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "1";
+pub const PROTOCOL_VERSION: &str = "3";
 
 /// Frames sent from the agent to the hub.
 #[derive(Debug, Serialize, Deserialize)]
@@ -12,24 +12,63 @@ pub enum ClientMsg {
         secret: String,
         version: String,
     },
-    RespHead {
-        req_id: u64,
-        status: u16,
-        #[serde(default)]
-        headers: HashMap<String, String>,
+    Pong,
+
+    /// Session lifecycle (agent confirms creation / restart / close).
+    SessionOpened {
+        session_id: Uuid,
+        workspace: String,
+        cwd: String,
     },
-    RespChunk {
-        req_id: u64,
-        data_b64: String,
+    /// Emitted once per turn after claude prints its first `system/init`
+    /// frame; carries the claude-side session id for `--resume`.
+    SessionTurnStarted {
+        session_id: Uuid,
+        claude_session_id: String,
     },
-    RespEnd {
-        req_id: u64,
+    /// One stream-json line from claude (verbatim).
+    SessionEvent {
+        session_id: Uuid,
+        event: String,
     },
-    RespError {
-        req_id: u64,
+    SessionTurnEnded {
+        session_id: Uuid,
+        exit_code: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    SessionWorkspaceSwitched {
+        session_id: Uuid,
+        workspace: String,
+        cwd: String,
+    },
+    SessionClosed {
+        session_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    SessionError {
+        session_id: Uuid,
         message: String,
     },
-    Pong,
+
+    /// Workspace management replies (not bound to a session).
+    WorkspaceListResult {
+        request_id: Uuid,
+        items: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    WorkspaceCreateResult {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    WorkspaceDeleteResult {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// Frames sent from the hub to the agent.
@@ -42,15 +81,43 @@ pub enum ServerMsg {
     Rejected {
         reason: RejectReason,
     },
-    Request {
-        req_id: u64,
-        method: String,
-        path: String,
-        #[serde(default)]
-        headers: HashMap<String, String>,
-        body_b64: String,
-    },
     Ping,
+
+    /// Open a new session in the given workspace (mkdir if missing).
+    SessionStart {
+        session_id: Uuid,
+        workspace: String,
+    },
+    /// Run one user turn. `resume` is None on the first turn; Some thereafter
+    /// (carries the claude_session_id from a previous SessionTurnStarted).
+    SessionInput {
+        session_id: Uuid,
+        content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resume: Option<String>,
+    },
+    SessionInterrupt {
+        session_id: Uuid,
+    },
+    SessionSwitchWorkspace {
+        session_id: Uuid,
+        workspace: String,
+    },
+    SessionStop {
+        session_id: Uuid,
+    },
+
+    WorkspaceList {
+        request_id: Uuid,
+    },
+    WorkspaceCreate {
+        request_id: Uuid,
+        name: String,
+    },
+    WorkspaceDelete {
+        request_id: Uuid,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
