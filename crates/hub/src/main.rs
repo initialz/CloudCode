@@ -77,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
     }
     match cli.cmd {
         None => serve(cli.config).await,
-        Some(Cmd::GenToken { name }) => gen_token(&name),
+        Some(Cmd::GenToken { name }) => gen_token(&name, &cli.config),
         Some(Cmd::Daemon { cmd }) => cloudcode_daemon::run("hub", "hub.toml", cmd),
     }
 }
@@ -110,17 +110,45 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn gen_token(name: &str) -> anyhow::Result<()> {
+fn gen_token(name: &str, config_path: &Path) -> anyhow::Result<()> {
+    if !config_path.exists() {
+        return Err(anyhow!(
+            "{} not found; run `cloudcode-hub --init --config {}` first",
+            config_path.display(),
+            config_path.display()
+        ));
+    }
+    let existing = Config::load(config_path)
+        .with_context(|| format!("loading {}", config_path.display()))?;
+    if existing.accounts.iter().any(|a| a.name == name) {
+        return Err(anyhow!(
+            "account '{}' already exists in {}; remove that [[accounts]] block first if you really want to rotate",
+            name,
+            config_path.display()
+        ));
+    }
+
     let token = auth::generate_token();
     let hash = auth::hash_token(&token)?;
+
+    let block = format!(
+        "\n[[accounts]]\nname = \"{}\"\ntoken_hash = \"{}\"\n",
+        name, hash
+    );
+
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(config_path)
+        .with_context(|| format!("opening {} for append", config_path.display()))?;
+    std::io::Write::write_all(&mut f, block.as_bytes())
+        .with_context(|| format!("appending to {}", config_path.display()))?;
+
     println!("# Account: {}", name);
     println!("# Token (give to user, will not be shown again):");
     println!("{}", token);
     println!();
-    println!("# Add to hub.toml:");
-    println!("[[accounts]]");
-    println!("name = \"{}\"", name);
-    println!("token_hash = \"{}\"", hash);
+    println!("# Appended [[accounts]] block to {}.", config_path.display());
+    println!("# Restart the hub for the new account to take effect.");
     Ok(())
 }
 
