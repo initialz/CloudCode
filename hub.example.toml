@@ -1,5 +1,7 @@
 # Cloudcode Hub 配置示例
 # 一次性初始化：cloudcode-hub --init --config hub.toml
+#   生成 hub.toml + 打印一个明文 agent registration token（务必保存，
+#   发给每个 agent 操作员用作 agent.toml 的 registration_token）。
 #
 # 启动（前台，日志到 stdout）：cloudcode-hub --config hub.toml
 # 启动（守护）：             cloudcode-hub daemon start --config hub.toml
@@ -9,23 +11,19 @@
 listen = "0.0.0.0:7000"
 audit_log = "./audit.jsonl"
 
-# Agent 槽位。每个槽位代表一台允许连入的 agent；
-# agent 通过出站 WebSocket 连接 /v1/agent/ws，并在 hello 帧上报 (name, plaintext secret)。
-# secret 必须 argon2 verify 出与 `shared_secret_hash` 一致，且 name 与本条匹配。
-# 同 name 多连接：先到先得，后到的会被拒。
-# [[agents]]
-# name = "peter-mbp"
-# shared_secret_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
+[agents]
+# 单一全局 agent registration token 的 argon2id 哈希。所有 agent 共享
+# 同一明文 token；agent name 由 agent 端自动生成（hostname-user），
+# 运行时先到先得，hub 不预注册 name。轮换 token = 重新 `--init` 一份 hub.toml。
+registration_token_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
 
 # 账号：通过 `cloudcode-hub gen-token <name>` 生成 token 与 hash。
-# allowed_agents: 该账号能 dispatch task 的 agent 列表，POST /v1/tasks 不显式带 `agent`
-#                 时按本顺序选第一个在线的；显式带 `agent` 则必须在本列表中。
+# 任何 account 都可以连任何在线 agent；client 端用 `/agent use <name>`
+# 自行选择。
 [[accounts]]
 name = "alice"
 token_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
-allowed_agents = []
 
 # [[accounts]]
 # name = "bob"
 # token_hash = "$argon2id$..."
-# allowed_agents = ["peter-mbp"]

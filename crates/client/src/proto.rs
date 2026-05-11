@@ -30,6 +30,7 @@ pub enum ClientToHub {
     DeleteWorkspace {
         name: String,
     },
+    ListAgents,
     Close,
     Pong,
 }
@@ -70,6 +71,9 @@ pub enum HubToClient {
     WorkspaceDeleted {
         name: String,
     },
+    AgentList {
+        items: Vec<AgentInfo>,
+    },
     SessionError {
         message: String,
     },
@@ -78,4 +82,11 @@ pub enum HubToClient {
         reason: Option<String>,
     },
     Ping,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AgentInfo {
+    pub name: String,
+    #[serde(default)]
+    pub current: bool,
 }

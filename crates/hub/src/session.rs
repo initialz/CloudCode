@@ -110,63 +110,39 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         _ => return,
     };
 
-    // Re-resolve account by name (auth borrowed earlier; now grab account ref freshly).
-    let account = match state
-        .config
-        .accounts
-        .iter()
-        .find(|a| a.name == account_name)
-    {
-        Some(a) => a.clone(),
-        None => {
-            let _ = send_client(
-                &mut sink,
-                &HubToClient::Rejected {
-                    reason: "account gone".into(),
-                },
-            )
-            .await;
-            return;
-        }
-    };
-
-    // Pick agent.
-    let candidates: Vec<&String> = match &agent_filter {
-        Some(name) => {
-            if !account.allowed_agents.iter().any(|a| a == name) {
+    // Pick agent. Any account may use any online agent — preference goes to
+    // the explicit name the client passed, otherwise we pick any online one.
+    let conn = match &agent_filter {
+        Some(name) => match state.registry.get(name) {
+            Some(c) => c,
+            None => {
                 let _ = send_client(
                     &mut sink,
                     &HubToClient::Rejected {
-                        reason: format!("agent '{}' not in your allowed_agents", name),
+                        reason: format!("agent '{}' is not online", name),
                     },
                 )
                 .await;
                 return;
             }
-            vec![name]
+        },
+        None => {
+            let mut active = state.registry.list_active();
+            if active.is_empty() {
+                let _ = send_client(
+                    &mut sink,
+                    &HubToClient::Rejected {
+                        reason: "no agent online".into(),
+                    },
+                )
+                .await;
+                return;
+            }
+            // Stable-but-arbitrary pick: first alphabetically. Client-side
+            // `last_agent` persistence covers the "stick to one" UX.
+            active.sort();
+            state.registry.get(&active[0]).unwrap()
         }
-        None => account.allowed_agents.iter().collect(),
-    };
-    if candidates.is_empty() {
-        let _ = send_client(
-            &mut sink,
-            &HubToClient::Rejected {
-                reason: "no allowed agents".into(),
-            },
-        )
-        .await;
-        return;
-    }
-    let conn = candidates.iter().find_map(|name| state.registry.get(name));
-    let Some(conn) = conn else {
-        let _ = send_client(
-            &mut sink,
-            &HubToClient::Rejected {
-                reason: "no agent online".into(),
-            },
-        )
-        .await;
-        return;
     };
     let agent_name = conn.name.clone();
 
@@ -512,6 +488,18 @@ where
                     .await;
                 }
             }
+            true
+        }
+        ClientToHub::ListAgents => {
+            let names = state.registry.list_active();
+            let items: Vec<crate::session_proto::AgentInfo> = names
+                .into_iter()
+                .map(|n| crate::session_proto::AgentInfo {
+                    current: n == agent_name,
+                    name: n,
+                })
+                .collect();
+            let _ = send_client(sink, &HubToClient::AgentList { items }).await;
             true
         }
         ClientToHub::Close => false,

@@ -121,7 +121,6 @@ fn gen_token(name: &str) -> anyhow::Result<()> {
     println!("[[accounts]]");
     println!("name = \"{}\"", name);
     println!("token_hash = \"{}\"", hash);
-    println!("allowed_agents = []   # fill with the [[agents]] names this user may dispatch to");
     Ok(())
 }
 
@@ -134,7 +133,11 @@ fn init_config(path: &Path) -> anyhow::Result<()> {
         ));
     }
 
-    let template = r#"# Cloudcode Hub config. Task gateway for `claude` subprocesses
+    let agent_token = auth::generate_agent_token();
+    let agent_token_hash = auth::hash_token(&agent_token)?;
+
+    let template = format!(
+        r#"# Cloudcode Hub config. Task gateway for `claude` subprocesses
 # running on remote agents.
 
 [server]
@@ -143,24 +146,21 @@ fn init_config(path: &Path) -> anyhow::Result<()> {
 listen = "0.0.0.0:7000"
 audit_log = "./audit.jsonl"
 
-# Agent slots. Each [[agents]] entry authorises one agent to connect;
-# the agent presents (name, plaintext secret) in its hello frame, and
-# the hub argon2-verifies against shared_secret_hash. Add entries with
-# the block printed by `cloudcode-agent --init`.
-# [[agents]]
-# name = "peter-mbp"
-# shared_secret_hash = "$argon2id$v=19$..."
+[agents]
+# argon2id hash of the global agent registration token. Any agent that
+# presents the matching plaintext token in its hello frame is accepted;
+# agent names are first-come, first-served at runtime (no pre-registration).
+# To rotate: re-run `cloudcode-hub --init` against a fresh hub.toml.
+registration_token_hash = "{agent_token_hash}"
 
-# Accounts. Generate token + hash with:
+# Accounts. Generate per-user tokens with:
 #   cloudcode-hub gen-token alice
-# allowed_agents: names of [[agents]] this account may dispatch tasks
-# to (first online wins when the client does not pass `agent` in the
-# POST /v1/tasks body).
+# Any account may use any online agent — the client chooses via /agent use.
 # [[accounts]]
 # name = "alice"
 # token_hash = "$argon2id$v=19$..."
-# allowed_agents = []
-"#;
+"#
+    );
 
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -168,9 +168,13 @@ audit_log = "./audit.jsonl"
                 .with_context(|| format!("creating {}", parent.display()))?;
         }
     }
-    std::fs::write(path, template).with_context(|| format!("writing {}", path.display()))?;
+    std::fs::write(path, &template).with_context(|| format!("writing {}", path.display()))?;
 
     println!("# Wrote {}", path.display());
+    println!();
+    println!("# Agent registration token (give to every agent operator;");
+    println!("# they paste it into agent.toml [auth].registration_token):");
+    println!("{}", agent_token);
     println!();
     println!("# Next steps:");
     println!("#   1) Generate per-user tokens:");
@@ -179,11 +183,9 @@ audit_log = "./audit.jsonl"
         "#      Paste the printed [[accounts]] block into {}.",
         path.display()
     );
-    println!("#   2) Have each agent run `cloudcode-agent --init` and paste");
-    println!(
-        "#      its printed [[agents]] block into {}.",
-        path.display()
-    );
+    println!("#   2) Distribute the agent registration token (above) to each");
+    println!("#      agent operator. They run `cloudcode-agent --init` then");
+    println!("#      paste it into agent.toml.");
     println!(
         "#   3) Start the hub: cloudcode-hub --config {}",
         path.display()

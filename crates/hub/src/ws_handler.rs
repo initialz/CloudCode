@@ -41,12 +41,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    let Some(agent_cfg) = state.config.agents.iter().find(|a| a.name == name) else {
-        let _ = send_rejected(&mut sink, RejectReason::NameInvalid).await;
-        return;
-    };
-
-    if !crate::auth::verify_token(&secret, &agent_cfg.shared_secret_hash) {
+    // Single global agent registration token; the agent name is whatever the
+    // agent self-reports (collisions are rejected later as NameTaken).
+    if !crate::auth::verify_token(&secret, &state.config.agents.registration_token_hash) {
         let _ = send_rejected(&mut sink, RejectReason::AuthFailed).await;
         return;
     }

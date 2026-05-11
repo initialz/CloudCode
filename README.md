@@ -63,9 +63,12 @@ sudo install -m 0755 target/release/cloudcode       /usr/local/bin/
 ### Hub (administrator)
 
 ```bash
-cloudcode-hub --init                     # writes ./hub.toml
+cloudcode-hub --init                     # writes ./hub.toml AND prints the
+                                         # one-time agent registration token
+                                         # — save it, you'll give it to every
+                                         # agent operator
 cloudcode-hub gen-token alice            # one token per user
-$EDITOR ./hub.toml                       # paste [[accounts]] and [[agents]] blocks
+$EDITOR ./hub.toml                       # paste the [[accounts]] block
 cloudcode-hub --config ./hub.toml        # foreground; logs to stdout
 # or
 cloudcode-hub daemon start --config ./hub.toml   # background
@@ -76,15 +79,17 @@ cloudcode-hub daemon start --config ./hub.toml   # background
 Run the agent as the same OS user that did `claude /login`. The agent never reads OAuth credentials itself; it just `fork+exec`s `claude`, and `claude` finds its own credentials (keychain on macOS, `~/.claude/.credentials.json` on Linux).
 
 ```bash
-cloudcode-agent --init                   # writes ./agent.toml + prints [[agents]] block
-$EDITOR ./agent.toml                     # edit [hub].url
+cloudcode-agent --init                   # writes ./agent.toml template
+$EDITOR ./agent.toml                     # paste [auth].registration_token
+                                         # (the token your hub admin printed)
+                                         # and set [hub].url
 
 cloudcode-agent --config ./agent.toml    # foreground; logs to stdout
 # or
 cloudcode-agent daemon start --config ./agent.toml   # background
 ```
 
-The `[[agents]]` block printed by `--init` goes into the hub admin's `hub.toml`.
+There's a **single global agent registration token**: every agent in the fleet uses the same one, and agent names are auto-generated (`<hostname>-<user>`) — there's no pre-registration list on the hub.
 
 ### Client (developer)
 
@@ -116,6 +121,8 @@ cloudcode --agent peter-mbp          # pin a specific agent
 
 | Command | Effect |
 |---|---|
+| `/agent list` | Show all online agents (current one prefixed with `*`) |
+| `/agent use <name>` | Reconnect onto a different agent; the client persists this choice as the default for next time |
 | `/ws list` | Ask the agent to list workspace directories |
 | `/ws create <name>` | Create a new workspace dir on the agent |
 | `/ws use <name>` | Switch the current session to a different workspace; conversation starts fresh |
@@ -126,6 +133,8 @@ cloudcode --agent peter-mbp          # pin a specific agent
 | `/exit` / `/quit` | Close the session |
 
 Workspaces are named directories under `<workspace_root>` on the agent host (default `~/cloudcode-agent/workspaces/<name>`). A given workspace can be held by at most one session at a time across the whole fleet — the hub enforces this.
+
+The last agent you connected to is remembered in `$XDG_STATE_HOME/cloudcode/last_agent` (default `~/.local/state/cloudcode/last_agent`); next time `cloudcode` runs without `--agent`, it prefers that name and falls back to "any online" if the previous choice is offline.
 
 > Daemon-mode logs: `~/.local/state/cloudcode/{hub,agent}.log`. Lifecycle: `cloudcode-{hub,agent} daemon {status,stop,restart}`.
 

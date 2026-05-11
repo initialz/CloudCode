@@ -1,7 +1,8 @@
 # Cloudcode Agent 配置示例。
 # 一次性初始化：`cloudcode-agent --init --config agent.toml`
-#   会生成一份新的 agent.toml（含自动生成的 shared_secret），并打印
-#   [[agents]] 块给 hub 管理员。已存在则拒绝覆盖。
+#   会生成 agent.toml 模板（含 token placeholder）。你的 hub 管理员需要
+#   把 `cloudcode-hub --init` 当时打印的明文 registration token 给你，
+#   粘到下面 [auth].registration_token。
 #
 # 前台运行：cloudcode-agent --config agent.toml          （日志打到标准输出）
 # 后台运行：cloudcode-agent daemon start --config agent.toml
@@ -16,8 +17,9 @@ url = "wss://hub.example.com/v1/agent/ws"
 # name = "peter-mbp"
 
 [auth]
-# 由 `cloudcode-agent --init` 生成的明文 secret。hub 端持其 argon2id 哈希。
-shared_secret = "ag_xxxxxxxxxxxxxxxxxxxx"
+# 全局 agent registration token，由 hub 管理员在 `cloudcode-hub --init` 时
+# 打印一次。所有 agent 共享同一个 token，hub 用 argon2id 哈希验证。
+registration_token = "ag_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 
 # [claude] 段可整段省略 —— 默认就够：
 # - executable     = "claude"                          # PATH 查找

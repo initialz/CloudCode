@@ -5,9 +5,17 @@ use axum::http::HeaderMap;
 use rand::RngCore;
 
 pub fn generate_token() -> String {
+    generate_token_with_prefix("cc_")
+}
+
+pub fn generate_agent_token() -> String {
+    generate_token_with_prefix("ag_")
+}
+
+fn generate_token_with_prefix(prefix: &str) -> String {
     let mut bytes = [0u8; 24];
     rand::thread_rng().fill_bytes(&mut bytes);
-    let mut s = String::from("cc_");
+    let mut s = String::from(prefix);
     for b in &bytes {
         s.push_str(&format!("{:02x}", b));
     }

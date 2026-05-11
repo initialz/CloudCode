@@ -1,4 +1,3 @@
-mod auth;
 mod claude;
 mod config;
 mod name;
@@ -30,9 +29,10 @@ struct Cli {
     #[arg(short, long, default_value = "agent.toml", global = true)]
     config: PathBuf,
 
-    /// One-time setup: write a fresh agent.toml at `--config` with an
-    /// auto-generated shared_secret, and print the matching [[agents]] block
-    /// for the hub admin. Refuses to overwrite if the file already exists.
+    /// One-time setup: write a fresh agent.toml template at `--config`.
+    /// Refuses to overwrite if the file already exists. After running this,
+    /// paste the agent registration token from your hub admin into
+    /// [auth].registration_token before starting the agent.
     #[arg(long)]
     init: bool,
 
@@ -113,12 +113,11 @@ fn init_config(path: &Path) -> anyhow::Result<()> {
         ));
     }
 
-    let secret = auth::generate_secret();
-    let hash = auth::hash_secret(&secret)?;
     let agent_name = name::default_agent_name();
 
     let template = format!(
-        r#"# Auto-generated on first run. Edit [hub].url before re-running.
+        r#"# Auto-generated on first run. Edit [hub].url and [auth].registration_token
+# before re-running.
 
 [hub]
 url = "wss://hub.example.com/v1/agent/ws"
@@ -128,14 +127,16 @@ url = "wss://hub.example.com/v1/agent/ws"
 # name = "{agent_name}"
 
 [auth]
-shared_secret = "{secret}"
+# Plaintext registration token issued by the hub. Ask your hub admin —
+# they got it from `cloudcode-hub --init`.
+registration_token = "ag_PASTE_TOKEN_HERE"
 
 # [claude] section is optional; defaults below are usually fine. The agent
-# spawns `claude` as a subprocess for every task, so claude must be installed
-# and you must have run `claude /login` once as the same OS user.
+# spawns `claude` as a subprocess for every user turn, so claude must be
+# installed and you must have run `claude /login` once as the same OS user.
 # [claude]
 # executable     = "claude"                            # PATH lookup by default
-# workspace_root = "~/cloudcode-agent/workspaces"      # one dir per task
+# workspace_root = "~/cloudcode-agent/workspaces"      # one dir per workspace
 # extra_args     = []                                  # appended to claude args
 "#
     );
@@ -151,11 +152,13 @@ shared_secret = "{secret}"
     println!("# Wrote {}", path.display());
     println!("# Auto-detected agent name: {}", agent_name);
     println!();
-    println!("# Give the following block to your hub admin to paste into hub.toml:");
-    println!("[[agents]]");
-    println!("name = \"{}\"", agent_name);
-    println!("shared_secret_hash = \"{}\"", hash);
-    println!();
-    println!("# Then edit [hub].url in {} and re-run.", path.display());
+    println!("# Next steps:");
+    println!("#   1) Ask your hub admin for the agent registration token");
+    println!("#      (printed once by `cloudcode-hub --init`).");
+    println!(
+        "#   2) Paste it into [auth].registration_token in {}.",
+        path.display()
+    );
+    println!("#   3) Set [hub].url to your hub endpoint, then run cloudcode-agent.");
     Ok(())
 }

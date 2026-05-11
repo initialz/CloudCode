@@ -23,6 +23,29 @@ pub struct App {
     pub rx: mpsc::Receiver<HubToClient>,
 }
 
+#[derive(Debug, Default)]
+pub struct Outcome {
+    /// The agent name to persist as "last used" if the user did anything
+    /// meaningful (opened a session at least once).
+    pub last_agent: Option<String>,
+    pub next: NextAction,
+}
+
+#[derive(Debug, Default)]
+pub enum NextAction {
+    /// User asked to exit; main() should stop.
+    #[default]
+    Quit,
+    /// User asked to switch to another agent. main() should tear down the
+    /// current WS and dial a fresh one with this agent name.
+    Reconnect {
+        agent: String,
+        /// If Some, switch to this workspace on the new agent; otherwise the
+        /// existing chosen workspace is reused.
+        workspace: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TurnState {
     Idle,
@@ -131,7 +154,7 @@ impl State {
     }
 }
 
-pub async fn run(app: App) -> Result<()> {
+pub async fn run(app: App) -> Result<Outcome> {
     enable_raw_mode()?;
     let mut out = stdout();
     execute!(out, EnterAlternateScreen)?;
@@ -147,8 +170,9 @@ pub async fn run(app: App) -> Result<()> {
 async fn main_loop(
     mut app: App,
     term: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-) -> Result<()> {
+) -> Result<Outcome> {
     let mut state = State::new();
+    let mut next_action = NextAction::Quit;
 
     // crossterm events fed through an mpsc so we can `tokio::select!`.
     let (ev_tx, mut ev_rx) = mpsc::channel::<CtEvent>(64);
@@ -179,7 +203,7 @@ async fn main_loop(
             Some(ev) = ev_rx.recv() => {
                 if let CtEvent::Key(k) = ev {
                     if k.kind == KeyEventKind::Press
-                        && !handle_key(&mut state, &mut app, k).await
+                        && !handle_key(&mut state, &mut app, k, &mut next_action).await
                     {
                         break;
                     }
@@ -202,10 +226,18 @@ async fn main_loop(
 
     // Try to send a graceful Close.
     let _ = app.tx.send(ClientToHub::Close).await;
-    Ok(())
+    Ok(Outcome {
+        last_agent: state.agent.clone(),
+        next: next_action,
+    })
 }
 
-async fn handle_key(state: &mut State, app: &mut App, k: KeyEvent) -> bool {
+async fn handle_key(
+    state: &mut State,
+    app: &mut App,
+    k: KeyEvent,
+    next_action: &mut NextAction,
+) -> bool {
     // Ctrl-C: interrupt or quit
     if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('c') {
         if state.turn == TurnState::Active {
@@ -229,7 +261,9 @@ async fn handle_key(state: &mut State, app: &mut App, k: KeyEvent) -> bool {
                     return true;
                 }
                 if let Some(cmd) = text.strip_prefix('/') {
-                    handle_slash(state, app, cmd).await;
+                    if !handle_slash(state, app, cmd, next_action).await {
+                        return false;
+                    }
                 } else {
                     state.push_user(&text);
                     if state.workspace.is_none() {
@@ -263,17 +297,25 @@ async fn handle_key(state: &mut State, app: &mut App, k: KeyEvent) -> bool {
     true
 }
 
-async fn handle_slash(state: &mut State, app: &mut App, cmd: &str) {
+/// Returns `false` to break the main loop (used by /exit and /agent use).
+async fn handle_slash(
+    state: &mut State,
+    app: &mut App,
+    cmd: &str,
+    next_action: &mut NextAction,
+) -> bool {
     let parts: Vec<&str> = cmd.split_whitespace().collect();
     match parts.as_slice() {
         ["help"] => {
             state.push_system(
-                "commands: /ws list|create <n>|use <n>|remove <n>, /reset, /status, /help, /exit"
+                "commands: /ws list|create <n>|use <n>|remove <n>, /agent list|use <n>, /reset, /status, /help, /exit"
                     .into(),
             );
         }
         ["exit"] | ["quit"] | ["q"] => {
             let _ = app.tx.send(ClientToHub::Close).await;
+            *next_action = NextAction::Quit;
+            return false;
         }
         ["status"] => {
             state.push_system(format!(
@@ -324,8 +366,25 @@ async fn handle_slash(state: &mut State, app: &mut App, cmd: &str) {
                 })
                 .await;
         }
+        ["agent"] | ["agent", "list"] | ["agent", "ls"] => {
+            let _ = app.tx.send(ClientToHub::ListAgents).await;
+        }
+        ["agent", "use", name] | ["agent", "switch", name] => {
+            if Some(*name) == state.agent.as_deref() {
+                state.push_system(format!("already on agent '{}'", name));
+            } else {
+                *next_action = NextAction::Reconnect {
+                    agent: (*name).into(),
+                    workspace: None,
+                };
+                state.push_system(format!("switching to agent '{}'…", name));
+                let _ = app.tx.send(ClientToHub::Close).await;
+                return false;
+            }
+        }
         _ => state.push_error(format!("unknown command /{}; try /help", cmd)),
     }
+    true
 }
 
 async fn handle_hub(state: &mut State, frame: HubToClient, tx: &mpsc::Sender<ClientToHub>) {
@@ -383,6 +442,23 @@ async fn handle_hub(state: &mut State, frame: HubToClient, tx: &mpsc::Sender<Cli
         }
         HubToClient::WorkspaceDeleted { name } => {
             state.push_system(format!("workspace '{}' deleted", name));
+        }
+        HubToClient::AgentList { items } => {
+            if items.is_empty() {
+                state.push_system("no agents online".into());
+            } else {
+                let names: Vec<String> = items
+                    .iter()
+                    .map(|a| {
+                        if a.current {
+                            format!("* {}", a.name)
+                        } else {
+                            format!("  {}", a.name)
+                        }
+                    })
+                    .collect();
+                state.push_system(format!("agents:\n{}", names.join("\n")));
+            }
         }
         HubToClient::SessionError { message } => state.push_error(message),
         HubToClient::SessionClosed { reason } => {

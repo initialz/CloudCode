@@ -25,9 +25,10 @@ pub struct AgentSection {
 
 #[derive(Debug, Deserialize)]
 pub struct AuthConfig {
-    /// Plaintext secret presented to the hub in the `hello` frame. The hub
-    /// stores its argon2id hash in `[[agents]].shared_secret_hash`.
-    pub shared_secret: String,
+    /// Plaintext registration token issued by the hub on first init. Every
+    /// agent in the fleet uses the same token; the hub argon2-verifies it
+    /// against [agents].registration_token_hash in hub.toml.
+    pub registration_token: String,
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -53,7 +53,7 @@ async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
 
     let hello = ClientMsg::Hello {
         name: state.name.clone(),
-        secret: state.config.auth.shared_secret.clone(),
+        secret: state.config.auth.registration_token.clone(),
         version: PROTOCOL_VERSION.into(),
     };
     let hello_json = serde_json::to_string(&hello)
@@ -151,7 +151,7 @@ fn reject_label(r: RejectReason) -> &'static str {
     match r {
         RejectReason::NameInvalid => "name_invalid (hub has no [[agents]] entry with this name)",
         RejectReason::NameTaken => "name_taken (another agent with this name is already connected)",
-        RejectReason::AuthFailed => "auth_failed (shared_secret does not match)",
+        RejectReason::AuthFailed => "auth_failed (registration_token does not match)",
         RejectReason::VersionMismatch => "version_mismatch (upgrade agent or hub)",
     }
 }

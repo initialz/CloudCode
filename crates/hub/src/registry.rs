@@ -70,6 +70,11 @@ impl AgentRegistry {
     pub fn get(&self, name: &str) -> Option<Arc<AgentConn>> {
         self.agents.get(name).map(|e| e.value().clone())
     }
+
+    /// Snapshot of currently connected agent names.
+    pub fn list_active(&self) -> Vec<String> {
+        self.agents.iter().map(|e| e.key().clone()).collect()
+    }
 }
 
 impl Default for AgentRegistry {

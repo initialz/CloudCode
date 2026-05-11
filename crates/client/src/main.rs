@@ -19,7 +19,9 @@ struct Cli {
     /// Open this workspace immediately.
     #[arg(long, default_value = "default")]
     workspace: String,
-    /// Pin the session to a specific agent name.
+    /// Pin the session to a specific agent name. Without this, cloudcode
+    /// prefers the last agent you used (kept in $XDG_STATE_HOME) and falls
+    /// back to whatever the hub picks if that one is offline.
     #[arg(long)]
     agent: Option<String>,
 
@@ -53,6 +55,40 @@ fn load_config() -> Result<ClientConfig> {
         )
     })?;
     Ok(toml::from_str(&s)?)
+}
+
+fn state_dir() -> Result<PathBuf> {
+    if let Ok(p) = std::env::var("CLOUDCODE_STATE_DIR") {
+        return Ok(PathBuf::from(p));
+    }
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("state")))
+        .context("could not determine state dir")?;
+    Ok(base.join("cloudcode"))
+}
+
+fn last_agent_path() -> Result<PathBuf> {
+    Ok(state_dir()?.join("last_agent"))
+}
+
+fn read_last_agent() -> Option<String> {
+    let path = last_agent_path().ok()?;
+    let s = std::fs::read_to_string(&path).ok()?;
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn write_last_agent(name: &str) {
+    let Ok(path) = last_agent_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, name);
 }
 
 #[tokio::main]
@@ -97,19 +133,41 @@ fn show_config() -> Result<()> {
     Ok(())
 }
 
-async fn run_chat(agent: Option<String>, workspace: String) -> Result<()> {
+async fn run_chat(agent_flag: Option<String>, workspace: String) -> Result<()> {
     let cfg = load_config()?;
-    let wire = wire::connect(&cfg.hub_url, &cfg.token).await?;
 
-    // Immediately send OpenSession; the TUI will reflect SessionOpened.
-    wire.tx
-        .send(proto::ClientToHub::OpenSession { agent, workspace })
-        .await
-        .context("hub send")?;
+    // First pass: prefer the explicit --agent flag, then the persisted
+    // last_agent. The hub will fall back to picking any online agent if
+    // this is None.
+    let mut chosen_agent = agent_flag.or_else(read_last_agent);
+    let mut chosen_workspace = workspace;
 
-    let app = tui::App {
-        tx: wire.tx,
-        rx: wire.rx,
-    };
-    tui::run(app).await
+    loop {
+        let wire = wire::connect(&cfg.hub_url, &cfg.token).await?;
+        wire.tx
+            .send(proto::ClientToHub::OpenSession {
+                agent: chosen_agent.clone(),
+                workspace: chosen_workspace.clone(),
+            })
+            .await
+            .context("hub send")?;
+
+        let app = tui::App {
+            tx: wire.tx,
+            rx: wire.rx,
+        };
+        let outcome = tui::run(app).await?;
+        if let Some(name) = &outcome.last_agent {
+            write_last_agent(name);
+        }
+        match outcome.next {
+            tui::NextAction::Quit => return Ok(()),
+            tui::NextAction::Reconnect { agent, workspace } => {
+                chosen_agent = Some(agent);
+                if let Some(w) = workspace {
+                    chosen_workspace = w;
+                }
+            }
+        }
+    }
 }

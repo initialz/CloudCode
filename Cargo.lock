@@ -316,7 +316,6 @@ name = "cloudcode-agent"
 version = "0.5.0"
 dependencies = [
  "anyhow",
- "argon2",
  "clap",
  "cloudcode-daemon",
  "dashmap",
