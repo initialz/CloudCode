@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "4";
+pub const PROTOCOL_VERSION: &str = "5";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
@@ -98,11 +98,13 @@ pub enum ServerMsg {
     },
     Ping,
 
-    /// Allocate a PTY for a session in the given workspace, with the given
-    /// initial terminal size. The agent should spawn `tmux new -A -s
-    /// cloudcode-<workspace>` running `claude` inside.
+    /// Allocate a PTY for a session in the given (account, workspace), with
+    /// the given initial terminal size. The agent stores workspace state
+    /// per-account; the tmux session name is `cloudcode-<account>-<workspace>`
+    /// and the cwd is `<workspace_root>/<account>/<workspace>/`.
     PtyOpen {
         session_id: Uuid,
+        account: String,
         workspace: String,
         cols: u16,
         rows: u16,
@@ -113,20 +115,23 @@ pub enum ServerMsg {
         rows: u16,
     },
     /// Detach this session. Does not kill the underlying tmux session — the
-    /// next PtyOpen on the same workspace re-attaches.
+    /// next PtyOpen on the same (account, workspace) re-attaches.
     PtyClose {
         session_id: Uuid,
     },
 
     WorkspaceList {
         request_id: Uuid,
+        account: String,
     },
     WorkspaceCreate {
         request_id: Uuid,
+        account: String,
         name: String,
     },
     WorkspaceDelete {
         request_id: Uuid,
+        account: String,
         name: String,
     },
 }

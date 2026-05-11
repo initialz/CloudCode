@@ -61,11 +61,12 @@ impl PtyManager {
         match msg {
             ServerMsg::PtyOpen {
                 session_id,
+                account,
                 workspace,
                 cols,
                 rows,
             } => {
-                self.open_session(session_id, workspace, cols, rows, tx)
+                self.open_session(session_id, account, workspace, cols, rows, tx)
                     .await;
             }
             ServerMsg::PtyResize {
@@ -80,13 +81,20 @@ impl PtyManager {
             ServerMsg::PtyClose { session_id } => {
                 self.close(session_id, tx).await;
             }
-            ServerMsg::WorkspaceList { request_id } => self.workspace_list(request_id, tx).await,
-            ServerMsg::WorkspaceCreate { request_id, name } => {
-                self.workspace_create(request_id, name, tx).await
-            }
-            ServerMsg::WorkspaceDelete { request_id, name } => {
-                self.workspace_delete(request_id, name, tx).await
-            }
+            ServerMsg::WorkspaceList {
+                request_id,
+                account,
+            } => self.workspace_list(request_id, account, tx).await,
+            ServerMsg::WorkspaceCreate {
+                request_id,
+                account,
+                name,
+            } => self.workspace_create(request_id, account, name, tx).await,
+            ServerMsg::WorkspaceDelete {
+                request_id,
+                account,
+                name,
+            } => self.workspace_delete(request_id, account, name, tx).await,
             ServerMsg::Welcome { .. } | ServerMsg::Rejected { .. } | ServerMsg::Ping => {}
         }
     }
@@ -122,12 +130,22 @@ impl PtyManager {
     async fn open_session(
         self: &Arc<Self>,
         session_id: Uuid,
+        account: String,
         workspace: String,
         cols: u16,
         rows: u16,
         tx: mpsc::Sender<OutFrame>,
     ) {
-        if let Err(e) = validate_workspace_name(&workspace) {
+        if let Err(e) = validate_name(&account, "account") {
+            let _ = tx
+                .send(OutFrame::Text(ClientMsg::PtyError {
+                    session_id,
+                    message: e,
+                }))
+                .await;
+            return;
+        }
+        if let Err(e) = validate_name(&workspace, "workspace") {
             let _ = tx
                 .send(OutFrame::Text(ClientMsg::PtyError {
                     session_id,
@@ -141,7 +159,7 @@ impl PtyManager {
         // without emitting PtyClosed because we set a no-emit marker through
         // the absence of the entry in `sessions`).
         let _ = self.sessions.remove(&session_id);
-        let cwd = self.workspace_root().join(&workspace);
+        let cwd = self.workspace_root().join(&account).join(&workspace);
         if let Err(e) = std::fs::create_dir_all(&cwd) {
             let _ = tx
                 .send(OutFrame::Text(ClientMsg::PtyError {
@@ -174,7 +192,7 @@ impl PtyManager {
 
         // Build the tmux command. `-A` means "attach to session if it exists,
         // else create"; the workspace becomes a persistent slot.
-        let session_name = format!("cloudcode-{}", workspace);
+        let session_name = format!("cloudcode-{}-{}", account, workspace);
         let mut cmd = CommandBuilder::new(&self.tmux.executable);
         cmd.arg("new-session");
         cmd.arg("-A");
@@ -263,8 +281,14 @@ impl PtyManager {
             .await;
 
         // Recording: open the cast file (best effort).
-        let recorder = match Recorder::open(&self.recording.dir, &workspace, session_id, cols, rows)
-        {
+        let recorder = match Recorder::open(
+            &self.recording.dir,
+            &account,
+            &workspace,
+            session_id,
+            cols,
+            rows,
+        ) {
             Ok(r) => Some(r),
             Err(e) => {
                 tracing::warn!(session = %session_id, error = %e, "recorder open failed; continuing without record");
@@ -282,7 +306,9 @@ impl PtyManager {
         let _ = std::thread::Builder::new()
             .name(format!("pty-reader-{}", session_id))
             .spawn(move || {
-                pty_reader_loop(handle, reader, session_id, sessions, tx_out, recorder, child)
+                pty_reader_loop(
+                    handle, reader, session_id, sessions, tx_out, recorder, child,
+                )
             });
     }
 
@@ -298,26 +324,32 @@ impl PtyManager {
             .await;
     }
 
-    async fn workspace_list(&self, request_id: Uuid, tx: mpsc::Sender<OutFrame>) {
-        let root = self.workspace_root();
-        let _ = std::fs::create_dir_all(&root);
-        let mut items = Vec::new();
-        let mut error: Option<String> = None;
-        match std::fs::read_dir(&root) {
-            Ok(rd) => {
-                for entry in rd.flatten() {
-                    if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                        if let Some(n) = entry.file_name().to_str().map(String::from) {
-                            if !n.starts_with('.') {
-                                items.push(n);
+    async fn workspace_list(&self, request_id: Uuid, account: String, tx: mpsc::Sender<OutFrame>) {
+        let (items, error) = match validate_name(&account, "account") {
+            Err(e) => (Vec::new(), Some(e)),
+            Ok(()) => {
+                let root = self.account_root(&account);
+                let _ = std::fs::create_dir_all(&root);
+                let mut items = Vec::new();
+                let mut error: Option<String> = None;
+                match std::fs::read_dir(&root) {
+                    Ok(rd) => {
+                        for entry in rd.flatten() {
+                            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                                if let Some(n) = entry.file_name().to_str().map(String::from) {
+                                    if !n.starts_with('.') {
+                                        items.push(n);
+                                    }
+                                }
                             }
                         }
                     }
+                    Err(e) => error = Some(format!("read_dir: {}", e)),
                 }
+                items.sort();
+                (items, error)
             }
-            Err(e) => error = Some(format!("read_dir: {}", e)),
-        }
-        items.sort();
+        };
         let _ = tx
             .send(OutFrame::Text(ClientMsg::WorkspaceListResult {
                 request_id,
@@ -327,11 +359,19 @@ impl PtyManager {
             .await;
     }
 
-    async fn workspace_create(&self, request_id: Uuid, name: String, tx: mpsc::Sender<OutFrame>) {
-        let error = match validate_workspace_name(&name) {
+    async fn workspace_create(
+        &self,
+        request_id: Uuid,
+        account: String,
+        name: String,
+        tx: mpsc::Sender<OutFrame>,
+    ) {
+        let error = match validate_name(&account, "account")
+            .and_then(|_| validate_name(&name, "workspace"))
+        {
             Err(e) => Some(e),
             Ok(()) => {
-                let dir = self.workspace_root().join(&name);
+                let dir = self.account_root(&account).join(&name);
                 if dir.exists() {
                     Some(format!("workspace '{}' already exists", name))
                 } else {
@@ -349,17 +389,28 @@ impl PtyManager {
             .await;
     }
 
-    async fn workspace_delete(&self, request_id: Uuid, name: String, tx: mpsc::Sender<OutFrame>) {
-        let error = match validate_workspace_name(&name) {
+    async fn workspace_delete(
+        &self,
+        request_id: Uuid,
+        account: String,
+        name: String,
+        tx: mpsc::Sender<OutFrame>,
+    ) {
+        let error = match validate_name(&account, "account")
+            .and_then(|_| validate_name(&name, "workspace"))
+        {
             Err(e) => Some(e),
             Ok(()) => {
-                let dir = self.workspace_root().join(&name);
+                let dir = self.account_root(&account).join(&name);
                 if !dir.exists() {
                     Some(format!("workspace '{}' does not exist", name))
                 } else {
-                    // Also kill any matching tmux session so it doesn't dangle.
                     let _ = std::process::Command::new(&self.tmux.executable)
-                        .args(["kill-session", "-t", &format!("cloudcode-{}", name)])
+                        .args([
+                            "kill-session",
+                            "-t",
+                            &format!("cloudcode-{}-{}", account, name),
+                        ])
                         .output();
                     std::fs::remove_dir_all(&dir)
                         .err()
@@ -377,6 +428,10 @@ impl PtyManager {
 
     fn workspace_root(&self) -> PathBuf {
         expand_path(&self.claude.workspace_root)
+    }
+
+    fn account_root(&self, account: &str) -> PathBuf {
+        self.workspace_root().join(account)
     }
 }
 
@@ -439,8 +494,15 @@ struct Recorder {
 }
 
 impl Recorder {
-    fn open(dir: &Path, workspace: &str, session_id: Uuid, cols: u16, rows: u16) -> Result<Self> {
-        let dir = dir.join(workspace);
+    fn open(
+        dir: &Path,
+        account: &str,
+        workspace: &str,
+        session_id: Uuid,
+        cols: u16,
+        rows: u16,
+    ) -> Result<Self> {
+        let dir = dir.join(account).join(workspace);
         std::fs::create_dir_all(&dir).with_context(|| format!("mkdir {}", dir.display()))?;
         let path = dir.join(format!("{}.cast", session_id));
         let mut file = std::fs::OpenOptions::new()
@@ -454,7 +516,7 @@ impl Recorder {
             "width": cols,
             "height": rows,
             "timestamp": chrono::Utc::now().timestamp(),
-            "title": format!("cloudcode {}", workspace),
+            "title": format!("cloudcode {}/{}", account, workspace),
             "env": { "TERM": std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()) },
         });
         writeln!(file, "{}", header).context("write cast header")?;
@@ -479,18 +541,20 @@ impl Recorder {
 
 // ---------------------------------------------------------------------------
 
-fn validate_workspace_name(name: &str) -> std::result::Result<(), String> {
+/// Common name rules for accounts and workspaces (must be safe to drop into
+/// a path component and a tmux session name).
+fn validate_name(name: &str, kind: &str) -> std::result::Result<(), String> {
     if name.is_empty() || name.len() > 63 {
-        return Err("workspace name must be 1..=63 chars".into());
+        return Err(format!("{} name must be 1..=63 chars", kind));
     }
     if name.starts_with('-') || name.starts_with('.') {
-        return Err("workspace name cannot start with '-' or '.'".into());
+        return Err(format!("{} name cannot start with '-' or '.'", kind));
     }
     for c in name.chars() {
         if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_') {
             return Err(format!(
-                "invalid char '{}' in workspace name; allowed: lowercase a-z, 0-9, '-', '_'",
-                c
+                "invalid char '{}' in {} name; allowed: lowercase a-z, 0-9, '-', '_'",
+                c, kind
             ));
         }
     }

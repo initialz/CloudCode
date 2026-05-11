@@ -143,9 +143,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     };
     let agent_name = conn.name.clone();
 
-    // Workspace mutex.
+    // Workspace mutex (per-account namespace).
     let session_id = Uuid::new_v4();
-    if !claim_workspace(&state, &agent_name, &workspace, session_id) {
+    if !claim_workspace(&state, &agent_name, &account_name, &workspace, session_id) {
         let _ = send_client(
             &mut sink,
             &HubToClient::Rejected {
@@ -159,14 +159,13 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    // Per-session event channel.
     let (evt_tx, mut evt_rx) = mpsc::channel::<PtyEventOut>(PTY_EVENT_QUEUE);
     conn.register_session(session_id, evt_tx);
 
-    // Ask agent to open the PTY.
     if conn
         .send(ServerMsg::PtyOpen {
             session_id,
+            account: account_name.clone(),
             workspace: workspace.clone(),
             cols,
             rows,
@@ -174,7 +173,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         .await
         .is_err()
     {
-        cleanup(&state, &conn, session_id, &agent_name, &workspace).await;
+        cleanup(
+            &state,
+            &conn,
+            session_id,
+            &agent_name,
+            &account_name,
+            &workspace,
+        )
+        .await;
         let _ = send_client(
             &mut sink,
             &HubToClient::SessionError {
@@ -185,16 +192,31 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    // Wait for PtyOpened.
     let cwd = match tokio::time::timeout(OPEN_TIMEOUT, evt_rx.recv()).await {
         Ok(Some(PtyEventOut::Frame(ClientMsg::PtyOpened { cwd, .. }))) => cwd,
         Ok(Some(PtyEventOut::Frame(ClientMsg::PtyError { message, .. }))) => {
-            cleanup(&state, &conn, session_id, &agent_name, &workspace).await;
+            cleanup(
+                &state,
+                &conn,
+                session_id,
+                &agent_name,
+                &account_name,
+                &workspace,
+            )
+            .await;
             let _ = send_client(&mut sink, &HubToClient::Rejected { reason: message }).await;
             return;
         }
         _ => {
-            cleanup(&state, &conn, session_id, &agent_name, &workspace).await;
+            cleanup(
+                &state,
+                &conn,
+                session_id,
+                &agent_name,
+                &account_name,
+                &workspace,
+            )
+            .await;
             let _ = send_client(
                 &mut sink,
                 &HubToClient::Rejected {
@@ -226,7 +248,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     .await
     .is_err()
     {
-        cleanup(&state, &conn, session_id, &agent_name, &workspace).await;
+        cleanup(
+            &state,
+            &conn,
+            session_id,
+            &agent_name,
+            &account_name,
+            &workspace,
+        )
+        .await;
         return;
     }
 
@@ -249,7 +279,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             Err(e) => { tracing::warn!(error = %e, "bad client frame"); continue; }
                         };
                         if !handle_client_frame(
-                            &state, &conn, &agent_name, session_id,
+                            &state, &conn, &agent_name, &account_name, session_id,
                             &mut current_workspace, &mut last_cols, &mut last_rows,
                             frame, &mut sink,
                         ).await {
@@ -277,7 +307,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     }
 
     let _ = conn.send(ServerMsg::PtyClose { session_id }).await;
-    cleanup(&state, &conn, session_id, &agent_name, &current_workspace).await;
+    cleanup(
+        &state,
+        &conn,
+        session_id,
+        &agent_name,
+        &account_name,
+        &current_workspace,
+    )
+    .await;
     state.audit.write(AuditEvent {
         account: Some(account_name),
         agent: Some(agent_name),
@@ -294,6 +332,7 @@ async fn handle_client_frame<S>(
     state: &Arc<AppState>,
     conn: &Arc<AgentConn>,
     agent_name: &str,
+    account_name: &str,
     session_id: Uuid,
     current_workspace: &mut String,
     last_cols: &mut u16,
@@ -328,7 +367,7 @@ where
                 .await;
                 return true;
             }
-            if !claim_workspace(state, agent_name, &workspace, session_id) {
+            if !claim_workspace(state, agent_name, account_name, &workspace, session_id) {
                 let _ = send_client(
                     sink,
                     &HubToClient::SessionError {
@@ -338,12 +377,11 @@ where
                 .await;
                 return true;
             }
-            // Reusing the same session_id signals "swap workspace in place"
-            // to the agent (it tears down the old PTY without sending a
-            // PtyClosed and re-opens against the new tmux session).
+            // Reusing the same session_id signals "swap workspace in place".
             if conn
                 .send(ServerMsg::PtyOpen {
                     session_id,
+                    account: account_name.to_string(),
                     workspace: workspace.clone(),
                     cols: *last_cols,
                     rows: *last_rows,
@@ -351,20 +389,23 @@ where
                 .await
                 .is_err()
             {
-                state
-                    .workspaces
-                    .remove_if(&(agent_name.to_string(), workspace.clone()), |_, sid| {
-                        *sid == session_id
-                    });
+                state.workspaces.remove_if(
+                    &(
+                        agent_name.to_string(),
+                        account_name.to_string(),
+                        workspace.clone(),
+                    ),
+                    |_, sid| *sid == session_id,
+                );
                 return false;
             }
-            // We let the agent's PtyOpened (handled in handle_agent_event) drive
-            // the WorkspaceSwitched notification + mutex release on the old slot.
             let prev = std::mem::replace(current_workspace, workspace);
-            state
-                .workspaces
-                .remove_if(&(agent_name.to_string(), prev), |_, sid| *sid == session_id);
+            state.workspaces.remove_if(
+                &(agent_name.to_string(), account_name.to_string(), prev),
+                |_, sid| *sid == session_id,
+            );
             state.audit.write(AuditEvent {
+                account: Some(account_name.to_string()),
                 agent: Some(agent_name.to_string()),
                 session_id: Some(session_id.to_string()),
                 workspace: Some(current_workspace.clone()),
@@ -390,7 +431,10 @@ where
             let (tx, rx) = oneshot::channel();
             conn.register_workspace_request(request_id, tx);
             if conn
-                .send(ServerMsg::WorkspaceList { request_id })
+                .send(ServerMsg::WorkspaceList {
+                    request_id,
+                    account: account_name.to_string(),
+                })
                 .await
                 .is_err()
             {
@@ -423,6 +467,7 @@ where
             if conn
                 .send(ServerMsg::WorkspaceCreate {
                     request_id,
+                    account: account_name.to_string(),
                     name: name.clone(),
                 })
                 .await
@@ -451,10 +496,11 @@ where
             true
         }
         ClientToHub::DeleteWorkspace { name } => {
-            if state
-                .workspaces
-                .contains_key(&(agent_name.to_string(), name.clone()))
-            {
+            if state.workspaces.contains_key(&(
+                agent_name.to_string(),
+                account_name.to_string(),
+                name.clone(),
+            )) {
                 let _ = send_client(
                     sink,
                     &HubToClient::SessionError {
@@ -470,6 +516,7 @@ where
             if conn
                 .send(ServerMsg::WorkspaceDelete {
                     request_id,
+                    account: account_name.to_string(),
                     name: name.clone(),
                 })
                 .await
@@ -547,11 +594,16 @@ async fn cleanup(
     conn: &Arc<AgentConn>,
     session_id: Uuid,
     agent_name: &str,
+    account_name: &str,
     workspace: &str,
 ) {
     conn.unregister_session(session_id);
     state.workspaces.remove_if(
-        &(agent_name.to_string(), workspace.to_string()),
+        &(
+            agent_name.to_string(),
+            account_name.to_string(),
+            workspace.to_string(),
+        ),
         |_, sid| *sid == session_id,
     );
 }
@@ -559,10 +611,15 @@ async fn cleanup(
 fn claim_workspace(
     state: &Arc<AppState>,
     agent_name: &str,
+    account_name: &str,
     workspace: &str,
     session_id: Uuid,
 ) -> bool {
-    let key = (agent_name.to_string(), workspace.to_string());
+    let key = (
+        agent_name.to_string(),
+        account_name.to_string(),
+        workspace.to_string(),
+    );
     match state.workspaces.entry(key) {
         dashmap::mapref::entry::Entry::Occupied(_) => false,
         dashmap::mapref::entry::Entry::Vacant(v) => {

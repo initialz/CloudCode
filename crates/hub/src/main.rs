@@ -23,9 +23,11 @@ pub struct AppState {
     pub config: Config,
     pub audit: AuditLog,
     pub registry: Arc<AgentRegistry>,
-    /// (agent_name, workspace_name) -> session_id, used as a global mutex
-    /// so two sessions can't drive `claude` in the same workspace at once.
-    pub workspaces: DashMap<(String, String), Uuid>,
+    /// (agent_name, account_name, workspace_name) -> session_id, used as a
+    /// global mutex so two sessions can't drive `claude` in the same
+    /// account+workspace at once. Different accounts on the same agent get
+    /// separate namespaces.
+    pub workspaces: DashMap<(String, String, String), Uuid>,
 }
 
 #[derive(Parser)]
