@@ -1,27 +1,32 @@
+mod menu;
 mod proto;
 mod relay;
 mod wire;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use tokio::sync::mpsc;
+
+use crate::proto::{ClientToHub, HubToClient};
+use crate::wire::OutFrame;
 
 #[derive(Parser)]
 #[command(
     name = "cloudcode",
     about = "Cloudcode client: open an interactive claude session on a remote agent",
-    long_about = "Running `cloudcode` with no subcommand opens a TUI chat against \
-                  the remote agent configured in ~/.config/cloudcode/config.toml. \
-                  Use `cloudcode config` to inspect or set up that file."
+    long_about = "Running `cloudcode` with no subcommand opens a workspace \
+                  picker for the configured remote agent, then drops into \
+                  claude inside that workspace. When claude exits you're \
+                  back at the picker. Use `cloudcode config` to inspect or \
+                  set up the client config."
 )]
 struct Cli {
-    /// Open this workspace immediately.
-    #[arg(long, default_value = "default")]
-    workspace: String,
-    /// Pin the session to a specific agent name. Without this, cloudcode
-    /// prefers the last agent you used (kept in $XDG_STATE_HOME) and falls
-    /// back to whatever the hub picks if that one is offline.
+    /// Pin to a specific agent. Without this, cloudcode prefers the last
+    /// agent you used (kept in $XDG_STATE_HOME) and falls back to whatever
+    /// the hub picks if that one is offline.
     #[arg(long)]
     agent: Option<String>,
 
@@ -47,10 +52,6 @@ struct ClientConfig {
 }
 
 fn config_path() -> Result<PathBuf> {
-    // Cross-platform: use $XDG_CONFIG_HOME if set, else ~/.config/. We
-    // deliberately don't follow `dirs::config_dir()`, which would put
-    // the file under ~/Library/Application Support on macOS — most CLI
-    // tools (rustup, gh, docker…) use ~/.config there too.
     if let Ok(p) = std::env::var("XDG_CONFIG_HOME") {
         if !p.is_empty() {
             return Ok(PathBuf::from(p).join("cloudcode").join("config.toml"));
@@ -86,32 +87,54 @@ fn last_agent_path() -> Result<PathBuf> {
     Ok(state_dir()?.join("last_agent"))
 }
 
-fn read_last_agent() -> Option<String> {
-    let path = last_agent_path().ok()?;
-    let s = std::fs::read_to_string(&path).ok()?;
-    let trimmed = s.trim();
-    if trimmed.is_empty() {
+fn last_workspace_path(agent: &str) -> Result<PathBuf> {
+    Ok(state_dir()?
+        .join("last_workspace")
+        .join(format!("{}.txt", agent)))
+}
+
+fn read_text_file(path: &PathBuf) -> Option<String> {
+    let s = std::fs::read_to_string(path).ok()?;
+    let t = s.trim();
+    if t.is_empty() {
         None
     } else {
-        Some(trimmed.to_string())
+        Some(t.to_string())
     }
 }
 
-fn write_last_agent(name: &str) {
-    let Ok(path) = last_agent_path() else { return };
+fn write_text_file(path: &PathBuf, contents: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let _ = std::fs::write(&path, name);
+    let _ = std::fs::write(path, contents);
+}
+
+fn read_last_agent() -> Option<String> {
+    read_text_file(&last_agent_path().ok()?)
+}
+
+fn write_last_agent(name: &str) {
+    if let Ok(p) = last_agent_path() {
+        write_text_file(&p, name);
+    }
+}
+
+fn read_last_workspace(agent: &str) -> Option<String> {
+    read_text_file(&last_workspace_path(agent).ok()?)
+}
+
+fn write_last_workspace(agent: &str, workspace: &str) {
+    if let Ok(p) = last_workspace_path(agent) {
+        write_text_file(&p, workspace);
+    }
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    // Pick rustls' ring CryptoProvider before any TLS code runs; rustls 0.23
-    // requires this when crate features can't disambiguate a default.
     let _ = rustls::crypto::ring::default_provider().install_default();
-
     let cli = Cli::parse();
+
     let result = if cli.init {
         if cli.cmd.is_some() {
             Err(anyhow!("--init cannot be combined with a subcommand"))
@@ -120,7 +143,7 @@ async fn main() -> ExitCode {
         }
     } else {
         match cli.cmd {
-            None => run_chat(cli.agent, cli.workspace).await,
+            None => run_chat(cli.agent).await,
             Some(Cmd::Config) => show_config(),
         }
     };
@@ -160,8 +183,7 @@ fn init_config() -> Result<()> {
         ));
     }
     let template = r#"# Cloudcode client config.
-# - hub_url: where the hub is reachable (http(s)://… — `cloudcode` rewrites
-#   scheme to ws(s):// internally to dial /v1/session/ws).
+# - hub_url: where the hub is reachable (http(s)://…).
 # - token:   account token printed once by `cloudcode-hub gen-token <name>`
 #            on the admin's side; ask them for it.
 
@@ -173,47 +195,119 @@ token   = "cc_PASTE_TOKEN_HERE"
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     std::fs::write(&path, template).with_context(|| format!("writing {}", path.display()))?;
-
     println!("# Wrote {}", path.display());
     println!();
-    println!("# Next steps:");
-    println!("#   1) Set hub_url to your hub's URL (default 7100 on localhost).");
-    println!("#   2) Ask your hub admin for an account token");
-    println!("#      (`cloudcode-hub gen-token <name>` prints it once).");
-    println!("#   3) Paste it into token = \"...\" then run `cloudcode`.");
+    println!("# Next: edit hub_url + token, then run `cloudcode`.");
     Ok(())
 }
 
-async fn run_chat(agent_flag: Option<String>, workspace: String) -> Result<()> {
+async fn run_chat(agent_flag: Option<String>) -> Result<()> {
     let cfg = load_config()?;
+    let mut wire = wire::connect(&cfg.hub_url, &cfg.token).await?;
 
-    let mut chosen_agent = agent_flag.or_else(read_last_agent);
-    let chosen_workspace = workspace;
+    match wire.in_text_rx.recv().await {
+        Some(HubToClient::Welcome { .. }) => {}
+        Some(HubToClient::Rejected { reason }) => {
+            return Err(anyhow!("hub rejected: {}", reason));
+        }
+        other => return Err(anyhow!("expected welcome, got {:?}", other.is_some())),
+    }
+
+    let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(64);
+    std::thread::Builder::new()
+        .name("stdin-pump".into())
+        .spawn(move || stdin_pump_loop(stdin_tx))
+        .ok();
+
+    let mut chosen_agent: Option<String> = agent_flag.or_else(read_last_agent);
 
     loop {
-        let wire = wire::connect(&cfg.hub_url, &cfg.token).await?;
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-
         wire.out_tx
-            .send(wire::OutFrame::Text(proto::ClientToHub::OpenSession {
+            .send(OutFrame::Text(ClientToHub::SelectAgent {
                 agent: chosen_agent.clone(),
-                workspace: chosen_workspace.clone(),
-                cols,
-                rows,
             }))
             .await
-            .context("hub send")?;
-
-        let app = relay::App { wire };
-        let outcome = relay::run(app).await?;
-        if let Some(name) = &outcome.last_agent {
-            write_last_agent(name);
-        }
-        match outcome.next {
-            relay::NextAction::Quit => return Ok(()),
-            relay::NextAction::Reconnect { agent } => {
-                chosen_agent = agent;
+            .map_err(|_| anyhow!("hub disconnected"))?;
+        let selected = loop {
+            match wire.in_text_rx.recv().await {
+                Some(HubToClient::AgentSelected { agent }) => break agent,
+                Some(HubToClient::SessionError { message }) => {
+                    return Err(anyhow!("select agent: {}", message));
+                }
+                Some(HubToClient::Ping) => {
+                    let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
+                }
+                Some(_) => continue,
+                None => return Err(anyhow!("hub closed connection")),
             }
+        };
+        chosen_agent = Some(selected.clone());
+        write_last_agent(&selected);
+
+        let last_ws = read_last_workspace(&selected);
+        let action = menu::run(&mut wire, &mut stdin_rx, &selected, last_ws.as_deref()).await?;
+
+        match action {
+            menu::MenuAction::Open(workspace) => {
+                let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+                wire.out_tx
+                    .send(OutFrame::Text(ClientToHub::OpenSession {
+                        workspace: workspace.clone(),
+                        cols,
+                        rows,
+                    }))
+                    .await
+                    .map_err(|_| anyhow!("hub disconnected"))?;
+
+                let mut opened = false;
+                loop {
+                    match wire.in_text_rx.recv().await {
+                        Some(HubToClient::SessionOpened { .. }) => {
+                            opened = true;
+                            break;
+                        }
+                        Some(HubToClient::SessionError { message }) => {
+                            eprintln!("[cc] {}", message);
+                            break;
+                        }
+                        Some(HubToClient::Ping) => {
+                            let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
+                        }
+                        Some(_) => continue,
+                        None => return Err(anyhow!("hub closed connection")),
+                    }
+                }
+                if !opened {
+                    continue;
+                }
+
+                write_last_workspace(&selected, &workspace);
+                relay::run(&mut wire, &mut stdin_rx).await.ok();
+                // Back to the menu on the next iteration.
+            }
+            menu::MenuAction::SwitchAgent(name) => {
+                chosen_agent = name;
+            }
+            menu::MenuAction::Quit => {
+                let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Close)).await;
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn stdin_pump_loop(tx: mpsc::Sender<Vec<u8>>) {
+    let mut stdin = std::io::stdin().lock();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stdin.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
         }
     }
 }

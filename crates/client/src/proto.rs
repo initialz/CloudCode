@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
+#[allow(dead_code)]
 pub const PTY_PROTOCOL_VERSION: &str = "1";
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -11,28 +12,16 @@ pub enum ClientToHub {
         token: String,
         version: String,
     },
-    /// Open a PTY session. The hub picks an agent (preferring `agent` if
-    /// given), claims the workspace mutex, allocates a session_id, and tells
-    /// the agent to spawn tmux+claude with the given initial size.
-    OpenSession {
+    /// Pre-session: bind this client connection to an agent. `None` lets the
+    /// hub pick the first online agent (alphabetically). All subsequent
+    /// workspace ops + the eventual OpenSession use this agent.
+    SelectAgent {
         #[serde(default)]
         agent: Option<String>,
-        workspace: String,
-        cols: u16,
-        rows: u16,
     },
-    /// Terminal-size change (SIGWINCH).
-    Resize {
-        cols: u16,
-        rows: u16,
-    },
-    /// Move the session to another workspace on the same agent (releases the
-    /// old workspace mutex, claims the new one). The agent re-attaches the
-    /// PTY to `cloudcode-<new>` tmux session, creating it if missing.
-    SwitchWorkspace {
-        workspace: String,
-    },
-    /// Workspace metadata ops — forwarded to the bound agent.
+    /// Pre-session: list online agents.
+    ListAgents,
+    /// Pre-session (or in-session): list workspaces on the selected agent.
     ListWorkspaces,
     CreateWorkspace {
         name: String,
@@ -40,10 +29,18 @@ pub enum ClientToHub {
     DeleteWorkspace {
         name: String,
     },
-    /// Snapshot of currently-online agents (with `current=true` on the one
-    /// this session is bound to).
-    ListAgents,
-    /// Voluntary client-initiated close.
+    /// Open a PTY session in the given workspace on the selected agent.
+    OpenSession {
+        workspace: String,
+        cols: u16,
+        rows: u16,
+    },
+    /// In-session: terminal-size change (SIGWINCH).
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    /// Voluntary client-initiated close (ends the whole connection).
     Close,
     Pong,
 }
@@ -54,22 +51,19 @@ pub enum HubToClient {
     Welcome {
         account: String,
     },
-    /// Pre-session failure (auth, no agent online, workspace busy, …).
+    /// Connection-level failure (auth, no agent online, …) — terminal.
     Rejected {
         reason: String,
     },
-    SessionOpened {
+    /// Reply to SelectAgent.
+    AgentSelected {
         agent: String,
-        workspace: String,
-        cwd: String,
     },
-    WorkspaceSwitched {
-        workspace: String,
-        cwd: String,
-    },
+    /// Reply to ListAgents.
     AgentList {
         items: Vec<AgentInfo>,
     },
+    /// Reply to ListWorkspaces.
     WorkspaceList {
         items: Vec<String>,
     },
@@ -79,14 +73,20 @@ pub enum HubToClient {
     WorkspaceDeleted {
         name: String,
     },
-    /// Recoverable error during an active session.
-    SessionError {
-        message: String,
+    /// PTY session is up.
+    SessionOpened {
+        agent: String,
+        workspace: String,
+        cwd: String,
     },
-    /// Terminal: server side has shut the session down.
+    /// PTY session ended; client should drop raw mode and return to menu.
     SessionClosed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+    /// Non-fatal error (failed op, busy, ...). Connection stays up.
+    SessionError {
+        message: String,
     },
     Ping,
 }

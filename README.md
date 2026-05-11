@@ -14,7 +14,7 @@ If you use this software to violate any provider's Terms of Service or applicabl
 
 - **`cloudcode-hub`** — public-facing gateway: account-token auth, workspace mutex, JSONL audit log. Relays PTY traffic between clients and agents.
 - **`cloudcode-agent`** — long-running daemon on a host where you've `claude /login`'d. Requires `tmux`. Dials out to the hub over WSS. When the hub asks for a session, the agent spawns `tmux new -A -s cloudcode-<workspace> -c <cwd> claude` and pipes the PTY master to/from the hub. tmux session **persists across reconnects** — close `cloudcode` and reopen later, you're back where you left off.
-- **`cloudcode`** — relay client on your laptop. Puts your local terminal in raw mode and shovels bytes to/from the remote PTY, so you see the **native claude TUI** (status bar, todo board, diffs, permission prompts, claude's own `/clear`/`/login`/etc — everything). `Ctrl+\` enters cloudcode's own escape mode for workspace and agent switching.
+- **`cloudcode`** — relay client on your laptop. First shows a small workspace picker for your agent; once you pick one, your terminal becomes the **native claude TUI** (status bar, todo board, diffs, permission prompts, claude's own `/clear`/`/login`/etc — everything). When claude exits you're dropped back at the picker.
 
 ## Architecture
 
@@ -103,39 +103,39 @@ hub_url = "https://your-hub-host"
 token   = "cc_xxx_from_admin"
 ```
 
-Run `cloudcode` — your terminal becomes the remote claude:
+Run `cloudcode`:
 
 ```bash
-cloudcode                            # uses workspace "default"
-cloudcode --workspace projA          # open straight into a named workspace
+cloudcode                            # menu picks last agent + last workspace
 cloudcode --agent peter-mbp          # pin a specific agent
 ```
 
-Inside the session, **every keystroke goes to remote claude as-is** — claude's own slash commands (`/clear`, `/login`, …) work normally because they're claude's, not ours.
+You land on a small picker:
 
-#### Cloudcode escape mode — `Ctrl+\`
+```
+agent: peter-mbp
+workspaces:
+  [1] * default
+  [2]   projA
+  [3]   projB
 
-To run a cloudcode command (workspace / agent switch, etc), hit `Ctrl+\`. The bottom row turns into a `cc> ` prompt; type a command and press Enter. `Esc` cancels.
+  c <name>   create workspace       d <num|name>  delete workspace
+  a [name]   list/switch agent      q             quit
 
-| Command | Effect |
-|---|---|
-| `a` or `a list` | Show online agents (current prefixed with `*`) |
-| `a use <name>` | Reconnect to a different agent; persisted as default for next time |
-| `w` or `w list` | List workspaces on the current agent |
-| `w use <name>` | Switch this session to a different workspace (tmux session swap) |
-| `w create <name>` | Create a new workspace dir |
-| `w rm <name>` | Delete a workspace (refused if a session has it open) |
-| `status` | Print current agent + workspace |
-| `help` | List commands |
-| `quit` / `q` / `exit` | Close cloudcode (tmux session keeps running on the agent) |
+choose [1]:
+```
 
-Workspaces are named directories under `<workspace_root>` on the agent host (default `~/cloudcode-agent/workspaces/<name>`). Each workspace maps 1:1 to a tmux session named `cloudcode-<workspace>`. A given workspace can be held by **at most one cloudcode session at a time** — the hub enforces this. Closing cloudcode does **not** kill the tmux session; long-running claude tasks (think: background fixes, agentic loops) keep going, and reopening the same workspace re-attaches to the running claude.
+Type a number / name and press Enter to drop into that workspace's claude session. **Inside claude there's no cloudcode escape mode** — every keystroke goes to claude as-is, claude's own slash commands (`/clear`, `/login`, …) work normally. When claude exits (you type `/exit`, the process dies, etc) you're dropped back at the picker. From the picker, `q` quits cloudcode.
 
-The last agent you connected to is remembered in `$XDG_STATE_HOME/cloudcode/last_agent` (default `~/.local/state/cloudcode/last_agent`).
+Workspaces are named directories under `<workspace_root>/<account>/` on the agent host (default `~/cloudcode-agent/workspaces/<account>/<workspace>/`). Each workspace maps 1:1 to a tmux session named `cloudcode-<account>-<workspace>`. A workspace can be held by **at most one cloudcode session at a time per account** — the hub enforces this. Closing cloudcode does **not** kill the tmux session; long-running claude tasks (background fixes, agentic loops) keep going, and reopening the same workspace re-attaches to the running claude.
+
+State persisted in `$XDG_STATE_HOME/cloudcode/`:
+- `last_agent` — the most recent agent name
+- `last_workspace/<agent>.txt` — most recent workspace per agent (used as the picker default)
 
 #### Recording
 
-Every session is recorded to an asciinema cast file on the agent at `~/.local/state/cloudcode/agent/recordings/<workspace>/<session_id>.cast`. Replay with `asciinema play <file>` for audit / debugging. Output only; keystrokes are not recorded (avoids leaking pasted tokens).
+Every session is recorded to an asciinema cast file on the agent at `~/.local/state/cloudcode/agent/recordings/<account>/<workspace>/<session_id>.cast`. Replay with `asciinema play <file>` for audit / debugging. Output only; keystrokes are not recorded (avoids leaking pasted tokens).
 
 > Daemon-mode logs: `~/.local/state/cloudcode/{hub,agent}.log`. Lifecycle: `cloudcode-{hub,agent} daemon {status,stop,restart}`.
 
