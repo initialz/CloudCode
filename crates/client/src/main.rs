@@ -2,7 +2,7 @@ mod proto;
 mod tui;
 mod wire;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -24,6 +24,11 @@ struct Cli {
     /// back to whatever the hub picks if that one is offline.
     #[arg(long)]
     agent: Option<String>,
+
+    /// One-time setup: write a fresh client config.toml template in the user
+    /// config dir. Refuses to overwrite if the file already exists.
+    #[arg(long)]
+    init: bool,
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -98,9 +103,17 @@ async fn main() -> ExitCode {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let cli = Cli::parse();
-    let result = match cli.cmd {
-        None => run_chat(cli.agent, cli.workspace).await,
-        Some(Cmd::Config) => show_config(),
+    let result = if cli.init {
+        if cli.cmd.is_some() {
+            Err(anyhow!("--init cannot be combined with a subcommand"))
+        } else {
+            init_config()
+        }
+    } else {
+        match cli.cmd {
+            None => run_chat(cli.agent, cli.workspace).await,
+            Some(Cmd::Config) => show_config(),
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -123,13 +136,42 @@ fn show_config() -> Result<()> {
         Err(_) => {
             println!();
             println!("config not found. create with:");
-            println!("  mkdir -p {}", path.parent().unwrap().display());
-            println!("  cat > {} <<EOF", path.display());
-            println!("  hub_url = \"http://localhost:7100\"");
-            println!("  token = \"cc_xxx\"");
-            println!("  EOF");
+            println!("  cloudcode --init");
         }
     }
+    Ok(())
+}
+
+fn init_config() -> Result<()> {
+    let path = config_path()?;
+    if path.exists() {
+        return Err(anyhow!(
+            "{} already exists; refusing to overwrite. Delete it first if you really want to re-init.",
+            path.display()
+        ));
+    }
+    let template = r#"# Cloudcode client config.
+# - hub_url: where the hub is reachable (http(s)://… — `cloudcode` rewrites
+#   scheme to ws(s):// internally to dial /v1/session/ws).
+# - token:   account token printed once by `cloudcode-hub gen-token <name>`
+#            on the admin's side; ask them for it.
+
+hub_url = "http://localhost:7100"
+token   = "cc_PASTE_TOKEN_HERE"
+"#;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(&path, template).with_context(|| format!("writing {}", path.display()))?;
+
+    println!("# Wrote {}", path.display());
+    println!();
+    println!("# Next steps:");
+    println!("#   1) Set hub_url to your hub's URL (default 7100 on localhost).");
+    println!("#   2) Ask your hub admin for an account token");
+    println!("#      (`cloudcode-hub gen-token <name>` prints it once).");
+    println!("#   3) Paste it into token = \"...\" then run `cloudcode`.");
     Ok(())
 }
 
