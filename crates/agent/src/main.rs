@@ -1,6 +1,6 @@
-mod claude;
 mod config;
 mod name;
+mod pty;
 mod tunnel;
 mod ws;
 
@@ -9,13 +9,13 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::claude::SessionManager;
 use crate::config::Config;
+use crate::pty::PtyManager;
 
 pub struct AppState {
     pub name: String,
     pub config: Config,
-    pub manager: Arc<SessionManager>,
+    pub manager: Arc<PtyManager>,
 }
 
 #[derive(Parser)]
@@ -94,7 +94,11 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         .unwrap_or_else(name::default_agent_name);
     tracing::info!(agent = %name, "starting cloudcode-agent");
 
-    let manager = Arc::new(SessionManager::new(config.claude.clone()));
+    let manager = Arc::new(PtyManager::new(
+        config.claude.clone(),
+        config.tmux.clone(),
+        config.recording.clone(),
+    )?);
 
     let state = Arc::new(AppState {
         name,

@@ -1,7 +1,7 @@
 use crate::audit::AuditEvent;
 use crate::auth;
-use crate::registry::AgentConn;
-use crate::session_proto::{ClientToHub, HubToClient, SESSION_PROTOCOL_VERSION};
+use crate::pty_proto::{AgentInfo, ClientToHub, HubToClient};
+use crate::registry::{AgentConn, PtyEventOut};
 use crate::tunnel::{ClientMsg, ServerMsg};
 use crate::AppState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -16,7 +16,7 @@ use uuid::Uuid;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 const WORKSPACE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const FROM_AGENT_QUEUE: usize = 256;
+const PTY_EVENT_QUEUE: usize = 1024;
 
 pub async fn upgrade(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
@@ -27,9 +27,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     // ---- Hello (auth) ----
     let hello = tokio::time::timeout(HELLO_TIMEOUT, stream.next()).await;
-    let (token, _version) = match hello {
+    let token = match hello {
         Ok(Some(Ok(Message::Text(s)))) => match serde_json::from_str::<ClientToHub>(&s) {
-            Ok(ClientToHub::Hello { token, version }) => (token, version),
+            Ok(ClientToHub::Hello { token, .. }) => token,
             _ => {
                 let _ = send_client(
                     &mut sink,
@@ -44,22 +44,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         _ => return,
     };
     let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        axum::http::header::AUTHORIZATION,
-        match axum::http::HeaderValue::from_str(&format!("Bearer {}", token)) {
-            Ok(v) => v,
-            Err(_) => {
-                let _ = send_client(
-                    &mut sink,
-                    &HubToClient::Rejected {
-                        reason: "bad token".into(),
-                    },
-                )
-                .await;
-                return;
-            }
-        },
-    );
+    if let Ok(v) = axum::http::HeaderValue::from_str(&format!("Bearer {}", token)) {
+        headers.insert(axum::http::header::AUTHORIZATION, v);
+    } else {
+        let _ = send_client(
+            &mut sink,
+            &HubToClient::Rejected {
+                reason: "bad token".into(),
+            },
+        )
+        .await;
+        return;
+    }
     let account_name = match auth::authenticate(&state.config.accounts, &headers) {
         Ok(a) => a.name.clone(),
         Err(reason) => {
@@ -78,7 +74,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             return;
         }
     };
-
     if send_client(
         &mut sink,
         &HubToClient::Welcome {
@@ -91,11 +86,16 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    // ---- Wait for OpenSession ----
+    // ---- OpenSession ----
     let open = tokio::time::timeout(OPEN_TIMEOUT, stream.next()).await;
-    let (agent_filter, workspace) = match open {
+    let (agent_filter, workspace, cols, rows) = match open {
         Ok(Some(Ok(Message::Text(s)))) => match serde_json::from_str::<ClientToHub>(&s) {
-            Ok(ClientToHub::OpenSession { agent, workspace }) => (agent, workspace),
+            Ok(ClientToHub::OpenSession {
+                agent,
+                workspace,
+                cols,
+                rows,
+            }) => (agent, workspace, cols, rows),
             _ => {
                 let _ = send_client(
                     &mut sink,
@@ -110,8 +110,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         _ => return,
     };
 
-    // Pick agent. Any account may use any online agent — preference goes to
-    // the explicit name the client passed, otherwise we pick any online one.
+    // Pick agent.
     let conn = match &agent_filter {
         Some(name) => match state.registry.get(name) {
             Some(c) => c,
@@ -138,43 +137,36 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 .await;
                 return;
             }
-            // Stable-but-arbitrary pick: first alphabetically. Client-side
-            // `last_agent` persistence covers the "stick to one" UX.
             active.sort();
             state.registry.get(&active[0]).unwrap()
         }
     };
     let agent_name = conn.name.clone();
 
-    // Workspace mutex (try-insert).
-    if !try_claim_workspace(&state, &agent_name, &workspace, Uuid::nil()).0 {
+    // Workspace mutex.
+    let session_id = Uuid::new_v4();
+    if !claim_workspace(&state, &agent_name, &workspace, session_id) {
         let _ = send_client(
             &mut sink,
             &HubToClient::Rejected {
-                reason: format!(
-                    "workspace '{}' is busy on agent '{}'",
-                    workspace, agent_name
-                ),
+                reason: format!("workspace '{}' is busy on agent '{}'", workspace, agent_name),
             },
         )
         .await;
         return;
     }
-    let session_id = Uuid::new_v4();
-    // Swap nil placeholder for real session id under the same key.
-    state
-        .workspaces
-        .insert((agent_name.clone(), workspace.clone()), session_id);
 
-    // Channel for ClientMsg forwarded by AgentConn::handle_frame for this session.
-    let (from_agent_tx, mut from_agent_rx) = mpsc::channel::<ClientMsg>(FROM_AGENT_QUEUE);
-    conn.register_session(session_id, from_agent_tx);
+    // Per-session event channel.
+    let (evt_tx, mut evt_rx) = mpsc::channel::<PtyEventOut>(PTY_EVENT_QUEUE);
+    conn.register_session(session_id, evt_tx);
 
-    // Tell agent to open the session.
+    // Ask agent to open the PTY.
     if conn
-        .send(ServerMsg::SessionStart {
+        .send(ServerMsg::PtyOpen {
             session_id,
             workspace: workspace.clone(),
+            cols,
+            rows,
         })
         .await
         .is_err()
@@ -190,11 +182,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    // Wait for SessionOpened.
-    let opened = tokio::time::timeout(OPEN_TIMEOUT, from_agent_rx.recv()).await;
-    let cwd = match opened {
-        Ok(Some(ClientMsg::SessionOpened { cwd, .. })) => cwd,
-        Ok(Some(ClientMsg::SessionError { message, .. })) => {
+    // Wait for PtyOpened.
+    let cwd = match tokio::time::timeout(OPEN_TIMEOUT, evt_rx.recv()).await {
+        Ok(Some(PtyEventOut::Frame(ClientMsg::PtyOpened { cwd, .. }))) => cwd,
+        Ok(Some(PtyEventOut::Frame(ClientMsg::PtyError { message, .. }))) => {
             cleanup(&state, &conn, session_id, &agent_name, &workspace).await;
             let _ = send_client(&mut sink, &HubToClient::Rejected { reason: message }).await;
             return;
@@ -204,7 +195,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
             let _ = send_client(
                 &mut sink,
                 &HubToClient::Rejected {
-                    reason: "session open timeout".into(),
+                    reason: "pty open timeout".into(),
                 },
             )
             .await;
@@ -236,16 +227,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    // Mutable session state held by this handler.
     let mut current_workspace = workspace.clone();
 
-    // ---- Main loop: multiplex client incoming + agent incoming ----
+    // ---- Main multiplex loop ----
     loop {
         tokio::select! {
             client_msg = stream.next() => {
                 let msg = match client_msg {
                     Some(Ok(m)) => m,
-                    Some(Err(_)) | None => break,
+                    _ => break,
                 };
                 match msg {
                     Message::Text(s) => {
@@ -254,31 +244,25 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             Err(e) => { tracing::warn!(error = %e, "bad client frame"); continue; }
                         };
                         if !handle_client_frame(
-                            &state,
-                            &conn,
-                            &agent_name,
-                            session_id,
-                            &mut current_workspace,
-                            frame,
-                            &mut sink,
+                            &state, &conn, &agent_name, session_id,
+                            &mut current_workspace, frame, &mut sink,
                         ).await {
                             break;
                         }
+                    }
+                    Message::Binary(b) => {
+                        // Forward as PTY input to the agent (tag 0x01 + session_id + payload).
+                        let _ = conn.send_pty_input(session_id, &b).await;
                     }
                     Message::Close(_) => break,
                     _ => {}
                 }
             }
-            agent_msg = from_agent_rx.recv() => {
-                let Some(frame) = agent_msg else { break; };
-                if !handle_agent_frame(
-                    &state,
-                    &agent_name,
-                    &account_name,
-                    session_id,
-                    &mut current_workspace,
-                    frame,
-                    &mut sink,
+            evt = evt_rx.recv() => {
+                let Some(evt) = evt else { break; };
+                if !handle_agent_event(
+                    &state, &agent_name, &account_name, session_id,
+                    &mut current_workspace, evt, &mut sink,
                 ).await {
                     break;
                 }
@@ -286,8 +270,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         }
     }
 
-    // ---- Cleanup ----
-    let _ = conn.send(ServerMsg::SessionStop { session_id }).await;
+    let _ = conn.send(ServerMsg::PtyClose { session_id }).await;
     cleanup(&state, &conn, session_id, &agent_name, &current_workspace).await;
     state.audit.write(AuditEvent {
         account: Some(account_name),
@@ -313,39 +296,28 @@ where
     S: SinkExt<Message, Error = axum::Error> + Unpin,
 {
     match frame {
-        ClientToHub::Input { content } => {
-            if conn
-                .send(ServerMsg::SessionInput {
+        ClientToHub::Resize { cols, rows } => {
+            let _ = conn
+                .send(ServerMsg::PtyResize {
                     session_id,
-                    content,
-                    resume: None,
+                    cols,
+                    rows,
                 })
-                .await
-                .is_err()
-            {
-                return false;
-            }
-            let _ = send_client(sink, &HubToClient::TurnStarted).await;
-            true
-        }
-        ClientToHub::Interrupt => {
-            let _ = conn.send(ServerMsg::SessionInterrupt { session_id }).await;
+                .await;
             true
         }
         ClientToHub::SwitchWorkspace { workspace } => {
-            // Acquire new mutex slot before releasing old. If acquire fails,
-            // tell the client and keep the current workspace.
             if workspace == *current_workspace {
                 let _ = send_client(
                     sink,
                     &HubToClient::SessionError {
-                        message: "already in this workspace; use `:reset` to start fresh".into(),
+                        message: "already in this workspace".into(),
                     },
                 )
                 .await;
                 return true;
             }
-            if !try_claim_workspace(state, agent_name, &workspace, session_id).0 {
+            if !claim_workspace(state, agent_name, &workspace, session_id) {
                 let _ = send_client(
                     sink,
                     &HubToClient::SessionError {
@@ -355,15 +327,18 @@ where
                 .await;
                 return true;
             }
+            // Tell agent to close current PTY + open a new one.
+            let _ = conn.send(ServerMsg::PtyClose { session_id }).await;
             if conn
-                .send(ServerMsg::SessionSwitchWorkspace {
+                .send(ServerMsg::PtyOpen {
                     session_id,
                     workspace: workspace.clone(),
+                    cols: 0,
+                    rows: 0,
                 })
                 .await
                 .is_err()
             {
-                // Roll back claim.
                 state
                     .workspaces
                     .remove_if(&(agent_name.to_string(), workspace.clone()), |_, sid| {
@@ -371,9 +346,31 @@ where
                     });
                 return false;
             }
-            // Wait for SessionWorkspaceSwitched from the agent (handled in
-            // handle_agent_frame, which will release the old slot and emit
-            // HubToClient::WorkspaceSwitched).
+            // We let the agent's PtyOpened (handled in handle_agent_event) drive
+            // the WorkspaceSwitched notification + mutex release on the old slot.
+            let prev = std::mem::replace(current_workspace, workspace);
+            state
+                .workspaces
+                .remove_if(&(agent_name.to_string(), prev), |_, sid| *sid == session_id);
+            state.audit.write(AuditEvent {
+                agent: Some(agent_name.to_string()),
+                session_id: Some(session_id.to_string()),
+                workspace: Some(current_workspace.clone()),
+                status: Some(200),
+                ..AuditEvent::new("workspace_switched")
+            });
+            true
+        }
+        ClientToHub::ListAgents => {
+            let names = state.registry.list_active();
+            let items: Vec<AgentInfo> = names
+                .into_iter()
+                .map(|n| AgentInfo {
+                    current: n == agent_name,
+                    name: n,
+                })
+                .collect();
+            let _ = send_client(sink, &HubToClient::AgentList { items }).await;
             true
         }
         ClientToHub::ListWorkspaces => {
@@ -387,8 +384,7 @@ where
             {
                 return false;
             }
-            let resp = tokio::time::timeout(WORKSPACE_REQUEST_TIMEOUT, rx).await;
-            match resp {
+            match tokio::time::timeout(WORKSPACE_REQUEST_TIMEOUT, rx).await {
                 Ok(Ok(ClientMsg::WorkspaceListResult { items, error, .. })) => {
                     if let Some(e) = error {
                         let _ = send_client(sink, &HubToClient::SessionError { message: e }).await;
@@ -443,7 +439,6 @@ where
             true
         }
         ClientToHub::DeleteWorkspace { name } => {
-            // Hub-side guard: refuse if currently held.
             if state
                 .workspaces
                 .contains_key(&(agent_name.to_string(), name.clone()))
@@ -490,94 +485,56 @@ where
             }
             true
         }
-        ClientToHub::ListAgents => {
-            let names = state.registry.list_active();
-            let items: Vec<crate::session_proto::AgentInfo> = names
-                .into_iter()
-                .map(|n| crate::session_proto::AgentInfo {
-                    current: n == agent_name,
-                    name: n,
-                })
-                .collect();
-            let _ = send_client(sink, &HubToClient::AgentList { items }).await;
-            true
-        }
         ClientToHub::Close => false,
         ClientToHub::Hello { .. } | ClientToHub::OpenSession { .. } | ClientToHub::Pong => true,
     }
 }
 
-async fn handle_agent_frame<S>(
-    state: &Arc<AppState>,
-    agent_name: &str,
-    account_name: &str,
-    session_id: Uuid,
+async fn handle_agent_event<S>(
+    _state: &Arc<AppState>,
+    _agent_name: &str,
+    _account_name: &str,
+    _session_id: Uuid,
     current_workspace: &mut String,
-    frame: ClientMsg,
+    evt: PtyEventOut,
     sink: &mut S,
 ) -> bool
 where
     S: SinkExt<Message, Error = axum::Error> + Unpin,
 {
-    match frame {
-        ClientMsg::SessionTurnStarted { .. } => true,
-        ClientMsg::SessionEvent { event, .. } => {
-            send_client(sink, &HubToClient::ClaudeEvent { event })
-                .await
-                .is_ok()
+    match evt {
+        PtyEventOut::Output(bytes) => {
+            sink.send(Message::Binary(bytes.to_vec())).await.is_ok()
         }
-        ClientMsg::SessionTurnEnded {
-            exit_code, error, ..
-        } => {
-            state.audit.write(AuditEvent {
-                account: Some(account_name.to_string()),
-                agent: Some(agent_name.to_string()),
-                session_id: Some(session_id.to_string()),
-                workspace: Some(current_workspace.clone()),
-                exit_code: Some(exit_code),
-                status: Some(if exit_code == 0 { 200 } else { 500 }),
-                reason: error.clone(),
-                ..AuditEvent::new("turn_ended")
-            });
-            send_client(sink, &HubToClient::TurnEnded { exit_code, error })
-                .await
-                .is_ok()
-        }
-        ClientMsg::SessionWorkspaceSwitched { workspace, cwd, .. } => {
-            // Release the old workspace mutex slot (the new one was claimed
-            // in handle_client_frame before we forwarded the switch).
-            let old = std::mem::replace(current_workspace, workspace.clone());
-            if old != workspace {
-                state
-                    .workspaces
-                    .remove_if(&(agent_name.to_string(), old.clone()), |_, sid| {
-                        *sid == session_id
-                    });
+        PtyEventOut::Frame(ClientMsg::PtyOpened { workspace, cwd, .. }) => {
+            // Workspace-switch confirmation comes back here too (after the
+            // initial open). Report it as WorkspaceSwitched if the workspace
+            // has changed; the initial open was already reported earlier.
+            if workspace != *current_workspace {
+                // Mismatch — agent confirmed a different workspace than what
+                // we recorded. Sync up just in case.
+                *current_workspace = workspace.clone();
             }
-            state.audit.write(AuditEvent {
-                account: Some(account_name.to_string()),
-                agent: Some(agent_name.to_string()),
-                session_id: Some(session_id.to_string()),
-                workspace: Some(workspace.clone()),
-                status: Some(200),
-                ..AuditEvent::new("workspace_switched")
-            });
-            send_client(sink, &HubToClient::WorkspaceSwitched { workspace, cwd })
-                .await
-                .is_ok()
+            send_client(
+                sink,
+                &HubToClient::WorkspaceSwitched {
+                    workspace,
+                    cwd,
+                },
+            )
+            .await
+            .is_ok()
         }
-        ClientMsg::SessionError { message, .. } => {
+        PtyEventOut::Frame(ClientMsg::PtyClosed { reason, .. }) => {
+            let _ = send_client(sink, &HubToClient::SessionClosed { reason }).await;
+            false
+        }
+        PtyEventOut::Frame(ClientMsg::PtyError { message, .. }) => {
             send_client(sink, &HubToClient::SessionError { message })
                 .await
                 .is_ok()
         }
-        ClientMsg::SessionClosed { reason, .. } => {
-            let _ = send_client(sink, &HubToClient::SessionClosed { reason }).await;
-            false
-        }
-        ClientMsg::SessionOpened { .. } => true, // already consumed earlier
-        // Workspace results / hello / pong don't route here.
-        _ => true,
+        PtyEventOut::Frame(_) => true,
     }
 }
 
@@ -589,25 +546,25 @@ async fn cleanup(
     workspace: &str,
 ) {
     conn.unregister_session(session_id);
-    state.workspaces.remove_if(
-        &(agent_name.to_string(), workspace.to_string()),
-        |_, sid| *sid == session_id,
-    );
+    state
+        .workspaces
+        .remove_if(&(agent_name.to_string(), workspace.to_string()), |_, sid| {
+            *sid == session_id
+        });
 }
 
-/// Try to claim `(agent, workspace)` for `session_id`. Returns (claimed, prior_holder).
-fn try_claim_workspace(
+fn claim_workspace(
     state: &Arc<AppState>,
     agent_name: &str,
     workspace: &str,
     session_id: Uuid,
-) -> (bool, Option<Uuid>) {
+) -> bool {
     let key = (agent_name.to_string(), workspace.to_string());
     match state.workspaces.entry(key) {
-        dashmap::mapref::entry::Entry::Occupied(o) => (false, Some(*o.get())),
+        dashmap::mapref::entry::Entry::Occupied(_) => false,
         dashmap::mapref::entry::Entry::Vacant(v) => {
             v.insert(session_id);
-            (true, None)
+            true
         }
     }
 }
@@ -619,8 +576,3 @@ where
     let text = serde_json::to_string(msg).map_err(|_| ())?;
     sink.send(Message::Text(text)).await.map_err(|_| ())
 }
-
-/// Suppress unused warnings for the protocol version constant (re-exported via
-/// session_proto).
-#[allow(dead_code)]
-const _PROTOCOL_VERSION_REF: &str = SESSION_PROTOCOL_VERSION;

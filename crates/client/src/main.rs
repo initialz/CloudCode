@@ -1,5 +1,5 @@
 mod proto;
-mod tui;
+mod relay;
 mod wire;
 
 use anyhow::{anyhow, Context, Result};
@@ -187,38 +187,26 @@ token   = "cc_PASTE_TOKEN_HERE"
 async fn run_chat(agent_flag: Option<String>, workspace: String) -> Result<()> {
     let cfg = load_config()?;
 
-    // First pass: prefer the explicit --agent flag, then the persisted
-    // last_agent. The hub will fall back to picking any online agent if
-    // this is None.
-    let mut chosen_agent = agent_flag.or_else(read_last_agent);
-    let mut chosen_workspace = workspace;
+    let chosen_agent = agent_flag.or_else(read_last_agent);
+    let wire = wire::connect(&cfg.hub_url, &cfg.token).await?;
 
-    loop {
-        let wire = wire::connect(&cfg.hub_url, &cfg.token).await?;
-        wire.tx
-            .send(proto::ClientToHub::OpenSession {
-                agent: chosen_agent.clone(),
-                workspace: chosen_workspace.clone(),
-            })
-            .await
-            .context("hub send")?;
+    // Initial terminal size for the remote PTY.
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
-        let app = tui::App {
-            tx: wire.tx,
-            rx: wire.rx,
-        };
-        let outcome = tui::run(app).await?;
-        if let Some(name) = &outcome.last_agent {
-            write_last_agent(name);
-        }
-        match outcome.next {
-            tui::NextAction::Quit => return Ok(()),
-            tui::NextAction::Reconnect { agent, workspace } => {
-                chosen_agent = Some(agent);
-                if let Some(w) = workspace {
-                    chosen_workspace = w;
-                }
-            }
-        }
+    wire.out_tx
+        .send(wire::OutFrame::Text(proto::ClientToHub::OpenSession {
+            agent: chosen_agent.clone(),
+            workspace: workspace.clone(),
+            cols,
+            rows,
+        }))
+        .await
+        .context("hub send")?;
+
+    let app = relay::App { wire };
+    let result = relay::run(app).await;
+    if let Some(name) = &chosen_agent {
+        write_last_agent(name);
     }
+    result
 }

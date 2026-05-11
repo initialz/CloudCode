@@ -1,4 +1,5 @@
-use crate::tunnel::{ClientMsg, RejectReason, ServerMsg, PROTOCOL_VERSION};
+use crate::pty::OutFrame;
+use crate::tunnel::{unpack_pty_frame, ClientMsg, RejectReason, ServerMsg, PROTOCOL_VERSION, TAG_PTY_INPUT};
 use crate::AppState;
 use anyhow::anyhow;
 use futures::{SinkExt, StreamExt};
@@ -9,7 +10,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const SEND_QUEUE: usize = 128;
+const SEND_QUEUE: usize = 256;
 
 pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
     let mut backoff = Backoff::new();
@@ -21,9 +22,7 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             Err(RunError::Fatal(reason)) => {
-                return Err(anyhow!(
-                    "hub rejected agent ({reason}); fix config and restart"
-                ));
+                return Err(anyhow!("hub rejected agent ({reason}); fix config and restart"));
             }
             Err(RunError::Transient(e)) => {
                 let delay = backoff.next();
@@ -36,9 +35,7 @@ pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
 
 #[derive(Debug)]
 enum RunError {
-    /// Hub explicitly rejected us; reconnecting will not help.
     Fatal(String),
-    /// Network / parse / unexpected disconnect; retry with backoff.
     Transient(String),
 }
 
@@ -84,18 +81,21 @@ async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
         None => return Err(RunError::Transient("eof before welcome".into())),
     }
 
-    let (tx, mut rx) = mpsc::channel::<ClientMsg>(SEND_QUEUE);
+    let (tx, mut rx) = mpsc::channel::<OutFrame>(SEND_QUEUE);
 
     let writer = tokio::spawn(async move {
-        while let Some(m) = rx.recv().await {
-            let text = match serde_json::to_string(&m) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(error = %e, "encode frame failed");
-                    continue;
-                }
+        while let Some(out) = rx.recv().await {
+            let msg = match out {
+                OutFrame::Text(m) => match serde_json::to_string(&m) {
+                    Ok(t) => Message::Text(t),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "encode text frame");
+                        continue;
+                    }
+                },
+                OutFrame::Binary(b) => Message::Binary(b),
             };
-            if sink.send(Message::Text(text)).await.is_err() {
+            if sink.send(msg).await.is_err() {
                 break;
             }
         }
@@ -110,7 +110,7 @@ async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
 
 async fn read_loop<S>(
     state: Arc<AppState>,
-    tx: mpsc::Sender<ClientMsg>,
+    tx: mpsc::Sender<OutFrame>,
     stream: &mut S,
 ) -> Result<(), RunError>
 where
@@ -121,7 +121,7 @@ where
         match msg {
             Message::Text(s) => match serde_json::from_str::<ServerMsg>(&s) {
                 Ok(ServerMsg::Ping) => {
-                    let _ = tx.send(ClientMsg::Pong).await;
+                    let _ = tx.send(OutFrame::Text(ClientMsg::Pong)).await;
                 }
                 Ok(ServerMsg::Welcome { .. }) => {
                     tracing::warn!("duplicate welcome from hub; ignoring");
@@ -136,9 +136,19 @@ where
                         mgr.handle(frame, send).await;
                     });
                 }
-                Err(e) => tracing::warn!(error = %e, "bad frame from hub"),
+                Err(e) => tracing::warn!(error = %e, "bad text frame from hub"),
             },
-            Message::Binary(_) => tracing::warn!("unexpected binary frame from hub"),
+            Message::Binary(b) => {
+                let Some((tag, session_id, payload)) = unpack_pty_frame(&b) else {
+                    tracing::warn!("malformed binary frame");
+                    continue;
+                };
+                if tag != TAG_PTY_INPUT {
+                    tracing::warn!(tag, "unexpected binary tag from hub");
+                    continue;
+                }
+                state.manager.write_input(session_id, payload);
+            }
             Message::Ping(_) | Message::Pong(_) => {}
             Message::Close(_) => return Ok(()),
             Message::Frame(_) => {}
@@ -149,7 +159,6 @@ where
 
 fn reject_label(r: RejectReason) -> &'static str {
     match r {
-        RejectReason::NameInvalid => "name_invalid (hub has no [[agents]] entry with this name)",
         RejectReason::NameTaken => "name_taken (another agent with this name is already connected)",
         RejectReason::AuthFailed => "auth_failed (registration_token does not match)",
         RejectReason::VersionMismatch => "version_mismatch (upgrade agent or hub)",

@@ -1,3 +1,4 @@
+use crate::registry::OutgoingFrame;
 use crate::tunnel::{ClientMsg, RejectReason, ServerMsg, PROTOCOL_VERSION};
 use crate::AppState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -10,7 +11,7 @@ use tokio::sync::mpsc;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const PING_INTERVAL: Duration = Duration::from_secs(30);
-const SEND_QUEUE: usize = 128;
+const SEND_QUEUE: usize = 256;
 
 pub async fn upgrade(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
     ws.on_upgrade(move |socket| handle_socket(socket, state))
@@ -41,20 +42,18 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         return;
     }
 
-    // Single global agent registration token; the agent name is whatever the
-    // agent self-reports (collisions are rejected later as NameTaken).
     if !crate::auth::verify_token(&secret, &state.config.agents.registration_token_hash) {
         let _ = send_rejected(&mut sink, RejectReason::AuthFailed).await;
         return;
     }
 
-    let (tx, mut rx) = mpsc::channel::<ServerMsg>(SEND_QUEUE);
+    let (tx, mut rx) = mpsc::channel::<OutgoingFrame>(SEND_QUEUE);
     let Some(conn) = state.registry.try_register(name.clone(), tx) else {
         let _ = send_rejected(&mut sink, RejectReason::NameTaken).await;
         return;
     };
 
-    if send_frame(&mut sink, &ServerMsg::Welcome { name: name.clone() })
+    if send_text(&mut sink, &ServerMsg::Welcome { name: name.clone() })
         .await
         .is_err()
     {
@@ -66,21 +65,27 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     let writer = tokio::spawn(async move {
         let mut ping = tokio::time::interval(PING_INTERVAL);
-        ping.tick().await; // skip immediate
+        ping.tick().await;
         loop {
             tokio::select! {
                 msg = rx.recv() => {
-                    match msg {
-                        Some(m) => {
-                            if send_frame(&mut sink, &m).await.is_err() {
-                                break;
+                    let Some(out) = msg else { break; };
+                    let r = match out {
+                        OutgoingFrame::Text(m) => match serde_json::to_string(&m) {
+                            Ok(t) => sink.send(Message::Text(t)).await,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "encode hub→agent text");
+                                continue;
                             }
-                        }
-                        None => break,
+                        },
+                        OutgoingFrame::Binary(b) => sink.send(Message::Binary(b)).await,
+                    };
+                    if r.is_err() {
+                        break;
                     }
                 }
                 _ = ping.tick() => {
-                    if send_frame(&mut sink, &ServerMsg::Ping).await.is_err() {
+                    if send_text(&mut sink, &ServerMsg::Ping).await.is_err() {
                         break;
                     }
                 }
@@ -99,12 +104,10 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         };
         match msg {
             Message::Text(s) => match serde_json::from_str::<ClientMsg>(&s) {
-                Ok(frame) => conn.handle_frame(frame).await,
+                Ok(frame) => conn.handle_text_frame(frame).await,
                 Err(e) => tracing::warn!(agent = %name, error = %e, "bad frame"),
             },
-            Message::Binary(_) => {
-                tracing::warn!(agent = %name, "unexpected binary frame");
-            }
+            Message::Binary(b) => conn.handle_binary_frame(&b).await,
             Message::Close(_) => break,
             Message::Ping(_) | Message::Pong(_) => {}
         }
@@ -115,7 +118,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     writer.abort();
 }
 
-async fn send_frame<S>(sink: &mut S, msg: &ServerMsg) -> Result<(), ()>
+async fn send_text<S>(sink: &mut S, msg: &ServerMsg) -> Result<(), ()>
 where
     S: SinkExt<Message, Error = axum::Error> + Unpin,
 {
@@ -127,6 +130,6 @@ async fn send_rejected<S>(sink: &mut S, reason: RejectReason) -> Result<(), ()>
 where
     S: SinkExt<Message, Error = axum::Error> + Unpin,
 {
-    let _ = send_frame(sink, &ServerMsg::Rejected { reason }).await;
+    let _ = send_text(sink, &ServerMsg::Rejected { reason }).await;
     Ok(())
 }

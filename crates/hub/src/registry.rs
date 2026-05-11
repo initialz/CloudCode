@@ -1,4 +1,7 @@
-use crate::tunnel::{ClientMsg, ServerMsg};
+use crate::tunnel::{
+    pack_pty_frame, unpack_pty_frame, ClientMsg, ServerMsg, TAG_PTY_INPUT, TAG_PTY_OUTPUT,
+};
+use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -6,6 +9,22 @@ use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 static NEXT_CONN_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Wraps a frame destined for the agent over the WS tunnel.
+#[derive(Debug)]
+pub enum OutgoingFrame {
+    Text(ServerMsg),
+    Binary(Vec<u8>),
+}
+
+/// Per-PTY-session events that the hub session router consumes.
+#[derive(Debug)]
+pub enum PtyEventOut {
+    /// Forwarded text frame from the agent (PtyOpened / PtyClosed / PtyError).
+    Frame(ClientMsg),
+    /// PTY output payload (already de-prefixed from the binary frame).
+    Output(Bytes),
+}
 
 pub struct AgentRegistry {
     agents: DashMap<String, Arc<AgentConn>>,
@@ -18,12 +37,10 @@ impl AgentRegistry {
         }
     }
 
-    /// Atomically register `name`. Returns None if a connection with this
-    /// name is already registered (caller should send Rejected::NameTaken).
     pub fn try_register(
         self: &Arc<Self>,
         name: String,
-        send: mpsc::Sender<ServerMsg>,
+        send: mpsc::Sender<OutgoingFrame>,
     ) -> Option<Arc<AgentConn>> {
         match self.agents.entry(name.clone()) {
             dashmap::mapref::entry::Entry::Occupied(_) => None,
@@ -41,8 +58,6 @@ impl AgentRegistry {
         }
     }
 
-    /// Remove the entry only if it still matches `conn`'s id. Tells every
-    /// in-flight session / pending workspace request that the agent vanished.
     pub fn unregister(&self, conn: &AgentConn) {
         let should_remove = self
             .agents
@@ -52,18 +67,15 @@ impl AgentRegistry {
         if should_remove {
             self.agents.remove(&conn.name);
         }
-        // Drain sessions and signal disconnect.
         let sids: Vec<Uuid> = conn.sessions.iter().map(|e| *e.key()).collect();
         for sid in sids {
             if let Some((_, tx)) = conn.sessions.remove(&sid) {
-                let _ = tx.try_send(ClientMsg::SessionClosed {
+                let _ = tx.try_send(PtyEventOut::Frame(ClientMsg::PtyClosed {
                     session_id: sid,
                     reason: Some("agent disconnected".into()),
-                });
+                }));
             }
         }
-        // Drop all pending workspace request oneshots; receivers wake with
-        // RecvError and surface "agent disconnected" themselves.
         conn.workspace_requests.clear();
     }
 
@@ -71,7 +83,6 @@ impl AgentRegistry {
         self.agents.get(name).map(|e| e.value().clone())
     }
 
-    /// Snapshot of currently connected agent names.
     pub fn list_active(&self) -> Vec<String> {
         self.agents.iter().map(|e| e.key().clone()).collect()
     }
@@ -86,11 +97,10 @@ impl Default for AgentRegistry {
 pub struct AgentConn {
     pub name: String,
     id: u64,
-    send: mpsc::Sender<ServerMsg>,
-    /// Per-session forward queue. Filled by hub session router when a session
-    /// opens; drained by handle_frame when agent emits Session* frames.
-    sessions: DashMap<Uuid, mpsc::Sender<ClientMsg>>,
-    /// One-shot reply slots keyed by request_id for workspace ops.
+    send: mpsc::Sender<OutgoingFrame>,
+    /// Active PTY sessions hosted by this agent, keyed by session_id.
+    sessions: DashMap<Uuid, mpsc::Sender<PtyEventOut>>,
+    /// One-shot reply slots for workspace_list / create / delete by request_id.
     workspace_requests: DashMap<Uuid, oneshot::Sender<ClientMsg>>,
 }
 
@@ -101,16 +111,27 @@ pub enum DispatchError {
 }
 
 impl AgentConn {
-    /// Send any ServerMsg to the agent over the WS tunnel.
     pub async fn send(&self, msg: ServerMsg) -> Result<(), DispatchError> {
         self.send
-            .send(msg)
+            .send(OutgoingFrame::Text(msg))
             .await
             .map_err(|_| DispatchError::Disconnected)
     }
 
-    /// Register a per-session forward channel. Replaces any previous entry.
-    pub fn register_session(&self, session_id: Uuid, tx: mpsc::Sender<ClientMsg>) {
+    /// Pack and send a TAG_PTY_INPUT binary frame for `session_id`.
+    pub async fn send_pty_input(
+        &self,
+        session_id: Uuid,
+        payload: &[u8],
+    ) -> Result<(), DispatchError> {
+        let frame = pack_pty_frame(TAG_PTY_INPUT, session_id, payload);
+        self.send
+            .send(OutgoingFrame::Binary(frame))
+            .await
+            .map_err(|_| DispatchError::Disconnected)
+    }
+
+    pub fn register_session(&self, session_id: Uuid, tx: mpsc::Sender<PtyEventOut>) {
         self.sessions.insert(session_id, tx);
     }
 
@@ -118,18 +139,21 @@ impl AgentConn {
         self.sessions.remove(&session_id);
     }
 
-    /// Register a one-shot reply slot for a workspace op.
-    pub fn register_workspace_request(&self, request_id: Uuid, tx: oneshot::Sender<ClientMsg>) {
+    pub fn register_workspace_request(
+        &self,
+        request_id: Uuid,
+        tx: oneshot::Sender<ClientMsg>,
+    ) {
         self.workspace_requests.insert(request_id, tx);
     }
 
-    /// Apply an incoming agent frame.
-    pub async fn handle_frame(&self, frame: ClientMsg) {
+    /// Handle an incoming text JSON frame from the agent.
+    pub async fn handle_text_frame(&self, frame: ClientMsg) {
         match classify(&frame) {
             Routing::Session(sid) => {
                 let tx = self.sessions.get(&sid).map(|e| e.value().clone());
                 if let Some(tx) = tx {
-                    let _ = tx.send(frame).await;
+                    let _ = tx.send(PtyEventOut::Frame(frame)).await;
                 } else {
                     tracing::warn!(session = %sid, "no session route for frame; dropping");
                 }
@@ -144,6 +168,26 @@ impl AgentConn {
             Routing::Discard => {}
         }
     }
+
+    /// Handle an incoming binary frame from the agent. Only TAG_PTY_OUTPUT is
+    /// expected; payload is forwarded to the matching session's PTY channel.
+    pub async fn handle_binary_frame(&self, raw: &[u8]) {
+        let Some((tag, sid, payload)) = unpack_pty_frame(raw) else {
+            tracing::warn!("malformed binary frame from agent");
+            return;
+        };
+        if tag != TAG_PTY_OUTPUT {
+            tracing::warn!(tag, "unexpected binary tag from agent");
+            return;
+        }
+        let tx = self.sessions.get(&sid).map(|e| e.value().clone());
+        if let Some(tx) = tx {
+            let bytes = Bytes::copy_from_slice(payload);
+            let _ = tx.send(PtyEventOut::Output(bytes)).await;
+        } else {
+            tracing::trace!(session = %sid, "binary frame for unknown session");
+        }
+    }
 }
 
 enum Routing {
@@ -154,13 +198,9 @@ enum Routing {
 
 fn classify(frame: &ClientMsg) -> Routing {
     match frame {
-        ClientMsg::SessionOpened { session_id, .. }
-        | ClientMsg::SessionTurnStarted { session_id, .. }
-        | ClientMsg::SessionEvent { session_id, .. }
-        | ClientMsg::SessionTurnEnded { session_id, .. }
-        | ClientMsg::SessionWorkspaceSwitched { session_id, .. }
-        | ClientMsg::SessionClosed { session_id, .. }
-        | ClientMsg::SessionError { session_id, .. } => Routing::Session(*session_id),
+        ClientMsg::PtyOpened { session_id, .. }
+        | ClientMsg::PtyClosed { session_id, .. }
+        | ClientMsg::PtyError { session_id, .. } => Routing::Session(*session_id),
         ClientMsg::WorkspaceListResult { request_id, .. }
         | ClientMsg::WorkspaceCreateResult { request_id, .. }
         | ClientMsg::WorkspaceDeleteResult { request_id, .. } => Routing::Workspace(*request_id),

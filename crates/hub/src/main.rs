@@ -1,9 +1,9 @@
 mod audit;
 mod auth;
 mod config;
+mod pty_proto;
+mod pty_session;
 mod registry;
-mod session;
-mod session_proto;
 mod tunnel;
 mod ws_handler;
 
@@ -96,7 +96,7 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     });
 
     let app = Router::new()
-        .route("/v1/session/ws", get(session::upgrade))
+        .route("/v1/pty/ws", get(pty_session::upgrade))
         .route("/v1/agent/ws", get(ws_handler::upgrade))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state);

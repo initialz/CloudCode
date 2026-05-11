@@ -1,9 +1,9 @@
-//! Wire schema for the client ↔ hub WebSocket on `/v1/session/ws`.
+//! Wire schema for the client ↔ hub WebSocket on `/v1/pty/ws`.
 //! Mirrored verbatim in `crates/client/src/proto.rs`.
 
 use serde::{Deserialize, Serialize};
 
-pub const SESSION_PROTOCOL_VERSION: &str = "1";
+pub const PTY_PROTOCOL_VERSION: &str = "1";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -12,18 +12,28 @@ pub enum ClientToHub {
         token: String,
         version: String,
     },
+    /// Open a PTY session. The hub picks an agent (preferring `agent` if
+    /// given), claims the workspace mutex, allocates a session_id, and tells
+    /// the agent to spawn tmux+claude with the given initial size.
     OpenSession {
         #[serde(default)]
         agent: Option<String>,
         workspace: String,
+        cols: u16,
+        rows: u16,
     },
-    Input {
-        content: String,
+    /// Terminal-size change (SIGWINCH).
+    Resize {
+        cols: u16,
+        rows: u16,
     },
-    Interrupt,
+    /// Move the session to another workspace on the same agent (releases the
+    /// old workspace mutex, claims the new one). The agent re-attaches the
+    /// PTY to `cloudcode-<new>` tmux session, creating it if missing.
     SwitchWorkspace {
         workspace: String,
     },
+    /// Workspace metadata ops — forwarded to the bound agent.
     ListWorkspaces,
     CreateWorkspace {
         name: String,
@@ -31,7 +41,10 @@ pub enum ClientToHub {
     DeleteWorkspace {
         name: String,
     },
+    /// Snapshot of currently-online agents (with `current=true` on the one
+    /// this session is bound to).
     ListAgents,
+    /// Voluntary client-initiated close.
     Close,
     Pong,
 }
@@ -42,6 +55,7 @@ pub enum HubToClient {
     Welcome {
         account: String,
     },
+    /// Pre-session failure (auth, no agent online, workspace busy, …).
     Rejected {
         reason: String,
     },
@@ -50,19 +64,12 @@ pub enum HubToClient {
         workspace: String,
         cwd: String,
     },
-    TurnStarted,
-    /// One stream-json line from claude, forwarded verbatim.
-    ClaudeEvent {
-        event: String,
-    },
-    TurnEnded {
-        exit_code: i32,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        error: Option<String>,
-    },
     WorkspaceSwitched {
         workspace: String,
         cwd: String,
+    },
+    AgentList {
+        items: Vec<AgentInfo>,
     },
     WorkspaceList {
         items: Vec<String>,
@@ -73,12 +80,11 @@ pub enum HubToClient {
     WorkspaceDeleted {
         name: String,
     },
-    AgentList {
-        items: Vec<AgentInfo>,
-    },
+    /// Recoverable error during an active session.
     SessionError {
         message: String,
     },
+    /// Terminal: server side has shut the session down.
     SessionClosed {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
@@ -89,7 +95,6 @@ pub enum HubToClient {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub name: String,
-    /// True if this is the agent the current session is bound to.
     #[serde(default)]
     pub current: bool,
 }
