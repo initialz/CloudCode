@@ -228,7 +228,7 @@ async fn handle_key(state: &mut State, app: &mut App, k: KeyEvent) -> bool {
                 if text.trim().is_empty() {
                     return true;
                 }
-                if let Some(cmd) = text.strip_prefix(':') {
+                if let Some(cmd) = text.strip_prefix('/') {
                     handle_slash(state, app, cmd).await;
                 } else {
                     state.push_user(&text);
@@ -268,7 +268,7 @@ async fn handle_slash(state: &mut State, app: &mut App, cmd: &str) {
     match parts.as_slice() {
         ["help"] => {
             state.push_system(
-                "commands: :workspace list|create <n>|switch <n>|delete <n>, :reset, :status, :help, :exit"
+                "commands: /ws list|create <n>|use <n>|remove <n>, /reset, /status, /help, /exit"
                     .into(),
             );
         }
@@ -296,10 +296,10 @@ async fn handle_slash(state: &mut State, app: &mut App, cmd: &str) {
                 state.push_system("requesting fresh conversation (same workspace)…".into());
             }
         }
-        ["workspace", "list"] => {
+        ["ws", "list"] | ["ws"] => {
             let _ = app.tx.send(ClientToHub::ListWorkspaces).await;
         }
-        ["workspace", "create", name] => {
+        ["ws", "create", name] => {
             let _ = app
                 .tx
                 .send(ClientToHub::CreateWorkspace {
@@ -307,7 +307,7 @@ async fn handle_slash(state: &mut State, app: &mut App, cmd: &str) {
                 })
                 .await;
         }
-        ["workspace", "switch", name] => {
+        ["ws", "use", name] | ["ws", "switch", name] => {
             let _ = app
                 .tx
                 .send(ClientToHub::SwitchWorkspace {
@@ -316,7 +316,7 @@ async fn handle_slash(state: &mut State, app: &mut App, cmd: &str) {
                 .await;
             state.push_system(format!("switching to workspace '{}'…", name));
         }
-        ["workspace", "delete", name] => {
+        ["ws", "remove", name] | ["ws", "delete", name] | ["ws", "rm", name] => {
             let _ = app
                 .tx
                 .send(ClientToHub::DeleteWorkspace {
@@ -324,7 +324,7 @@ async fn handle_slash(state: &mut State, app: &mut App, cmd: &str) {
                 })
                 .await;
         }
-        _ => state.push_error(format!("unknown command :{}; try :help", cmd)),
+        _ => state.push_error(format!("unknown command /{}; try /help", cmd)),
     }
 }
 
@@ -350,7 +350,7 @@ async fn handle_hub(state: &mut State, frame: HubToClient, tx: &mpsc::Sender<Cli
             state.workspace = Some(workspace);
             state.cwd = Some(cwd);
             state.pending_session_open = false;
-            state.push_system("session opened. type :help for commands.".into());
+            state.push_system("session opened. type /help for commands.".into());
         }
         HubToClient::TurnStarted => {
             state.turn = TurnState::Active;
@@ -553,7 +553,7 @@ fn draw_chat(f: &mut ratatui::Frame, area: Rect, s: &State) {
 
 fn draw_hint(f: &mut ratatui::Frame, area: Rect) {
     let para = Paragraph::new(Span::styled(
-        " Enter: send · Alt+Enter: newline · Ctrl-C: interrupt/quit · :help ",
+        " Enter: send · Alt+Enter: newline · Ctrl-C: interrupt/quit · /help ",
         Style::default().fg(Color::DarkGray),
     ));
     f.render_widget(para, area);

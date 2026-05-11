@@ -116,14 +116,14 @@ cloudcode --agent peter-mbp          # pin a specific agent
 
 | Command | Effect |
 |---|---|
-| `:workspace list` | Ask the agent to list workspace directories |
-| `:workspace create <name>` | Create a new workspace dir on the agent |
-| `:workspace switch <name>` | Switch the current session to a different workspace; conversation starts fresh |
-| `:workspace delete <name>` | Delete a workspace (refused if any session has it open) |
-| `:reset` | Drop the current conversation, stay in the same workspace |
-| `:status` | Show session info |
-| `:help` | List commands |
-| `:exit` / `:quit` | Close the session |
+| `/ws list` | Ask the agent to list workspace directories |
+| `/ws create <name>` | Create a new workspace dir on the agent |
+| `/ws use <name>` | Switch the current session to a different workspace; conversation starts fresh |
+| `/ws remove <name>` | Delete a workspace (refused if any session has it open) |
+| `/reset` | Drop the current conversation, stay in the same workspace |
+| `/status` | Show session info |
+| `/help` | List commands |
+| `/exit` / `/quit` | Close the session |
 
 Workspaces are named directories under `<workspace_root>` on the agent host (default `~/cloudcode-agent/workspaces/<name>`). A given workspace can be held by at most one session at a time across the whole fleet — the hub enforces this.
 
