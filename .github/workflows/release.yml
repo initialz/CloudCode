@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag (e.g. v0.1.0) for manual run; tag must already exist'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            asset_suffix: linux-x86_64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            asset_suffix: linux-aarch64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            asset_suffix: macos-aarch64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --workspace --target ${{ matrix.target }}
+
+      - name: Package
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          SUFFIX: ${{ matrix.asset_suffix }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          NAME="cloudcode-${TAG}-${SUFFIX}"
+          mkdir -p "dist/${NAME}"
+          cp "target/${TARGET}/release/cloudcode-hub" "dist/${NAME}/"
+          cp "target/${TARGET}/release/cloudcode" "dist/${NAME}/"
+          cp hub.example.toml "dist/${NAME}/"
+          tar -czf "${NAME}.tar.gz" -C dist "${NAME}"
+          (cd dist && sha256sum "${NAME}/cloudcode-hub" "${NAME}/cloudcode" > "../${NAME}.sha256" || \
+            shasum -a 256 "${NAME}/cloudcode-hub" "${NAME}/cloudcode" > "../${NAME}.sha256")
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            cloudcode-*.tar.gz
+            cloudcode-*.sha256
+          fail_on_unmatched_files: true
