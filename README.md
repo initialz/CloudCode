@@ -16,14 +16,22 @@ The hub lives on a host with a public address.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sh -s -- hub
-cloudcode-hub --init                              # writes hub.toml + prints agent registration token
-cloudcode-hub gen-token alice                     # one token per developer
+cloudcode-hub --init                              # writes hub.toml + prints agent registration & admin tokens
 cloudcode-hub daemon start --config ./hub.toml
 ```
 
-Hand out:
-- the **agent registration token** to people running agents
-- one **account token** per developer (printed by `gen-token`)
+`--init` prints **two** one-shot plaintext tokens; save both before they scroll off:
+
+- **agent registration token** → hand to every agent operator (goes into `agent.toml`)
+- **admin UI token** → keep for yourself; you'll paste it once into the admin login page
+
+By default the admin UI listens on `127.0.0.1:7101`. Open <http://localhost:7101/admin/login> (or run an SSH tunnel from your laptop), paste the admin token, and you can:
+
+- create / delete accounts and rotate their tokens (no more SSH-to-host + `gen-token`)
+- browse the audit timeline with filters
+- see active sessions, sessions in the last 24h, online agents
+
+For remote access, put a TLS-terminating reverse proxy in front of `127.0.0.1:7101`.
 
 ### As an agent operator (run claude on this host)
 

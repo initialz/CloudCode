@@ -17,9 +17,9 @@ audit_log = "./audit.jsonl"
 # 运行时先到先得，hub 不预注册 name。轮换 token = 重新 `--init` 一份 hub.toml。
 registration_token_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
 
-# 账号：通过 `cloudcode-hub gen-token <name>` 生成 token 与 hash。
-# 任何 account 都可以连任何在线 agent；client 端用 `/agent use <name>`
-# 自行选择。
+# 账号：通过 `cloudcode-hub gen-token <name>` 生成 token 与 hash，或者
+# 直接在 admin UI 里 Create。第一次启动时下面的 [[accounts]] 会被一次性
+# 导入 SQLite，之后增删 / 改 token 都在 admin UI 里操作。
 [[accounts]]
 name = "alice"
 token_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
@@ -27,3 +27,12 @@ token_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
 # [[accounts]]
 # name = "bob"
 # token_hash = "$argon2id$..."
+
+[admin]
+# 管理界面监听地址。默认只绑 127.0.0.1；远程访问请放在 TLS 反向代理后面。
+listen = "127.0.0.1:7101"
+# SQLite 数据库文件，存账号、审计、session 记录。
+db_path = "./cloudcode-hub.db"
+# 管理 UI 登录 token 的 argon2id 哈希。明文由 `cloudcode-hub --init`
+# 打印一次（务必保存；丢了就只能重 --init 一份新 hub.toml）。
+token_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
