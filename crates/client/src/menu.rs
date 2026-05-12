@@ -95,13 +95,29 @@ async fn run_inner<B: ratatui::backend::Backend>(
                     &agents,
                     &mut a_state,
                     "↑↓ move · Enter pick · Esc/q quit",
+                    false,
                 )
             })?;
             let Some(k) = keys.next(bytes).await else {
                 return Ok(MenuOutcome::Quit);
             };
             match handle_list_key(k, &mut a_state, agents.len()) {
-                ListAction::Pick => break agents[a_state.selected().unwrap_or(0)].clone(),
+                ListAction::Pick => {
+                    let picked = agents[a_state.selected().unwrap_or(0)].clone();
+                    term.draw(|f| {
+                        draw_layout(
+                            f,
+                            account,
+                            "Select agent",
+                            &agents,
+                            &mut a_state,
+                            "↑↓ move · Enter pick · Esc/q quit",
+                            true,
+                        )
+                    })?;
+                    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                    break picked;
+                }
                 ListAction::Quit => return Ok(MenuOutcome::Quit),
                 ListAction::Pass => {}
             }
@@ -144,6 +160,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
                     &workspaces,
                     &mut w_state,
                     "↑↓ move · Enter pick · c create · d delete · Esc back · q quit",
+                    false,
                 )
             })?;
             let Some(k) = keys.next(bytes).await else {
@@ -183,10 +200,22 @@ async fn run_inner<B: ratatui::backend::Backend>(
                 _ => match handle_list_key(k, &mut w_state, workspaces.len()) {
                     ListAction::Pick => {
                         if let Some(sel) = w_state.selected() {
-                            if let Some(ws) = workspaces.get(sel) {
+                            if let Some(ws) = workspaces.get(sel).cloned() {
+                                term.draw(|f| {
+                                    draw_layout(
+                                        f,
+                                        account,
+                                        &format!("Select workspace on {}", agent),
+                                        &workspaces,
+                                        &mut w_state,
+                                        "↑↓ move · Enter pick · c create · d delete · Esc back · q quit",
+                                        true,
+                                    )
+                                })?;
+                                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
                                 return Ok(MenuOutcome::OpenWorkspace {
                                     agent,
-                                    workspace: ws.clone(),
+                                    workspace: ws,
                                 });
                             }
                         }
@@ -289,6 +318,30 @@ fn paint_dialog_frame(f: &mut ratatui::Frame, want_w: u16, want_h: u16) -> Rect 
     inner
 }
 
+/// Render the "primary" (Enter-triggered) button. When `pressed` is true,
+/// it switches to a depressed look — angle brackets become square ones,
+/// the bevel inverts, and the colour dims — so the user gets a moment of
+/// "click" feedback before the action fires.
+fn ok_button(label: &str, pressed: bool) -> Span<'static> {
+    if pressed {
+        Span::styled(
+            format!("  [ {} ]  ", label),
+            Style::default()
+                .bg(Color::DarkGray)
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            format!("  < {} >  ", label),
+            Style::default()
+                .bg(HILITE_BG)
+                .fg(HILITE_FG)
+                .add_modifier(Modifier::BOLD),
+        )
+    }
+}
+
 fn hint_bar(f: &mut ratatui::Frame, hint: &str) {
     let area = f.area();
     if area.height == 0 {
@@ -316,6 +369,7 @@ fn draw_layout(
     items: &[String],
     state: &mut ListState,
     hint: &str,
+    pressed_ok: bool,
 ) {
     paint_desktop(f);
 
@@ -417,14 +471,7 @@ fn draw_layout(
         .highlight_symbol("");
     f.render_stateful_widget(list, chunks[2], state);
 
-    // buttons row: shows the two affordances; bindings are Enter / Esc.
-    let ok = Span::styled(
-        "  < OK >  ",
-        Style::default()
-            .bg(HILITE_BG)
-            .fg(HILITE_FG)
-            .add_modifier(Modifier::BOLD),
-    );
+    let ok = ok_button("OK", pressed_ok);
     let cancel = Span::styled("  <Cancel>  ", Style::default().bg(DIALOG_BG).fg(DIALOG_FG));
     f.render_widget(
         Paragraph::new(
@@ -559,7 +606,7 @@ async fn prompt_confirm<B: ratatui::backend::Backend>(
     keys: &mut MenuKeyQueue,
     msg: &str,
 ) -> Result<bool> {
-    loop {
+    let draw = |term: &mut Terminal<B>, pressed_yes: bool| -> Result<()> {
         let msg_owned = msg.to_string();
         term.draw(move |f| {
             let body = draw_titled_dialog(f, "Confirm", 56, 8);
@@ -577,13 +624,7 @@ async fn prompt_confirm<B: ratatui::backend::Backend>(
                     .style(Style::default().bg(DIALOG_BG).fg(DIALOG_FG)),
                 body_chunks[0],
             );
-            let yes = Span::styled(
-                "  < Yes >  ",
-                Style::default()
-                    .bg(HILITE_BG)
-                    .fg(HILITE_FG)
-                    .add_modifier(Modifier::BOLD),
-            );
+            let yes = ok_button("Yes", pressed_yes);
             let no = Span::styled("  < No >  ", Style::default().bg(DIALOG_BG).fg(DIALOG_FG));
             f.render_widget(
                 Paragraph::new(
@@ -594,11 +635,19 @@ async fn prompt_confirm<B: ratatui::backend::Backend>(
             );
             hint_bar(f, "y/Enter yes · n/Esc no");
         })?;
+        Ok(())
+    };
+    loop {
+        draw(term, false)?;
         let Some(k) = keys.next(bytes).await else {
             return Ok(false);
         };
         match k {
-            MenuKey::Char('y') | MenuKey::Char('Y') | MenuKey::Enter => return Ok(true),
+            MenuKey::Char('y') | MenuKey::Char('Y') | MenuKey::Enter => {
+                draw(term, true)?;
+                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                return Ok(true);
+            }
             MenuKey::Char('n') | MenuKey::Char('N') | MenuKey::Escape => return Ok(false),
             _ => {}
         }
