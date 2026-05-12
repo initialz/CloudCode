@@ -53,12 +53,18 @@
 ;; ---------------------------------------------------------------------
 ;; secrets — deny both read and write, overriding the broad read above
 ;; ---------------------------------------------------------------------
+;; Note ~/Library/Keychains is NOT in this list: claude stores its OAuth
+;; token there ("Claude Code-credentials" in login.keychain-db) and
+;; Security.framework needs to read/mmap the keychain file as part of
+;; looking it up. Keychain access is already gated per-entry by macOS's
+;; own keychain ACL (code-signed identity check) — denying the file
+;; here would just break login without adding meaningful protection
+;; against the entries another tool can already reach.
 (deny file-read* file-write*
     (subpath (string-append (param "HOME_DIR") "/.ssh"))
     (subpath (string-append (param "HOME_DIR") "/.gnupg"))
     (subpath (string-append (param "HOME_DIR") "/.aws"))
     (subpath (string-append (param "HOME_DIR") "/.config/gcloud"))
-    (subpath (string-append (param "HOME_DIR") "/Library/Keychains"))
     (subpath (string-append (param "HOME_DIR") "/Library/Cookies"))
     (subpath (string-append (param "HOME_DIR") "/Library/Application Support/com.apple.TCC")))
 
