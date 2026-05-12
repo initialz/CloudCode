@@ -95,7 +95,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
                     &agents,
                     &mut a_state,
                     "↑↓ move · Enter pick · Esc/q quit",
-                    None,
+                    false,
                 )
             })?;
             let Some(k) = keys.next(bytes).await else {
@@ -103,20 +103,25 @@ async fn run_inner<B: ratatui::backend::Backend>(
             };
             match handle_list_key(k, &mut a_state, agents.len()) {
                 ListAction::Pick => {
-                    let sel = a_state.selected().unwrap_or(0);
-                    let picked = agents[sel].clone();
-                    term.draw(|f| {
-                        draw_layout(
-                            f,
-                            account,
-                            "Select agent",
-                            &agents,
-                            &mut a_state,
-                            "↑↓ move · Enter pick · Esc/q quit",
-                            Some(sel),
-                        )
-                    })?;
-                    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                    let picked = agents[a_state.selected().unwrap_or(0)].clone();
+                    let mut redraw = |pressed: bool| -> Result<()> {
+                        term.draw(|f| {
+                            draw_layout(
+                                f,
+                                account,
+                                "Select agent",
+                                &agents,
+                                &mut a_state,
+                                "↑↓ move · Enter pick · Esc/q quit",
+                                pressed,
+                            )
+                        })?;
+                        Ok(())
+                    };
+                    redraw(true)?;
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    redraw(false)?;
+                    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
                     break picked;
                 }
                 ListAction::Quit => return Ok(MenuOutcome::Quit),
@@ -161,7 +166,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
                     &workspaces,
                     &mut w_state,
                     "↑↓ move · Enter pick · c create · d delete · Esc back · q quit",
-                    None,
+                    false,
                 )
             })?;
             let Some(k) = keys.next(bytes).await else {
@@ -202,18 +207,26 @@ async fn run_inner<B: ratatui::backend::Backend>(
                     ListAction::Pick => {
                         if let Some(sel) = w_state.selected() {
                             if let Some(ws) = workspaces.get(sel).cloned() {
-                                term.draw(|f| {
-                                    draw_layout(
-                                        f,
-                                        account,
-                                        &format!("Select workspace on {}", agent),
-                                        &workspaces,
-                                        &mut w_state,
-                                        "↑↓ move · Enter pick · c create · d delete · Esc back · q quit",
-                                        Some(sel),
-                                    )
-                                })?;
-                                tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                                let title = format!("Select workspace on {}", agent);
+                                let hint = "↑↓ move · Enter pick · c create · d delete · Esc back · q quit";
+                                let mut redraw = |pressed: bool| -> Result<()> {
+                                    term.draw(|f| {
+                                        draw_layout(
+                                            f,
+                                            account,
+                                            &title,
+                                            &workspaces,
+                                            &mut w_state,
+                                            hint,
+                                            pressed,
+                                        )
+                                    })?;
+                                    Ok(())
+                                };
+                                redraw(true)?;
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                redraw(false)?;
+                                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
                                 return Ok(MenuOutcome::OpenWorkspace {
                                     agent,
                                     workspace: ws,
@@ -289,28 +302,43 @@ fn paint_desktop(f: &mut ratatui::Frame) {
 }
 
 /// Centered dialog rect, plus a 2-col / 1-row drop shadow drawn behind it.
-fn paint_dialog_frame(f: &mut ratatui::Frame, want_w: u16, want_h: u16) -> Rect {
+/// When `pressed` is true, the dialog falls onto its shadow (offset by
+/// the same +2 / +1) and the shadow is hidden, giving an "Enter held
+/// down" look. The next frame redrawn with `pressed = false` produces
+/// the spring-back.
+fn paint_dialog_frame(f: &mut ratatui::Frame, want_w: u16, want_h: u16, pressed: bool) -> Rect {
     let area = f.area();
     let w = want_w.min(area.width.saturating_sub(4));
     let h = want_h.min(area.height.saturating_sub(2));
-    let x = area.x + (area.width.saturating_sub(w + 2)) / 2;
-    let y = area.y + (area.height.saturating_sub(h + 1)) / 2;
-    let dialog = Rect {
-        x,
-        y,
-        width: w,
-        height: h,
+    let base_x = area.x + (area.width.saturating_sub(w + 2)) / 2;
+    let base_y = area.y + (area.height.saturating_sub(h + 1)) / 2;
+    let dialog = if pressed {
+        Rect {
+            x: base_x + 2,
+            y: base_y + 1,
+            width: w,
+            height: h,
+        }
+    } else {
+        Rect {
+            x: base_x,
+            y: base_y,
+            width: w,
+            height: h,
+        }
     };
-    let shadow = Rect {
-        x: dialog.x + 2,
-        y: dialog.y + 1,
-        width: dialog.width,
-        height: dialog.height,
-    };
-    f.render_widget(
-        Block::default().style(Style::default().bg(SHADOW_BG)),
-        shadow,
-    );
+    if !pressed {
+        let shadow = Rect {
+            x: dialog.x + 2,
+            y: dialog.y + 1,
+            width: dialog.width,
+            height: dialog.height,
+        };
+        f.render_widget(
+            Block::default().style(Style::default().bg(SHADOW_BG)),
+            shadow,
+        );
+    }
     let block = Block::default()
         .borders(Borders::ALL)
         .style(Style::default().bg(DIALOG_BG).fg(DIALOG_FG));
@@ -400,7 +428,7 @@ fn draw_layout(
     items: &[String],
     state: &mut ListState,
     hint: &str,
-    pressed_index: Option<usize>,
+    pressed: bool,
 ) {
     paint_desktop(f);
 
@@ -410,7 +438,7 @@ fn draw_layout(
         .max((LOGO_W + 6) as usize)) as u16;
     let want_h = (items.len() as u16 + LOGO_H + 6).max(LOGO_H + 8);
 
-    let inner = paint_dialog_frame(f, want_w, want_h);
+    let inner = paint_dialog_frame(f, want_w, want_h, pressed);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -457,7 +485,6 @@ fn draw_layout(
         chunks[2],
     );
 
-    // list with red numbers + press-down animation for the picked row.
     let list_w = chunks[4].width as usize;
     let selected = state.selected();
     let list_items: Vec<ListItem> = if items.is_empty() {
@@ -471,12 +498,12 @@ fn draw_layout(
         items
             .iter()
             .enumerate()
-            .map(|(i, s)| build_row(i, s, list_w, selected, pressed_index))
+            .map(|(i, s)| build_row(i, s, list_w, selected))
             .collect()
     };
-    // We bake the highlight (and the pressed flash) directly into the items,
-    // so the List widget should not apply any extra highlight_style — it
-    // would just paint over what we already drew.
+    // We bake the highlight directly into the items, so the List widget
+    // doesn't need its own highlight_style — that would just paint over
+    // what we already drew.
     let list = List::new(list_items)
         .style(Style::default().bg(DIALOG_BG))
         .highlight_symbol("");
@@ -486,38 +513,15 @@ fn draw_layout(
     hint_bar(f, hint);
 }
 
-/// Build one list row. We bake highlight and the "press-down" effect into
-/// the line directly: when row `i` is the pressed one, it is rendered as
-/// a depressed shadow shifted right by 2 cells and dimmed; when it is the
-/// merely-selected row, it gets the usual blue/white highlight.
-fn build_row(
-    i: usize,
-    name: &str,
-    list_w: usize,
-    selected: Option<usize>,
-    pressed: Option<usize>,
-) -> ListItem<'static> {
+/// Build one list row, baking the highlight directly into the line so we
+/// don't have to rely on ratatui's `highlight_style` (which would
+/// override Span colours we set deliberately).
+fn build_row(i: usize, name: &str, list_w: usize, selected: Option<usize>) -> ListItem<'static> {
     let prefix = format!("  {:>2}  ", i + 1);
     let used = prefix.chars().count() + name.chars().count();
     let pad = list_w.saturating_sub(used);
-    let raw = format!("{}{}{}", prefix, name, " ".repeat(pad));
-
-    if pressed == Some(i) {
-        // Pressed row: shift content right by 2 cells, dim colour palette.
-        let shifted = format!("  {}", raw);
-        let body = shifted.chars().take(list_w).collect::<String>();
-        return ListItem::new(Line::from(Span::styled(
-            body,
-            Style::default()
-                .bg(Color::DarkGray)
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )));
-    }
 
     if selected == Some(i) {
-        // Highlighted row: blue/white bar across full row width. We split
-        // the number prefix so it stays bold red, but bg becomes blue.
         let num_style = Style::default()
             .bg(HILITE_BG)
             .fg(Color::Yellow)
@@ -533,7 +537,6 @@ fn build_row(
         ]));
     }
 
-    // Normal row.
     ListItem::new(Line::from(vec![
         Span::styled(
             prefix,
@@ -557,7 +560,7 @@ fn draw_titled_dialog(
     want_h: u16,
 ) -> Rect {
     paint_desktop(f);
-    let inner = paint_dialog_frame(f, want_w, want_h);
+    let inner = paint_dialog_frame(f, want_w, want_h, false);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
