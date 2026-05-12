@@ -302,25 +302,22 @@ fn paint_desktop(f: &mut ratatui::Frame) {
 }
 
 /// Centered dialog rect, plus a 2-col / 1-row drop shadow drawn behind it.
-/// The shadow stays at base + (2, 2). When `pressed` is true the
-/// dialog moves *halfway* — base + (1, 1) — so the shadow is still
-/// partly visible behind it on both the right and the bottom. Looks
-/// like the dialog is mid-press, not bottomed out. Redrawing with
-/// `pressed = false` springs it back to base.
+/// The shadow stays at base + (2, 1). Terminal cells are roughly
+/// twice as tall as they are wide, so +2 col / +1 row is the offset
+/// that *looks* equal on screen. When `pressed` is true the dialog
+/// moves +1 col on the x-axis (half the shadow's horizontal travel);
+/// y stays put because 1 row is already the minimum vertical step we
+/// can take. Springs back when `pressed = false`.
 fn paint_dialog_frame(f: &mut ratatui::Frame, want_w: u16, want_h: u16, pressed: bool) -> Rect {
     let area = f.area();
-    // Cap size so dialog + shadow + a little margin all fit. The dialog
-    // itself is centered in the available area; the shadow is allowed to
-    // bleed into the bottom-right margin space rather than skewing the
-    // dialog's apparent position.
     let w = want_w.min(area.width.saturating_sub(4));
-    let h = want_h.min(area.height.saturating_sub(4));
+    let h = want_h.min(area.height.saturating_sub(3));
     let base_x = area.x + (area.width.saturating_sub(w)) / 2;
     let base_y = area.y + (area.height.saturating_sub(h)) / 2;
     let dialog = if pressed {
         Rect {
             x: base_x + 1,
-            y: base_y + 1,
+            y: base_y,
             width: w,
             height: h,
         }
@@ -332,11 +329,9 @@ fn paint_dialog_frame(f: &mut ratatui::Frame, want_w: u16, want_h: u16, pressed:
             height: h,
         }
     };
-    // Shadow is anchored to base, not to the (possibly pressed) dialog —
-    // that way pressing only moves the top layer, the shadow stays put.
     let shadow = Rect {
         x: base_x + 2,
-        y: base_y + 2,
+        y: base_y + 1,
         width: w,
         height: h,
     };
