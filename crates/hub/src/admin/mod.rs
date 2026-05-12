@@ -119,7 +119,11 @@ pub fn router(state: AdminState) -> Router {
         )
         .route(
             "/admin/accounts/:name/delete",
-            post(handlers::accounts_delete).route_layer(gate),
+            post(handlers::accounts_delete).route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/audit",
+            get(handlers::audit_list).route_layer(gate),
         )
         .with_state(state)
 }

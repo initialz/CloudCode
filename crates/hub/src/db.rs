@@ -202,6 +202,84 @@ impl Db {
 
     // ---- audit ---------------------------------------------------------
 
+    pub async fn list_audit_events(
+        &self,
+        f: &AuditFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<AuditDisplayRow>> {
+        use sqlx::QueryBuilder;
+        let mut qb = QueryBuilder::new(
+            "SELECT id, ts, kind, account, agent, session_id, workspace, detail
+               FROM audit_events
+              WHERE 1=1",
+        );
+        if let Some(v) = &f.account {
+            qb.push(" AND account = ").push_bind(v.clone());
+        }
+        if let Some(v) = &f.agent {
+            qb.push(" AND agent = ").push_bind(v.clone());
+        }
+        if let Some(v) = &f.kind {
+            qb.push(" AND kind = ").push_bind(v.clone());
+        }
+        if let Some(v) = f.since {
+            qb.push(" AND ts >= ").push_bind(v);
+        }
+        if let Some(v) = f.until {
+            qb.push(" AND ts <= ").push_bind(v);
+        }
+        qb.push(" ORDER BY ts DESC, id DESC LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| AuditDisplayRow {
+                id: r.get("id"),
+                ts: r.get("ts"),
+                kind: r.get("kind"),
+                account: r.get("account"),
+                agent: r.get("agent"),
+                session_id: r.get("session_id"),
+                workspace: r.get("workspace"),
+                detail: r.get("detail"),
+            })
+            .collect())
+    }
+
+    pub async fn count_audit_events(&self, f: &AuditFilter) -> Result<i64> {
+        use sqlx::QueryBuilder;
+        let mut qb = QueryBuilder::new("SELECT COUNT(*) AS n FROM audit_events WHERE 1=1");
+        if let Some(v) = &f.account {
+            qb.push(" AND account = ").push_bind(v.clone());
+        }
+        if let Some(v) = &f.agent {
+            qb.push(" AND agent = ").push_bind(v.clone());
+        }
+        if let Some(v) = &f.kind {
+            qb.push(" AND kind = ").push_bind(v.clone());
+        }
+        if let Some(v) = f.since {
+            qb.push(" AND ts >= ").push_bind(v);
+        }
+        if let Some(v) = f.until {
+            qb.push(" AND ts <= ").push_bind(v);
+        }
+        let row = qb.build().fetch_one(&self.pool).await?;
+        Ok(row.get::<i64, _>("n"))
+    }
+
+    pub async fn distinct_audit_kinds(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT kind FROM audit_events ORDER BY kind",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get("kind")).collect())
+    }
+
     /// Best-effort insert; logs at debug on failure so a flaky disk
     /// doesn't break PTY flow.
     pub async fn insert_audit(&self, row: &AuditRow) {
@@ -276,4 +354,25 @@ pub struct AuditRow {
     pub session_id: Option<String>,
     pub workspace: Option<String>,
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AuditDisplayRow {
+    pub id: i64,
+    pub ts: i64,
+    pub kind: String,
+    pub account: Option<String>,
+    pub agent: Option<String>,
+    pub session_id: Option<String>,
+    pub workspace: Option<String>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AuditFilter {
+    pub account: Option<String>,
+    pub agent: Option<String>,
+    pub kind: Option<String>,
+    pub since: Option<i64>,
+    pub until: Option<i64>,
 }

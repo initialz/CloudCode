@@ -4,8 +4,9 @@
 
 use super::{AdminState, SESSION_COOKIE};
 use crate::auth;
+use crate::db::AuditFilter;
 use axum::{
-    extract::{Form, Path, State},
+    extract::{Form, Path, Query, State},
     http::{header::SET_COOKIE, HeaderMap, StatusCode},
     response::{Html, IntoResponse, Redirect, Response},
 };
@@ -276,6 +277,221 @@ fn unix_to_short(ts: i64) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
+fn unix_to_iso(ts: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+        .map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "—".into())
+}
+
+/// Parse a `<input type="datetime-local">` value ("YYYY-MM-DDTHH:MM[:SS]")
+/// or a plain ISO date ("YYYY-MM-DD") into a UTC unix timestamp.
+fn parse_datetime_local(s: &str) -> Option<i64> {
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M") {
+        return Some(dt.and_utc().timestamp());
+    }
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
+        return Some(dt.and_utc().timestamp());
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return date
+            .and_hms_opt(0, 0, 0)
+            .map(|dt| dt.and_utc().timestamp());
+    }
+    None
+}
+
+// ---------------------------------------------------------------------
+// /admin/audit  (timeline, protected)
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+pub struct AuditQuery {
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub until: Option<String>,
+    #[serde(default)]
+    pub page: Option<i64>,
+}
+
+const AUDIT_PAGE_SIZE: i64 = 100;
+
+pub async fn audit_list(
+    State(state): State<AdminState>,
+    Query(q): Query<AuditQuery>,
+) -> Response {
+    fn norm(v: &Option<String>) -> Option<String> {
+        v.as_ref().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    }
+    let acct = norm(&q.account);
+    let agent = norm(&q.agent);
+    let kind = norm(&q.kind);
+    let since_raw = norm(&q.since);
+    let until_raw = norm(&q.until);
+    let filter = AuditFilter {
+        account: acct.clone(),
+        agent: agent.clone(),
+        kind: kind.clone(),
+        since: since_raw.as_deref().and_then(parse_datetime_local),
+        until: until_raw.as_deref().and_then(parse_datetime_local),
+    };
+
+    let page = q.page.unwrap_or(1).max(1);
+    let offset = (page - 1) * AUDIT_PAGE_SIZE;
+    let rows = match state
+        .app
+        .db
+        .list_audit_events(&filter, AUDIT_PAGE_SIZE, offset)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return Html(error_page(&format!("audit query: {}", e))).into_response();
+        }
+    };
+    let total = state
+        .app
+        .db
+        .count_audit_events(&filter)
+        .await
+        .unwrap_or(rows.len() as i64);
+    let kinds = state.app.db.distinct_audit_kinds().await.unwrap_or_default();
+
+    // Build kind <select>
+    let mut kind_options = String::new();
+    kind_options.push_str(r#"<option value="">(any)</option>"#);
+    for k in &kinds {
+        let sel = if kind.as_deref() == Some(k.as_str()) {
+            " selected"
+        } else {
+            ""
+        };
+        kind_options.push_str(&format!(
+            r#"<option value="{k}"{sel}>{k}</option>"#,
+            k = html_escape(k),
+            sel = sel
+        ));
+    }
+
+    // Build table rows
+    let mut body = String::new();
+    if rows.is_empty() {
+        body.push_str(
+            r#"<tr><td colspan="7" style="opacity:0.6">no events match these filters.</td></tr>"#,
+        );
+    } else {
+        for r in &rows {
+            let sid_short = r
+                .session_id
+                .as_deref()
+                .map(|s| s.chars().take(8).collect::<String>())
+                .unwrap_or_default();
+            body.push_str(&format!(
+                r##"<tr>
+  <td><time>{ts}</time></td>
+  <td><code>{kind}</code></td>
+  <td>{acct}</td>
+  <td>{agt}</td>
+  <td>{ws}</td>
+  <td><code style="opacity:0.6">{sid}</code></td>
+  <td><code style="opacity:0.6">{detail}</code></td>
+</tr>
+"##,
+                ts = unix_to_iso(r.ts),
+                kind = html_escape(&r.kind),
+                acct = html_escape(r.account.as_deref().unwrap_or("—")),
+                agt = html_escape(r.agent.as_deref().unwrap_or("—")),
+                ws = html_escape(r.workspace.as_deref().unwrap_or("—")),
+                sid = html_escape(&sid_short),
+                detail = html_escape(r.detail.as_deref().unwrap_or("")),
+            ));
+        }
+    }
+
+    // Pagination links
+    let last_page = ((total - 1).max(0) / AUDIT_PAGE_SIZE) + 1;
+    let prev_link = if page > 1 {
+        format!(
+            r#"<a href="{}">← Prev</a>"#,
+            audit_url(&acct, &agent, &kind, &since_raw, &until_raw, page - 1)
+        )
+    } else {
+        r#"<span style="opacity:0.4">← Prev</span>"#.into()
+    };
+    let next_link = if page < last_page {
+        format!(
+            r#"<a href="{}">Next →</a>"#,
+            audit_url(&acct, &agent, &kind, &since_raw, &until_raw, page + 1)
+        )
+    } else {
+        r#"<span style="opacity:0.4">Next →</span>"#.into()
+    };
+
+    let html = AUDIT_HTML
+        .replace("<!--HEAD-->", SHELL_HEAD)
+        .replace("<!--FOOT-->", SHELL_FOOT)
+        .replace("<!--ROWS-->", &body)
+        .replace("<!--KIND_OPTIONS-->", &kind_options)
+        .replace("<!--ACCT_VAL-->", &html_escape(acct.as_deref().unwrap_or("")))
+        .replace("<!--AGENT_VAL-->", &html_escape(agent.as_deref().unwrap_or("")))
+        .replace(
+            "<!--SINCE_VAL-->",
+            &html_escape(since_raw.as_deref().unwrap_or("")),
+        )
+        .replace(
+            "<!--UNTIL_VAL-->",
+            &html_escape(until_raw.as_deref().unwrap_or("")),
+        )
+        .replace("<!--PREV-->", &prev_link)
+        .replace("<!--NEXT-->", &next_link)
+        .replace("<!--PAGE_INFO-->", &format!("page {} of {}", page, last_page))
+        .replace("<!--TOTAL-->", &total.to_string());
+    Html(html).into_response()
+}
+
+fn audit_url(
+    account: &Option<String>,
+    agent: &Option<String>,
+    kind: &Option<String>,
+    since: &Option<String>,
+    until: &Option<String>,
+    page: i64,
+) -> String {
+    let mut parts: Vec<String> = vec![format!("page={}", page)];
+    let mut push = |k: &str, v: &Option<String>| {
+        if let Some(s) = v {
+            if !s.is_empty() {
+                parts.push(format!("{}={}", k, urlencoding(s)));
+            }
+        }
+    };
+    push("account", account);
+    push("agent", agent);
+    push("kind", kind);
+    push("since", since);
+    push("until", until);
+    format!("/admin/audit?{}", parts.join("&"))
+}
+
+fn urlencoding(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------
 // Templates (inline; askama later)
 // ---------------------------------------------------------------------
@@ -354,7 +570,8 @@ form.create input { padding: 0.4rem 0.6rem; border: 1px solid #888; border-radiu
 <nav>
   <a href="/admin/">Dashboard</a>
   <a href="/admin/accounts">Accounts</a>
-  <span style="opacity:0.4">audit · sessions (coming)</span>
+  <a href="/admin/audit">Audit</a>
+  <span style="opacity:0.4">sessions (coming)</span>
 </nav>
 "##;
 
@@ -388,7 +605,8 @@ nav a { margin-right: 1rem; }
 <nav>
   <a href="/admin/">Dashboard</a>
   <a href="/admin/accounts">Accounts</a>
-  <span style="opacity:0.4">audit · sessions (coming)</span>
+  <a href="/admin/audit">Audit</a>
+  <span style="opacity:0.4">sessions (coming)</span>
 </nav>
 <section class="card" style="margin-top: 1.5rem; max-width: 14rem;">
   <div class="label">Accounts</div>
@@ -396,6 +614,32 @@ nav a { margin-right: 1rem; }
 </section>
 </body>
 </html>"##;
+
+const AUDIT_HTML: &str = r##"<!--HEAD-->
+<form method="GET" action="/admin/audit" style="display:flex; gap:0.6rem; align-items:flex-end; flex-wrap:wrap; margin-bottom:1rem;">
+  <label>account <input name="account" value="<!--ACCT_VAL-->" placeholder="alice"></label>
+  <label>agent <input name="agent" value="<!--AGENT_VAL-->" placeholder="petez-mbp"></label>
+  <label>kind <select name="kind"><!--KIND_OPTIONS--></select></label>
+  <label>since <input type="datetime-local" name="since" value="<!--SINCE_VAL-->"></label>
+  <label>until <input type="datetime-local" name="until" value="<!--UNTIL_VAL-->"></label>
+  <button type="submit">Filter</button>
+  <a href="/admin/audit" style="margin-left:0.5rem;">reset</a>
+</form>
+<div style="opacity:0.6; margin-bottom:0.5rem;"><!--TOTAL--> events match</div>
+<table>
+  <thead>
+    <tr><th>Time (UTC)</th><th>Kind</th><th>Account</th><th>Agent</th><th>Workspace</th><th>Session</th><th>Detail</th></tr>
+  </thead>
+  <tbody>
+    <!--ROWS-->
+  </tbody>
+</table>
+<div style="display:flex; justify-content:space-between; margin-top:1rem; align-items:center;">
+  <!--PREV-->
+  <span style="opacity:0.6;"><!--PAGE_INFO--></span>
+  <!--NEXT-->
+</div>
+<!--FOOT-->"##;
 
 const ACCOUNTS_HTML: &str = r##"<!--HEAD-->
 <table>
