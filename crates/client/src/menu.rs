@@ -302,19 +302,19 @@ fn paint_desktop(f: &mut ratatui::Frame) {
 }
 
 /// Centered dialog rect, plus a 2-col / 1-row drop shadow drawn behind it.
-/// When `pressed` is true, the dialog falls onto its shadow (offset by
-/// the same +2 / +1) and the shadow is hidden, giving an "Enter held
-/// down" look. The next frame redrawn with `pressed = false` produces
-/// the spring-back.
+/// When `pressed` is true, the dialog falls onto its shadow (same +1
+/// / +1 offset as the shadow itself) and the shadow is hidden, giving
+/// an "Enter held down" look. The next frame redrawn with
+/// `pressed = false` produces the spring-back.
 fn paint_dialog_frame(f: &mut ratatui::Frame, want_w: u16, want_h: u16, pressed: bool) -> Rect {
     let area = f.area();
-    let w = want_w.min(area.width.saturating_sub(4));
+    let w = want_w.min(area.width.saturating_sub(2));
     let h = want_h.min(area.height.saturating_sub(2));
-    let base_x = area.x + (area.width.saturating_sub(w + 2)) / 2;
+    let base_x = area.x + (area.width.saturating_sub(w + 1)) / 2;
     let base_y = area.y + (area.height.saturating_sub(h + 1)) / 2;
     let dialog = if pressed {
         Rect {
-            x: base_x + 2,
+            x: base_x + 1,
             y: base_y + 1,
             width: w,
             height: h,
@@ -329,7 +329,7 @@ fn paint_dialog_frame(f: &mut ratatui::Frame, want_w: u16, want_h: u16, pressed:
     };
     if !pressed {
         let shadow = Rect {
-            x: dialog.x + 2,
+            x: dialog.x + 1,
             y: dialog.y + 1,
             width: dialog.width,
             height: dialog.height,
