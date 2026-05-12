@@ -457,25 +457,18 @@ where
                 ctx.account_name.clone(),
                 workspace.clone(),
             );
-            let claimed = match ctx.state.workspaces.entry(key.clone()) {
-                dashmap::mapref::entry::Entry::Occupied(_) => false,
-                dashmap::mapref::entry::Entry::Vacant(v) => {
-                    v.insert(session_id);
-                    true
+            // Take-over semantics: if another cloudcode client is already
+            // attached to this (agent, account, workspace), evict it. We
+            // close just the previous PTY on the agent — the tmux server
+            // and its session keep running, so when we issue PtyOpen
+            // below the agent attaches to the *same* tmux session and
+            // the new client picks up where the old one left off. The
+            // evicted client sees SessionClosed and drops back to its
+            // own menu.
+            if let Some(prev) = ctx.state.workspaces.insert(key.clone(), session_id) {
+                if prev != session_id {
+                    let _ = conn.send(ServerMsg::PtyClose { session_id: prev }).await;
                 }
-            };
-            if !claimed {
-                let _ = send_client(
-                    sink,
-                    &HubToClient::SessionError {
-                        message: format!(
-                            "workspace '{}' is busy on agent '{}'",
-                            workspace, conn.name
-                        ),
-                    },
-                )
-                .await;
-                return true;
             }
             let (evt_tx, mut evt_rx) = mpsc::channel::<PtyEventOut>(PTY_EVENT_QUEUE);
             conn.register_session(session_id, evt_tx);
