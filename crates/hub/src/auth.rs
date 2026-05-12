@@ -1,4 +1,4 @@
-use crate::config::Account;
+use crate::db::{Db, DbAccount};
 use argon2::password_hash::{rand_core::OsRng, SaltString};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 use axum::http::HeaderMap;
@@ -51,12 +51,16 @@ pub fn extract_token(headers: &HeaderMap) -> Option<String> {
         .map(String::from)
 }
 
-pub fn authenticate<'a>(
-    accounts: &'a [Account],
-    headers: &HeaderMap,
-) -> Result<&'a Account, &'static str> {
+/// Look up a plaintext token against every active account in the db.
+/// O(N) on accounts (each row needs an argon2 verify) but N is small
+/// — hubs in the wild have one account per developer.
+pub async fn authenticate(db: &Db, headers: &HeaderMap) -> Result<DbAccount, &'static str> {
     let token = extract_token(headers).ok_or("missing token")?;
+    let accounts = db.list_accounts().await.map_err(|_| "db error")?;
     for a in accounts {
+        if a.disabled {
+            continue;
+        }
         if verify_token(&token, &a.token_hash) {
             return Ok(a);
         }

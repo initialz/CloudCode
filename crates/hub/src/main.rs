@@ -1,6 +1,7 @@
 mod audit;
 mod auth;
 mod config;
+mod db;
 mod pty_proto;
 mod pty_session;
 mod registry;
@@ -17,11 +18,13 @@ use uuid::Uuid;
 
 use crate::audit::AuditLog;
 use crate::config::Config;
+use crate::db::Db;
 use crate::registry::AgentRegistry;
 
 pub struct AppState {
     pub config: Config,
     pub audit: AuditLog,
+    pub db: Db,
     pub registry: Arc<AgentRegistry>,
     /// (agent_name, account_name, workspace_name) -> session_id, used as a
     /// global mutex so two sessions can't drive `claude` in the same
@@ -87,12 +90,17 @@ async fn main() -> anyhow::Result<()> {
 async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     let config =
         Config::load(&config_path).with_context(|| format!("loading {}", config_path.display()))?;
-    let audit = AuditLog::open(&config.server.audit_log)?;
+    let db = Db::open(&config.admin.db_path)
+        .await
+        .with_context(|| format!("opening admin db at {}", config.admin.db_path.display()))?;
+    migrate_accounts_from_toml(&db, &config).await?;
+    let audit = AuditLog::open(&config.server.audit_log, db.clone())?;
     let listen = config.server.listen.clone();
 
     let state = Arc::new(AppState {
         config,
         audit,
+        db,
         registry: Arc::new(AgentRegistry::new()),
         workspaces: DashMap::new(),
     });
@@ -109,6 +117,36 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     tracing::info!("cloudcode hub listening on {}", listen);
 
     axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// One-shot import of accounts inline in hub.toml into the SQLite db.
+/// Only runs when the db has zero accounts; subsequent hub starts skip
+/// this (the db is the source of truth). The token_hash in toml is
+/// already argon2id, so we copy it as-is. token_prefix is unknown for
+/// imported rows — admin UI will display "(legacy)" for those.
+async fn migrate_accounts_from_toml(db: &Db, config: &Config) -> anyhow::Result<()> {
+    if config.accounts.is_empty() {
+        return Ok(());
+    }
+    let existing = db.account_count().await?;
+    if existing > 0 {
+        return Ok(());
+    }
+    let mut imported = 0;
+    for a in &config.accounts {
+        if let Err(e) = db.insert_account(&a.name, &a.token_hash, None).await {
+            tracing::warn!(account = %a.name, error = %e, "import account skipped");
+            continue;
+        }
+        imported += 1;
+    }
+    if imported > 0 {
+        tracing::info!(
+            count = imported,
+            "imported accounts from hub.toml into admin db (further changes happen in db only)"
+        );
+    }
     Ok(())
 }
 

@@ -40,3 +40,4 @@ ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
 unicode-width = "0.1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "macros"] }

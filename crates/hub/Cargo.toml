@@ -29,4 +29,5 @@ rand.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
 uuid.workspace = true
+sqlx.workspace = true
 cloudcode-daemon = { path = "../daemon" }

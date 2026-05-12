@@ -177,7 +177,7 @@ where
         .await;
         return None;
     }
-    match auth::authenticate(&state.config.accounts, &headers) {
+    match auth::authenticate(&state.db, &headers).await {
         Ok(a) => {
             let name = a.name.clone();
             if send_client(
@@ -530,6 +530,18 @@ where
                 status: Some(200),
                 ..AuditEvent::new("session_opened")
             });
+            // Fire-and-forget the sessions-table insert. If it fails the
+            // audit JSONL + audit_events row still records the start.
+            {
+                let db = ctx.state.db.clone();
+                let sid = session_id.to_string();
+                let account = ctx.account_name.clone();
+                let agent = conn.name.clone();
+                let ws = workspace.clone();
+                tokio::spawn(async move {
+                    db.start_session(&sid, &account, &agent, &ws).await;
+                });
+            }
             let _ = send_client(
                 sink,
                 &HubToClient::SessionOpened {
@@ -597,6 +609,12 @@ where
                     status: Some(200),
                     reason: reason.clone(),
                     ..AuditEvent::new("session_closed")
+                });
+                let db = ctx.state.db.clone();
+                let sid = active.session_id.to_string();
+                let r = reason.clone();
+                tokio::spawn(async move {
+                    db.end_session(&sid, r.as_deref()).await;
                 });
             }
             let _ = send_client(sink, &HubToClient::SessionClosed { reason }).await;
