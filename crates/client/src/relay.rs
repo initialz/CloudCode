@@ -1,10 +1,11 @@
-//! Raw PTY relay: KeyEvent → bytes → hub; hub binary → stdout.
+//! Raw PTY relay: stdin bytes → hub; hub binary → stdout.
 //!
-//! Both directions share `crate::input::spawn_reader`'s KeyEvent stream, so
-//! ownership of stdin never has to be handed back and forth between menu
-//! and relay.
+//! Bytes from `crate::input::spawn_byte_reader` are forwarded verbatim, so
+//! every terminal escape sequence (DA1/DA2 responses, cursor position
+//! reports, mouse events, anything claude's UI library queries) reaches
+//! the remote PTY exactly as the terminal produced it.
 
-use crate::input::{key_event_to_bytes, KeyRx};
+use crate::input::ByteRx;
 use crate::proto::{ClientToHub, HubToClient};
 use crate::wire::{OutFrame, Wire};
 use anyhow::Result;
@@ -12,9 +13,9 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::Write;
 use tokio::sync::mpsc;
 
-pub async fn run(wire: &mut Wire, keys: &mut KeyRx) -> Result<()> {
+pub async fn run(wire: &mut Wire, bytes: &mut ByteRx) -> Result<()> {
     enable_raw_mode()?;
-    let result = relay_loop(wire, keys).await;
+    let result = relay_loop(wire, bytes).await;
     disable_raw_mode().ok();
     let mut stdout = std::io::stdout();
     // Best-effort reset of alt-screen / cursor / mouse modes.
@@ -23,7 +24,7 @@ pub async fn run(wire: &mut Wire, keys: &mut KeyRx) -> Result<()> {
     result
 }
 
-async fn relay_loop(wire: &mut Wire, keys: &mut KeyRx) -> Result<()> {
+async fn relay_loop(wire: &mut Wire, bytes: &mut ByteRx) -> Result<()> {
     if let Some((cols, rows)) = current_terminal_size() {
         let _ = wire
             .out_tx
@@ -34,10 +35,9 @@ async fn relay_loop(wire: &mut Wire, keys: &mut KeyRx) -> Result<()> {
 
     loop {
         tokio::select! {
-            k = keys.recv() => {
-                let Some(k) = k else { return Ok(()); };
-                let Some(bytes) = key_event_to_bytes(k) else { continue; };
-                if wire.out_tx.send(OutFrame::Binary(bytes)).await.is_err() {
+            chunk = bytes.recv() => {
+                let Some(chunk) = chunk else { return Ok(()); };
+                if wire.out_tx.send(OutFrame::Binary(chunk)).await.is_err() {
                     return Ok(());
                 }
             }

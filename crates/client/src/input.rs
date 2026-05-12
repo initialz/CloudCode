@@ -1,30 +1,34 @@
-//! Unified stdin input pipeline.
+//! Raw stdin byte pump shared by menu and relay.
 //!
-//! A single crossterm `EventStream` reads keyboard events; both the menu
-//! (which consumes `KeyEvent` directly) and the PTY relay (which converts
-//! `KeyEvent` back into raw byte sequences) read from the same channel, so
-//! ownership of stdin is never contended.
+//! A blocking std thread reads stdin in chunks and forwards them through an
+//! mpsc channel. The PTY relay consumes bytes verbatim — vital for keeping
+//! claude's terminal queries (DA1/DA2 responses, cursor position reports,
+//! mouse events, anything the terminal echoes back) byte-perfect. The menu
+//! reuses the same channel and runs the bytes through a tiny ANSI parser
+//! to recover the small set of keys it actually needs.
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
-use futures::StreamExt;
+use std::io::Read;
 use tokio::sync::mpsc;
 
-pub type KeyRx = mpsc::Receiver<KeyEvent>;
+pub type ByteRx = mpsc::Receiver<Vec<u8>>;
 
-const KEY_QUEUE: usize = 256;
+const CHUNK_QUEUE: usize = 64;
+const READ_BUF: usize = 4096;
 
-pub fn spawn_reader() -> KeyRx {
-    let (tx, rx) = mpsc::channel::<KeyEvent>(KEY_QUEUE);
-    tokio::spawn(async move {
-        let mut events = EventStream::new();
-        while let Some(item) = events.next().await {
-            match item {
-                Ok(Event::Key(k)) => {
-                    if tx.send(k).await.is_err() {
+pub fn spawn_byte_reader() -> ByteRx {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(CHUNK_QUEUE);
+    std::thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let mut buf = [0u8; READ_BUF];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
                         break;
                     }
                 }
-                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
         }
@@ -32,76 +36,94 @@ pub fn spawn_reader() -> KeyRx {
     rx
 }
 
-/// Translate a crossterm KeyEvent back into the raw byte sequence a terminal
-/// would normally produce, so the PTY relay can hand them through to claude
-/// unchanged. Covers the common keys (control characters, arrows, function
-/// keys, alt-prefixed). Unknown keys → None (dropped).
-pub fn key_event_to_bytes(k: KeyEvent) -> Option<Vec<u8>> {
-    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = k.modifiers.contains(KeyModifiers::ALT);
-    let bytes: Vec<u8> = match k.code {
-        KeyCode::Char(c) => {
-            if ctrl {
-                let lc = c.to_ascii_lowercase();
-                if lc.is_ascii_lowercase() {
-                    vec![(lc as u8) - b'a' + 1]
-                } else if c == ' ' {
-                    vec![0]
-                } else if c == '[' {
-                    vec![0x1b]
-                } else if c == '\\' {
-                    vec![0x1c]
-                } else if c == ']' {
-                    vec![0x1d]
-                } else if c == '^' {
-                    vec![0x1e]
-                } else if c == '_' {
-                    vec![0x1f]
-                } else {
-                    vec![c as u8]
+/// Minimal key event surface used by the menu. The parser deliberately
+/// covers only what the menu binds — anything else (function keys, mouse,
+/// device-attribute responses) is dropped so it can't pollute the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuKey {
+    Char(char),
+    Enter,
+    Backspace,
+    Tab,
+    Escape,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+    End,
+    /// Ctrl + a/b/.../z (byte value 1..=26).
+    Ctrl(u8),
+}
+
+/// Parse a buffered chunk of stdin bytes into menu key events. Unknown
+/// escape sequences are silently discarded; partial sequences at the tail
+/// of the chunk are also discarded (good enough for an interactive menu,
+/// where the user keystroke that started the sequence will arrive in the
+/// same chunk under raw mode).
+pub fn parse_keys(buf: &[u8]) -> Vec<MenuKey> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < buf.len() {
+        let b = buf[i];
+        if b == 0x1b {
+            // Lone ESC at end of chunk.
+            if i + 1 >= buf.len() {
+                out.push(MenuKey::Escape);
+                i += 1;
+                continue;
+            }
+            let n = buf[i + 1];
+            if n == b'[' {
+                // CSI: scan to final byte in 0x40..=0x7e
+                let mut j = i + 2;
+                while j < buf.len() && !(0x40..=0x7e).contains(&buf[j]) {
+                    j += 1;
                 }
+                if j >= buf.len() {
+                    break; // incomplete; drop tail
+                }
+                let params = &buf[i + 2..j];
+                let final_b = buf[j];
+                if params.is_empty() {
+                    match final_b {
+                        b'A' => out.push(MenuKey::Up),
+                        b'B' => out.push(MenuKey::Down),
+                        b'C' => out.push(MenuKey::Right),
+                        b'D' => out.push(MenuKey::Left),
+                        b'H' => out.push(MenuKey::Home),
+                        b'F' => out.push(MenuKey::End),
+                        _ => {}
+                    }
+                }
+                // Other CSI sequences (private markers, parameters, etc.) → drop.
+                i = j + 1;
+                continue;
+            } else if n == b'O' {
+                // SS3 (F1..F4 et al.) — drop the 3-byte sequence.
+                if i + 2 < buf.len() {
+                    i += 3;
+                } else {
+                    break;
+                }
+                continue;
             } else {
-                c.to_string().into_bytes()
+                // ESC + anything else: surface as ESC, then re-process the
+                // byte on the next iteration.
+                out.push(MenuKey::Escape);
+                i += 1;
+                continue;
             }
         }
-        KeyCode::Enter => vec![b'\r'],
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::BackTab => b"\x1b[Z".to_vec(),
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
-        KeyCode::PageUp => b"\x1b[5~".to_vec(),
-        KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::Insert => b"\x1b[2~".to_vec(),
-        KeyCode::F(n) => match n {
-            1 => b"\x1bOP".to_vec(),
-            2 => b"\x1bOQ".to_vec(),
-            3 => b"\x1bOR".to_vec(),
-            4 => b"\x1bOS".to_vec(),
-            5 => b"\x1b[15~".to_vec(),
-            6 => b"\x1b[17~".to_vec(),
-            7 => b"\x1b[18~".to_vec(),
-            8 => b"\x1b[19~".to_vec(),
-            9 => b"\x1b[20~".to_vec(),
-            10 => b"\x1b[21~".to_vec(),
-            11 => b"\x1b[23~".to_vec(),
-            12 => b"\x1b[24~".to_vec(),
-            _ => return None,
-        },
-        _ => return None,
-    };
-    if alt {
-        let mut out = Vec::with_capacity(bytes.len() + 1);
-        out.push(0x1b);
-        out.extend_from_slice(&bytes);
-        Some(out)
-    } else {
-        Some(bytes)
+        match b {
+            b'\r' | b'\n' => out.push(MenuKey::Enter),
+            0x7f | 0x08 => out.push(MenuKey::Backspace),
+            b'\t' => out.push(MenuKey::Tab),
+            0x01..=0x1a => out.push(MenuKey::Ctrl(b)),
+            0x20..=0x7e => out.push(MenuKey::Char(b as char)),
+            _ => {} // discard high bytes; menu inputs are ASCII-only.
+        }
+        i += 1;
     }
+    out
 }

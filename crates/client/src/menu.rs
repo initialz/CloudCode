@@ -8,11 +8,10 @@
 //!
 //! Esc / `q` at the agent picker quits cloudcode.
 
-use crate::input::KeyRx;
+use crate::input::{parse_keys, ByteRx, MenuKey};
 use crate::proto::{ClientToHub, HubToClient};
 use crate::wire::{OutFrame, Wire};
 use anyhow::{anyhow, Result};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -32,7 +31,7 @@ pub enum MenuOutcome {
 
 pub async fn run(
     wire: &mut Wire,
-    keys: &mut KeyRx,
+    bytes: &mut ByteRx,
     account: &str,
     last_agent: Option<&str>,
 ) -> Result<MenuOutcome> {
@@ -41,17 +40,36 @@ pub async fn run(
     execute!(out, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend)?;
-    let result = run_inner(&mut term, wire, keys, account, last_agent).await;
+    let mut keys = MenuKeyQueue::default();
+    let result = run_inner(&mut term, wire, bytes, &mut keys, account, last_agent).await;
     disable_raw_mode().ok();
     execute!(term.backend_mut(), LeaveAlternateScreen).ok();
     term.show_cursor().ok();
     result
 }
 
+#[derive(Default)]
+struct MenuKeyQueue {
+    pending: std::collections::VecDeque<MenuKey>,
+}
+
+impl MenuKeyQueue {
+    async fn next(&mut self, bytes: &mut ByteRx) -> Option<MenuKey> {
+        loop {
+            if let Some(k) = self.pending.pop_front() {
+                return Some(k);
+            }
+            let chunk = bytes.recv().await?;
+            self.pending.extend(parse_keys(&chunk));
+        }
+    }
+}
+
 async fn run_inner<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     wire: &mut Wire,
-    keys: &mut KeyRx,
+    bytes: &mut ByteRx,
+    keys: &mut MenuKeyQueue,
     account: &str,
     last_agent: Option<&str>,
 ) -> Result<MenuOutcome> {
@@ -59,7 +77,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
         // ---- stage 1: agent picker ----
         let agents = list_agents(wire).await?;
         if agents.is_empty() {
-            show_message(term, "no agents online", keys).await?;
+            show_message(term, "no agents online", bytes, keys).await?;
             return Ok(MenuOutcome::Quit);
         }
         let mut a_state = ListState::default();
@@ -79,7 +97,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
                     "↑↓ move · Enter pick · Esc/q quit",
                 )
             })?;
-            let Some(k) = keys.recv().await else {
+            let Some(k) = keys.next(bytes).await else {
                 return Ok(MenuOutcome::Quit);
             };
             match handle_list_key(k, &mut a_state, agents.len()) {
@@ -99,7 +117,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
         match expect_text(wire).await? {
             HubToClient::AgentSelected { .. } => {}
             HubToClient::SessionError { message } => {
-                show_message(term, &format!("error: {}", message), keys).await?;
+                show_message(term, &format!("error: {}", message), bytes, keys).await?;
                 continue 'outer;
             }
             _ => continue 'outer,
@@ -128,16 +146,16 @@ async fn run_inner<B: ratatui::backend::Backend>(
                     "↑↓ move · Enter pick · c create · d delete · Esc back · q quit",
                 )
             })?;
-            let Some(k) = keys.recv().await else {
+            let Some(k) = keys.next(bytes).await else {
                 return Ok(MenuOutcome::Quit);
             };
-            match k.code {
-                KeyCode::Esc => continue 'outer,
-                KeyCode::Char('q') if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(MenuOutcome::Quit);
-                }
-                KeyCode::Char('c') => {
-                    if let Some(name) = prompt_input(term, keys, "create workspace", "").await? {
+            match k {
+                MenuKey::Escape => continue 'outer,
+                MenuKey::Char('q') => return Ok(MenuOutcome::Quit),
+                MenuKey::Char('c') => {
+                    if let Some(name) =
+                        prompt_input(term, bytes, keys, "create workspace", "").await?
+                    {
                         let name = name.trim().to_string();
                         if !name.is_empty() {
                             create_workspace(wire, &name).await?;
@@ -145,12 +163,16 @@ async fn run_inner<B: ratatui::backend::Backend>(
                         }
                     }
                 }
-                KeyCode::Char('d') => {
+                MenuKey::Char('d') => {
                     if let Some(sel) = w_state.selected() {
                         if let Some(ws) = workspaces.get(sel) {
-                            let confirmed =
-                                prompt_confirm(term, keys, &format!("delete workspace '{}'?", ws))
-                                    .await?;
+                            let confirmed = prompt_confirm(
+                                term,
+                                bytes,
+                                keys,
+                                &format!("delete workspace '{}'?", ws),
+                            )
+                            .await?;
                             if confirmed {
                                 delete_workspace(wire, ws).await?;
                                 w_state.select(None);
@@ -185,35 +207,35 @@ enum ListAction {
     Pass,
 }
 
-fn handle_list_key(k: KeyEvent, state: &mut ListState, len: usize) -> ListAction {
+fn handle_list_key(k: MenuKey, state: &mut ListState, len: usize) -> ListAction {
     if len == 0 {
-        if matches!(k.code, KeyCode::Esc | KeyCode::Char('q')) {
+        if matches!(k, MenuKey::Escape | MenuKey::Char('q')) {
             return ListAction::Quit;
         }
         return ListAction::Pass;
     }
     let cur = state.selected().unwrap_or(0);
-    match k.code {
-        KeyCode::Up | KeyCode::Char('k') => {
+    match k {
+        MenuKey::Up | MenuKey::Char('k') => {
             state.select(Some(if cur == 0 { len - 1 } else { cur - 1 }));
             ListAction::Pass
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        MenuKey::Down | MenuKey::Char('j') => {
             state.select(Some((cur + 1) % len));
             ListAction::Pass
         }
-        KeyCode::Home | KeyCode::Char('g') => {
+        MenuKey::Home | MenuKey::Char('g') => {
             state.select(Some(0));
             ListAction::Pass
         }
-        KeyCode::End | KeyCode::Char('G') => {
+        MenuKey::End | MenuKey::Char('G') => {
             state.select(Some(len - 1));
             ListAction::Pass
         }
-        KeyCode::Enter => ListAction::Pick,
-        KeyCode::Esc => ListAction::Quit,
-        KeyCode::Char('q') if !k.modifiers.contains(KeyModifiers::CONTROL) => ListAction::Quit,
-        KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => ListAction::Quit,
+        MenuKey::Enter => ListAction::Pick,
+        MenuKey::Escape => ListAction::Quit,
+        MenuKey::Char('q') => ListAction::Quit,
+        MenuKey::Ctrl(3) => ListAction::Quit, // Ctrl+C
         _ => ListAction::Pass,
     }
 }
@@ -461,7 +483,8 @@ fn draw_titled_dialog(
 async fn show_message<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     msg: &str,
-    keys: &mut KeyRx,
+    bytes: &mut ByteRx,
+    keys: &mut MenuKeyQueue,
 ) -> Result<()> {
     let msg_owned = msg.to_string();
     term.draw(|f| {
@@ -473,13 +496,14 @@ async fn show_message<B: ratatui::backend::Backend>(
         );
         hint_bar(f, "Any key to continue");
     })?;
-    let _ = keys.recv().await;
+    let _ = keys.next(bytes).await;
     Ok(())
 }
 
 async fn prompt_input<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
-    keys: &mut KeyRx,
+    bytes: &mut ByteRx,
+    keys: &mut MenuKeyQueue,
     title: &str,
     initial: &str,
 ) -> Result<Option<String>> {
@@ -494,10 +518,7 @@ async fn prompt_input<B: ratatui::backend::Backend>(
                 .constraints([Constraint::Length(1), Constraint::Min(1)])
                 .split(body);
             let para = Paragraph::new(Line::from(vec![
-                Span::styled(
-                    "  > ",
-                    Style::default().bg(DIALOG_BG).fg(NUM_FG),
-                ),
+                Span::styled("  > ", Style::default().bg(DIALOG_BG).fg(NUM_FG)),
                 Span::styled(
                     buf_view.clone(),
                     Style::default().bg(DIALOG_BG).fg(DIALOG_FG),
@@ -515,16 +536,16 @@ async fn prompt_input<B: ratatui::backend::Backend>(
             );
             hint_bar(f, "Enter accept · Esc cancel");
         })?;
-        let Some(k) = keys.recv().await else {
+        let Some(k) = keys.next(bytes).await else {
             return Ok(None);
         };
-        match k.code {
-            KeyCode::Esc => return Ok(None),
-            KeyCode::Enter => return Ok(Some(buf)),
-            KeyCode::Backspace => {
+        match k {
+            MenuKey::Escape => return Ok(None),
+            MenuKey::Enter => return Ok(Some(buf)),
+            MenuKey::Backspace => {
                 buf.pop();
             }
-            KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+            MenuKey::Char(c) => {
                 buf.push(c);
             }
             _ => {}
@@ -534,7 +555,8 @@ async fn prompt_input<B: ratatui::backend::Backend>(
 
 async fn prompt_confirm<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
-    keys: &mut KeyRx,
+    bytes: &mut ByteRx,
+    keys: &mut MenuKeyQueue,
     msg: &str,
 ) -> Result<bool> {
     loop {
@@ -565,20 +587,19 @@ async fn prompt_confirm<B: ratatui::backend::Backend>(
             let no = Span::styled("  < No >  ", Style::default().bg(DIALOG_BG).fg(DIALOG_FG));
             f.render_widget(
                 Paragraph::new(
-                    Line::from(vec![yes, Span::raw("    "), no])
-                        .alignment(Alignment::Center),
+                    Line::from(vec![yes, Span::raw("    "), no]).alignment(Alignment::Center),
                 )
                 .style(Style::default().bg(DIALOG_BG)),
                 body_chunks[2],
             );
             hint_bar(f, "y/Enter yes · n/Esc no");
         })?;
-        let Some(k) = keys.recv().await else {
+        let Some(k) = keys.next(bytes).await else {
             return Ok(false);
         };
-        match k.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => return Ok(true),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => return Ok(false),
+        match k {
+            MenuKey::Char('y') | MenuKey::Char('Y') | MenuKey::Enter => return Ok(true),
+            MenuKey::Char('n') | MenuKey::Char('N') | MenuKey::Escape => return Ok(false),
             _ => {}
         }
     }

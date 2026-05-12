@@ -212,13 +212,13 @@ async fn run_chat(agent_flag: Option<String>) -> Result<()> {
         other => return Err(anyhow!("expected welcome, got {:?}", other.is_some())),
     };
 
-    let mut keys = input::spawn_reader();
+    let mut bytes = input::spawn_byte_reader();
     let preferred_agent: Option<String> = agent_flag.or_else(read_last_agent);
 
     loop {
         let outcome = menu::run(
             &mut wire,
-            &mut keys,
+            &mut bytes,
             &account_name,
             preferred_agent.as_deref(),
         )
@@ -256,7 +256,7 @@ async fn run_chat(agent_flag: Option<String>) -> Result<()> {
                     continue;
                 }
                 write_last_workspace(&agent, &workspace);
-                relay::run(&mut wire, &mut keys).await.ok();
+                relay::run(&mut wire, &mut bytes).await.ok();
                 // back to menu
             }
             menu::MenuOutcome::Quit => {
