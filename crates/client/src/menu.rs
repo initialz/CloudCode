@@ -21,7 +21,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use ratatui::Terminal;
 use std::io::stdout;
 
@@ -218,6 +218,75 @@ fn handle_list_key(k: KeyEvent, state: &mut ListState, len: usize) -> ListAction
     }
 }
 
+// ---------- retro dialog styling ----------
+
+const DESKTOP_BG: Color = Color::Blue;
+const DIALOG_BG: Color = Color::White;
+const DIALOG_FG: Color = Color::Black;
+const SHADOW_BG: Color = Color::Black;
+const HILITE_BG: Color = Color::Blue;
+const HILITE_FG: Color = Color::White;
+const NUM_FG: Color = Color::Red;
+
+fn paint_desktop(f: &mut ratatui::Frame) {
+    let area = f.area();
+    f.render_widget(
+        Block::default().style(Style::default().bg(DESKTOP_BG)),
+        area,
+    );
+}
+
+/// Centered dialog rect, plus a 2-col / 1-row drop shadow drawn behind it.
+fn paint_dialog_frame(f: &mut ratatui::Frame, want_w: u16, want_h: u16) -> Rect {
+    let area = f.area();
+    let w = want_w.min(area.width.saturating_sub(4));
+    let h = want_h.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w + 2)) / 2;
+    let y = area.y + (area.height.saturating_sub(h + 1)) / 2;
+    let dialog = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    let shadow = Rect {
+        x: dialog.x + 2,
+        y: dialog.y + 1,
+        width: dialog.width,
+        height: dialog.height,
+    };
+    f.render_widget(
+        Block::default().style(Style::default().bg(SHADOW_BG)),
+        shadow,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .style(Style::default().bg(DIALOG_BG).fg(DIALOG_FG));
+    let inner = block.inner(dialog);
+    f.render_widget(block, dialog);
+    inner
+}
+
+fn hint_bar(f: &mut ratatui::Frame, hint: &str) {
+    let area = f.area();
+    if area.height == 0 {
+        return;
+    }
+    let rect = Rect {
+        x: area.x,
+        y: area.y + area.height - 1,
+        width: area.width,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            format!(" {} ", hint),
+            Style::default().bg(DESKTOP_BG).fg(Color::Gray),
+        ))),
+        rect,
+    );
+}
+
 fn draw_layout(
     f: &mut ratatui::Frame,
     account: &str,
@@ -226,133 +295,167 @@ fn draw_layout(
     state: &mut ListState,
     hint: &str,
 ) {
-    let area = f.area();
-    // Mascot is 11 lines tall (10 art + 1 greeting); only show it when the
-    // terminal has room. Below ~24 rows we skip it so the picker stays usable.
-    let show_mascot = area.height >= 20;
-    let mascot_h: u16 = if show_mascot { 11 } else { 0 };
+    paint_desktop(f);
 
-    let constraints = if show_mascot {
-        vec![
-            ratatui::layout::Constraint::Length(mascot_h),
-            ratatui::layout::Constraint::Min(3),
-            ratatui::layout::Constraint::Length(1),
-        ]
-    } else {
-        vec![
-            ratatui::layout::Constraint::Min(3),
-            ratatui::layout::Constraint::Length(1),
-        ]
-    };
+    let label_w = items.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    let want_w = ((label_w + 16).max(title.chars().count() + account.len() + 12).max(50)) as u16;
+    let want_h = (items.len().max(4) as u16 + 7).max(12);
+
+    let inner = paint_dialog_frame(f, want_w, want_h);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area);
+        .constraints([
+            Constraint::Length(1), // title
+            Constraint::Length(1), // rule
+            Constraint::Min(3),    // list
+            Constraint::Length(1), // rule
+            Constraint::Length(1), // buttons
+        ])
+        .split(inner);
 
-    let (list_area, hint_area) = if show_mascot {
-        f.render_widget(mascot_widget(account), chunks[0]);
-        (chunks[1], chunks[2])
-    } else {
-        (chunks[0], chunks[1])
-    };
+    // title row: " Title:                          [account] "
+    let acct_label = format!("[{}]", account);
+    let title_text = format!(" {}:", title);
+    let pad = (chunks[0].width as usize)
+        .saturating_sub(title_text.chars().count() + acct_label.chars().count() + 1);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                title_text,
+                Style::default()
+                    .fg(DIALOG_FG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" ".repeat(pad)),
+            Span::styled(acct_label, Style::default().fg(Color::DarkGray)),
+            Span::raw(" "),
+        ]))
+        .style(Style::default().bg(DIALOG_BG)),
+        chunks[0],
+    );
 
+    // separator rules.
+    let rule_w = chunks[1].width as usize;
+    let rule = "─".repeat(rule_w);
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            rule.clone(),
+            Style::default().bg(DIALOG_BG).fg(DIALOG_FG),
+        )),
+        chunks[1],
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            rule,
+            Style::default().bg(DIALOG_BG).fg(DIALOG_FG),
+        )),
+        chunks[3],
+    );
+
+    // list with red numbers.
+    let list_w = chunks[2].width as usize;
     let list_items: Vec<ListItem> = if items.is_empty() {
-        vec![ListItem::new(Line::from(Span::styled(
-            "  (empty — press `c` to create)",
-            Style::default().fg(Color::DarkGray),
-        )))]
+        let txt = "  (empty — press `c` to create)";
+        let pad = list_w.saturating_sub(txt.chars().count());
+        vec![ListItem::new(Line::from(vec![
+            Span::styled(txt, Style::default().fg(Color::DarkGray).bg(DIALOG_BG)),
+            Span::raw(" ".repeat(pad)),
+        ]))]
     } else {
         items
             .iter()
-            .map(|s| ListItem::new(Line::from(Span::raw(s.clone()))))
+            .enumerate()
+            .map(|(i, s)| {
+                let prefix = format!("  {:>2}  ", i + 1);
+                let used = prefix.chars().count() + s.chars().count();
+                let pad = list_w.saturating_sub(used);
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        prefix,
+                        Style::default()
+                            .fg(NUM_FG)
+                            .bg(DIALOG_BG)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(s.clone(), Style::default().fg(DIALOG_FG).bg(DIALOG_BG)),
+                    Span::raw(" ".repeat(pad)),
+                ]))
+            })
             .collect()
     };
-
     let list = List::new(list_items)
-        .block(
-            Block::default()
-                .title(Span::styled(
-                    format!(" {} ", title),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
+        .style(Style::default().bg(DIALOG_BG))
         .highlight_style(
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
+                .bg(HILITE_BG)
+                .fg(HILITE_FG)
                 .add_modifier(Modifier::BOLD),
         )
-        .highlight_symbol("▶ ");
+        .highlight_symbol("");
+    f.render_stateful_widget(list, chunks[2], state);
 
-    f.render_stateful_widget(list, list_area, state);
+    // buttons row: shows the two affordances; bindings are Enter / Esc.
+    let ok = Span::styled(
+        "  < OK >  ",
+        Style::default()
+            .bg(HILITE_BG)
+            .fg(HILITE_FG)
+            .add_modifier(Modifier::BOLD),
+    );
+    let cancel = Span::styled("  <Cancel>  ", Style::default().bg(DIALOG_BG).fg(DIALOG_FG));
+    f.render_widget(
+        Paragraph::new(
+            Line::from(vec![ok, Span::raw("    "), cancel]).alignment(Alignment::Center),
+        )
+        .style(Style::default().bg(DIALOG_BG).fg(DIALOG_FG)),
+        chunks[4],
+    );
 
-    let hint_widget = Paragraph::new(Span::styled(
-        format!(" {} ", hint),
-        Style::default().fg(Color::DarkGray),
-    ));
-    f.render_widget(hint_widget, hint_area);
+    hint_bar(f, hint);
 }
 
-/// Cute pixel-ish robot mascot, ~10 rows tall. Designed with box-drawing
-/// chars so it stays aligned in monospace fonts.
-fn mascot_widget(account: &str) -> Paragraph<'static> {
-    let body = Style::default().fg(Color::Cyan);
-    let eyes = Style::default()
-        .fg(Color::Yellow)
-        .add_modifier(Modifier::BOLD);
-    let mouth = Style::default().fg(Color::LightMagenta);
-    let antenna = Style::default().fg(Color::White);
-    let cloud = Style::default().fg(Color::LightCyan);
-    let dim = Style::default().fg(Color::DarkGray);
+fn draw_titled_dialog(
+    f: &mut ratatui::Frame,
+    title: &str,
+    want_w: u16,
+    want_h: u16,
+) -> Rect {
+    paint_desktop(f);
+    let inner = paint_dialog_frame(f, want_w, want_h);
 
-    let lines: Vec<Line<'static>> = vec![
-        Line::from(Span::styled(". ° ✦ °  .", cloud)).alignment(Alignment::Center),
-        Line::from(Span::styled("│", antenna)).alignment(Alignment::Center),
-        Line::from(Span::styled("●", antenna)).alignment(Alignment::Center),
-        Line::from(Span::styled("╭─────╮", body)).alignment(Alignment::Center),
-        Line::from(vec![
-            Span::styled("│ ", body),
-            Span::styled("●", eyes),
-            Span::raw(" "),
-            Span::styled("●", eyes),
-            Span::styled(" │", body),
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
         ])
-        .alignment(Alignment::Center),
-        Line::from(vec![
-            Span::styled("│  ", body),
-            Span::styled("◡", mouth),
-            Span::styled("  │", body),
-        ])
-        .alignment(Alignment::Center),
-        Line::from(Span::styled("╰──┬─┬──╯", body)).alignment(Alignment::Center),
-        Line::from(Span::styled("┌─────┴─┴─────┐", body)).alignment(Alignment::Center),
-        Line::from(vec![
-            Span::styled("│ ", body),
-            Span::styled("░", dim),
-            Span::styled(" ▓▓▓▓▓ ", body),
-            Span::styled("░", dim),
-            Span::styled(" │", body),
-        ])
-        .alignment(Alignment::Center),
-        Line::from(Span::styled("└────┬───┬────┘", body)).alignment(Alignment::Center),
-        Line::from(vec![
-            Span::styled("hi ", Style::default().fg(Color::DarkGray)),
+        .split(inner);
+
+    let pad = (chunks[0].width as usize).saturating_sub(title.chars().count() + 2);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
             Span::styled(
-                account.to_string(),
+                format!(" {}:", title),
                 Style::default()
-                    .fg(Color::LightMagenta)
+                    .fg(DIALOG_FG)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" ✨", Style::default().fg(Color::Yellow)),
-        ])
-        .alignment(Alignment::Center),
-    ];
-
-    Paragraph::new(lines)
+            Span::raw(" ".repeat(pad)),
+            Span::raw(" "),
+        ]))
+        .style(Style::default().bg(DIALOG_BG)),
+        chunks[0],
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(chunks[1].width as usize),
+            Style::default().bg(DIALOG_BG).fg(DIALOG_FG),
+        )),
+        chunks[1],
+    );
+    chunks[2]
 }
 
 async fn show_message<B: ratatui::backend::Backend>(
@@ -360,11 +463,15 @@ async fn show_message<B: ratatui::backend::Backend>(
     msg: &str,
     keys: &mut KeyRx,
 ) -> Result<()> {
+    let msg_owned = msg.to_string();
     term.draw(|f| {
-        let area = f.area();
-        let block = Block::default().title(" cloudcode ").borders(Borders::ALL);
-        let p = Paragraph::new(Line::from(Span::raw(msg))).block(block);
-        f.render_widget(p, centered_rect(area, 50, 5));
+        let body = draw_titled_dialog(f, "cloudcode", 50, 7);
+        f.render_widget(
+            Paragraph::new(Line::from(Span::raw(msg_owned)))
+                .style(Style::default().bg(DIALOG_BG).fg(DIALOG_FG)),
+            body,
+        );
+        hint_bar(f, "Any key to continue");
     })?;
     let _ = keys.recv().await;
     Ok(())
@@ -381,29 +488,32 @@ async fn prompt_input<B: ratatui::backend::Backend>(
         let title_owned = title.to_string();
         let buf_view = buf.clone();
         term.draw(move |f| {
-            let area = f.area();
-            let rect = centered_rect(area, 60, 5);
-            f.render_widget(Clear, rect);
-            let block = Block::default()
-                .title(format!(" {} ", title_owned))
-                .borders(Borders::ALL);
-            let inner = block.inner(rect);
-            f.render_widget(block, rect);
-            let para = Paragraph::new(Line::from(vec![
-                Span::styled("> ", Style::default().fg(Color::Cyan)),
-                Span::raw(buf_view.clone()),
-                Span::styled("█", Style::default().fg(Color::Cyan)),
-            ]));
-            let hint = Paragraph::new(Span::styled(
-                " Enter accept · Esc cancel ",
-                Style::default().fg(Color::DarkGray),
-            ));
-            let inner_chunks = Layout::default()
+            let body = draw_titled_dialog(f, &title_owned, 60, 7);
+            let body_chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Length(1)])
-                .split(inner);
-            f.render_widget(para, inner_chunks[0]);
-            f.render_widget(hint, inner_chunks[1]);
+                .constraints([Constraint::Length(1), Constraint::Min(1)])
+                .split(body);
+            let para = Paragraph::new(Line::from(vec![
+                Span::styled(
+                    "  > ",
+                    Style::default().bg(DIALOG_BG).fg(NUM_FG),
+                ),
+                Span::styled(
+                    buf_view.clone(),
+                    Style::default().bg(DIALOG_BG).fg(DIALOG_FG),
+                ),
+                Span::styled("█", Style::default().bg(DIALOG_BG).fg(HILITE_BG)),
+            ]))
+            .style(Style::default().bg(DIALOG_BG));
+            f.render_widget(para, body_chunks[0]);
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "                ",
+                    Style::default().bg(DIALOG_BG),
+                )),
+                body_chunks[1],
+            );
+            hint_bar(f, "Enter accept · Esc cancel");
         })?;
         let Some(k) = keys.recv().await else {
             return Ok(None);
@@ -430,46 +540,47 @@ async fn prompt_confirm<B: ratatui::backend::Backend>(
     loop {
         let msg_owned = msg.to_string();
         term.draw(move |f| {
-            let area = f.area();
-            let rect = centered_rect(area, 50, 5);
-            f.render_widget(Clear, rect);
-            let block = Block::default().title(" confirm ").borders(Borders::ALL);
-            let inner = block.inner(rect);
-            f.render_widget(block, rect);
-            let chunks = Layout::default()
+            let body = draw_titled_dialog(f, "Confirm", 56, 8);
+            let body_chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Length(1)])
-                .split(inner);
-            f.render_widget(Paragraph::new(Line::from(Span::raw(msg_owned))), chunks[0]);
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(0),
+                ])
+                .split(body);
             f.render_widget(
-                Paragraph::new(Span::styled(
-                    " y yes · n/Esc no ",
-                    Style::default().fg(Color::DarkGray),
-                )),
-                chunks[1],
+                Paragraph::new(Line::from(Span::raw(format!("  {}", msg_owned))))
+                    .style(Style::default().bg(DIALOG_BG).fg(DIALOG_FG)),
+                body_chunks[0],
             );
+            let yes = Span::styled(
+                "  < Yes >  ",
+                Style::default()
+                    .bg(HILITE_BG)
+                    .fg(HILITE_FG)
+                    .add_modifier(Modifier::BOLD),
+            );
+            let no = Span::styled("  < No >  ", Style::default().bg(DIALOG_BG).fg(DIALOG_FG));
+            f.render_widget(
+                Paragraph::new(
+                    Line::from(vec![yes, Span::raw("    "), no])
+                        .alignment(Alignment::Center),
+                )
+                .style(Style::default().bg(DIALOG_BG)),
+                body_chunks[2],
+            );
+            hint_bar(f, "y/Enter yes · n/Esc no");
         })?;
         let Some(k) = keys.recv().await else {
             return Ok(false);
         };
         match k.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => return Ok(true),
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => return Ok(true),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => return Ok(false),
             _ => {}
         }
-    }
-}
-
-fn centered_rect(area: Rect, width_pct: u16, height: u16) -> Rect {
-    let h = height.min(area.height);
-    let w = (area.width * width_pct / 100).clamp(20, area.width);
-    let y = area.y + (area.height.saturating_sub(h)) / 2;
-    let x = area.x + (area.width.saturating_sub(w)) / 2;
-    Rect {
-        x,
-        y,
-        width: w,
-        height: h,
     }
 }
 
