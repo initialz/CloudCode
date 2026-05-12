@@ -1,3 +1,4 @@
+mod admin;
 mod audit;
 mod auth;
 mod config;
@@ -109,12 +110,35 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         .route("/v1/pty/ws", get(pty_session::upgrade))
         .route("/v1/agent/ws", get(ws_handler::upgrade))
         .route("/healthz", get(|| async { "ok" }))
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&listen)
         .await
         .with_context(|| format!("binding {}", listen))?;
     tracing::info!("cloudcode hub listening on {}", listen);
+
+    // Optional admin server on a separate listener. Runs only if
+    // [admin].token_hash is set in hub.toml (i.e. you've run --init at
+    // least once on a v0.7+ hub).
+    if let Some(token_hash) = state.config.admin.token_hash.clone() {
+        let admin_listen = state.config.admin.listen.clone();
+        let admin_state = admin::AdminState {
+            app: state.clone(),
+            auth: Arc::new(admin::AdminAuth::new(token_hash)),
+        };
+        let admin_app = admin::router(admin_state);
+        let admin_listener = tokio::net::TcpListener::bind(&admin_listen)
+            .await
+            .with_context(|| format!("binding admin listener on {}", admin_listen))?;
+        tracing::info!(admin = %admin_listen, "admin UI ready (login at /admin/login)");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(admin_listener, admin_app).await {
+                tracing::error!(error = %e, "admin server stopped");
+            }
+        });
+    } else {
+        tracing::info!("admin UI disabled — set [admin].token_hash in hub.toml");
+    }
 
     axum::serve(listener, app).await?;
     Ok(())
@@ -251,6 +275,8 @@ fn init_config(path: &Path) -> anyhow::Result<()> {
 
     let agent_token = auth::generate_agent_token();
     let agent_token_hash = auth::hash_token(&agent_token)?;
+    let admin_token = auth::generate_admin_token();
+    let admin_token_hash = auth::hash_token(&admin_token)?;
 
     let template = format!(
         r#"# Cloudcode Hub config. Task gateway for `claude` subprocesses
@@ -269,12 +295,21 @@ audit_log = "./audit.jsonl"
 # To rotate: re-run `cloudcode-hub --init` against a fresh hub.toml.
 registration_token_hash = "{agent_token_hash}"
 
-# Accounts. Generate per-user tokens with:
-#   cloudcode-hub gen-token alice
-# Any account may use any online agent — the client chooses via /agent use.
+# Accounts. Once the hub starts these are imported into the admin db
+# and managed from the admin UI / `cloudcode-hub gen-token`.
 # [[accounts]]
 # name = "alice"
 # token_hash = "$argon2id$v=19$..."
+
+[admin]
+# Listen address for the admin UI. 127.0.0.1 by default — put a reverse
+# proxy with TLS in front if you want remote access.
+listen = "127.0.0.1:7101"
+# Path to the SQLite database (accounts, audit events, session records).
+db_path = "./cloudcode-hub.db"
+# argon2id hash of the admin UI login token. The plaintext was printed
+# once by --init; if you lose it, re-run --init against a fresh hub.toml.
+token_hash = "{admin_token_hash}"
 "#
     );
 
@@ -291,6 +326,10 @@ registration_token_hash = "{agent_token_hash}"
     println!("# Agent registration token (give to every agent operator;");
     println!("# they paste it into agent.toml [auth].registration_token):");
     println!("{}", agent_token);
+    println!();
+    println!("# Admin UI login token (open the admin URL and paste this");
+    println!("# once; lost == re-run --init against a fresh hub.toml):");
+    println!("{}", admin_token);
     println!();
     println!("# Next steps:");
     println!("#   1) Generate per-user tokens:");

@@ -47,18 +47,33 @@ pub struct AdminConfig {
     /// records used by the admin UI.
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
+    /// argon2id hash of the admin UI login token. If absent the admin
+    /// HTTP server is not started. The plaintext is printed once by
+    /// `cloudcode-hub --init`.
+    #[serde(default)]
+    pub token_hash: Option<String>,
+    /// HTTP listen address for the admin UI. Defaults to localhost only
+    /// — put a TLS-terminating reverse proxy in front for remote access.
+    #[serde(default = "default_admin_listen")]
+    pub listen: String,
 }
 
 impl Default for AdminConfig {
     fn default() -> Self {
         Self {
             db_path: default_db_path(),
+            token_hash: None,
+            listen: default_admin_listen(),
         }
     }
 }
 
 fn default_db_path() -> PathBuf {
     PathBuf::from("./cloudcode-hub.db")
+}
+
+fn default_admin_listen() -> String {
+    "127.0.0.1:7101".into()
 }
 
 impl Config {

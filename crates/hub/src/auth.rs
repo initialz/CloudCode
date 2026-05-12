@@ -12,6 +12,17 @@ pub fn generate_agent_token() -> String {
     generate_token_with_prefix("ag_")
 }
 
+pub fn generate_admin_token() -> String {
+    generate_token_with_prefix("ad_")
+}
+
+pub fn generate_session_id() -> String {
+    let mut bytes = [0u8; 18];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
 fn generate_token_with_prefix(prefix: &str) -> String {
     let mut bytes = [0u8; 24];
     rand::thread_rng().fill_bytes(&mut bytes);
