@@ -68,9 +68,10 @@ pub enum HubToClient {
     AgentList {
         items: Vec<AgentInfo>,
     },
-    /// Reply to ListWorkspaces.
+    /// Reply to ListWorkspaces. Each item carries enough state for
+    /// the picker to render the right badge (active / saved / blank).
     WorkspaceList {
-        items: Vec<String>,
+        items: Vec<WorkspaceInfo>,
     },
     WorkspaceCreated {
         name: String,
@@ -101,4 +102,19 @@ pub struct AgentInfo {
     pub name: String,
     #[serde(default)]
     pub current: bool,
+}
+
+/// Workspace status row carried in HubToClient::WorkspaceList.
+///
+/// - `tmux_alive` = agent has a live tmux server for this workspace
+///   (so the previous claude state is still recoverable).
+/// - `has_client` = some cloudcode client is currently attached to it.
+///   Opening it would trigger take-over.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkspaceInfo {
+    pub name: String,
+    #[serde(default)]
+    pub tmux_alive: bool,
+    #[serde(default)]
+    pub has_client: bool,
 }

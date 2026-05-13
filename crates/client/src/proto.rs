@@ -68,9 +68,10 @@ pub enum HubToClient {
     AgentList {
         items: Vec<AgentInfo>,
     },
-    /// Reply to ListWorkspaces.
+    /// Reply to ListWorkspaces. Each item carries its current state
+    /// (tmux_alive + has_client) so the picker can render badges.
     WorkspaceList {
-        items: Vec<String>,
+        items: Vec<WorkspaceInfo>,
     },
     WorkspaceCreated {
         name: String,
@@ -101,4 +102,15 @@ pub struct AgentInfo {
     pub name: String,
     #[serde(default)]
     pub current: bool,
+}
+
+/// Per-workspace status badge data, returned alongside the workspace
+/// name in HubToClient::WorkspaceList.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkspaceInfo {
+    pub name: String,
+    #[serde(default)]
+    pub tmux_alive: bool,
+    #[serde(default)]
+    pub has_client: bool,
 }

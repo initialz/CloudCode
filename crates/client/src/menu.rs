@@ -86,13 +86,20 @@ async fn run_inner<B: ratatui::backend::Backend>(
             .unwrap_or(0);
         a_state.select(Some(initial));
 
+        let agent_rows: Vec<PickerRow> = agents
+            .iter()
+            .map(|n| PickerRow {
+                name: n.clone(),
+                badge: None,
+            })
+            .collect();
         let agent = loop {
             term.draw(|f| {
                 draw_layout(
                     f,
                     account,
                     "Select agent",
-                    &agents,
+                    &agent_rows,
                     &mut a_state,
                     "↑↓ move · Enter pick · Esc/q quit",
                     false,
@@ -110,7 +117,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
                                 f,
                                 account,
                                 "Select agent",
-                                &agents,
+                                &agent_rows,
                                 &mut a_state,
                                 "↑↓ move · Enter pick · Esc/q quit",
                                 pressed,
@@ -155,10 +162,23 @@ async fn run_inner<B: ratatui::backend::Backend>(
         let mut pending_select: Option<String> = None;
         loop {
             let workspaces = list_workspaces(wire).await?;
+            let workspace_rows: Vec<PickerRow> = workspaces
+                .iter()
+                .map(|w| PickerRow {
+                    name: w.name.clone(),
+                    badge: if w.has_client {
+                        Some(Badge::active())
+                    } else if w.tmux_alive {
+                        Some(Badge::saved())
+                    } else {
+                        None
+                    },
+                })
+                .collect();
             let preferred = pending_select.take().or_else(|| last_ws.clone());
             let initial = preferred
                 .as_deref()
-                .and_then(|n| workspaces.iter().position(|w| w == n))
+                .and_then(|n| workspaces.iter().position(|w| w.name == n))
                 .unwrap_or(0);
             if w_state.selected().is_none() {
                 w_state.select(Some(initial.min(workspaces.len().saturating_sub(1))));
@@ -168,7 +188,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
                     f,
                     account,
                     &format!("Select workspace on {}", agent),
-                    &workspaces,
+                    &workspace_rows,
                     &mut w_state,
                     "↑↓ move · Enter pick · c create · d delete · Esc back · q quit",
                     false,
@@ -199,11 +219,11 @@ async fn run_inner<B: ratatui::backend::Backend>(
                                 term,
                                 bytes,
                                 keys,
-                                &format!("delete workspace '{}'?", ws),
+                                &format!("delete workspace '{}'?", ws.name),
                             )
                             .await?;
                             if confirmed {
-                                delete_workspace(wire, ws).await?;
+                                delete_workspace(wire, &ws.name).await?;
                                 w_state.select(None);
                             }
                         }
@@ -221,7 +241,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
                                             f,
                                             account,
                                             &title,
-                                            &workspaces,
+                                            &workspace_rows,
                                             &mut w_state,
                                             hint,
                                             pressed,
@@ -235,7 +255,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
                                 tokio::time::sleep(std::time::Duration::from_millis(60)).await;
                                 return Ok(MenuOutcome::OpenWorkspace {
                                     agent,
-                                    workspace: ws,
+                                    workspace: ws.name,
                                 });
                             }
                         }
@@ -432,14 +452,18 @@ fn draw_layout(
     f: &mut ratatui::Frame,
     account: &str,
     title: &str,
-    items: &[String],
+    items: &[PickerRow],
     state: &mut ListState,
     hint: &str,
     pressed: bool,
 ) {
     paint_desktop(f);
 
-    let label_w = items.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    let label_w = items
+        .iter()
+        .map(|r| r.name.chars().count() + r.badge.map(|b| b.width() + 1).unwrap_or(0))
+        .max()
+        .unwrap_or(0);
     let want_w = ((label_w + 18)
         .max(title.chars().count() + account.len() + 12)
         .max((LOGO_W + 6) as usize)) as u16;
@@ -505,7 +529,7 @@ fn draw_layout(
         items
             .iter()
             .enumerate()
-            .map(|(i, s)| build_row(i, s, list_w, selected))
+            .map(|(i, r)| build_row(i, r, list_w, selected))
             .collect()
     };
     // We bake the highlight directly into the items, so the List widget
@@ -520,15 +544,59 @@ fn draw_layout(
     hint_bar(f, hint);
 }
 
-/// Build one list row, baking the highlight directly into the line so we
-/// don't have to rely on ratatui's `highlight_style` (which would
-/// override Span colours we set deliberately).
-fn build_row(i: usize, name: &str, list_w: usize, selected: Option<usize>) -> ListItem<'static> {
+/// What the picker draws for one row. The agent picker passes
+/// `badge: None` for every entry; the workspace picker fills it in
+/// from `WorkspaceInfo`.
+#[derive(Clone)]
+pub struct PickerRow {
+    pub name: String,
+    pub badge: Option<Badge>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Badge {
+    pub glyph: &'static str, // "●" or "·"
+    pub label: &'static str, // " active" or " saved"
+    pub color: Color,
+}
+
+impl Badge {
+    pub fn active() -> Self {
+        Badge {
+            glyph: "●",
+            label: " active",
+            color: Color::Red,
+        }
+    }
+    pub fn saved() -> Self {
+        Badge {
+            glyph: "·",
+            label: " saved",
+            color: Color::Yellow,
+        }
+    }
+
+    fn width(&self) -> usize {
+        // glyph counts as 1 cell; label already starts with a leading space.
+        self.glyph.chars().count() + self.label.chars().count()
+    }
+}
+
+/// Build one list row, baking highlight + optional badge directly
+/// into the line so we don't have to rely on ratatui's
+/// `highlight_style` (which would clobber the badge colour).
+fn build_row(i: usize, row: &PickerRow, list_w: usize, selected: Option<usize>) -> ListItem<'static> {
     let prefix = format!("  {:>2}  ", i + 1);
-    let used = prefix.chars().count() + name.chars().count();
+    let badge_w = row.badge.map(|b| b.width()).unwrap_or(0);
+    // Reserve one column of gutter between name and badge.
+    let gutter = if row.badge.is_some() { 1 } else { 0 };
+    let used = prefix.chars().count() + row.name.chars().count() + gutter + badge_w;
     let pad = list_w.saturating_sub(used);
 
     if selected == Some(i) {
+        // Highlighted row: blue background, but the badge keeps its
+        // colour for the glyph (otherwise users can't tell at a glance
+        // that the row they're hovering is active vs saved).
         let num_style = Style::default()
             .bg(HILITE_BG)
             .fg(Color::Yellow)
@@ -537,14 +605,28 @@ fn build_row(i: usize, name: &str, list_w: usize, selected: Option<usize>) -> Li
             .bg(HILITE_BG)
             .fg(HILITE_FG)
             .add_modifier(Modifier::BOLD);
-        return ListItem::new(Line::from(vec![
+        let mut spans = vec![
             Span::styled(prefix, num_style),
-            Span::styled(name.to_string(), body_style),
-            Span::styled(" ".repeat(pad), body_style),
-        ]));
+            Span::styled(row.name.clone(), body_style),
+            Span::styled(" ".repeat(pad + gutter), body_style),
+        ];
+        if let Some(b) = row.badge {
+            spans.push(Span::styled(
+                b.glyph,
+                Style::default()
+                    .bg(HILITE_BG)
+                    .fg(b.color)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(
+                b.label,
+                Style::default().bg(HILITE_BG).fg(HILITE_FG),
+            ));
+        }
+        return ListItem::new(Line::from(spans));
     }
 
-    ListItem::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             prefix,
             Style::default()
@@ -553,11 +635,27 @@ fn build_row(i: usize, name: &str, list_w: usize, selected: Option<usize>) -> Li
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            name.to_string(),
+            row.name.clone(),
             Style::default().bg(DIALOG_BG).fg(DIALOG_FG),
         ),
-        Span::styled(" ".repeat(pad), Style::default().bg(DIALOG_BG)),
-    ]))
+        Span::styled(" ".repeat(pad + gutter), Style::default().bg(DIALOG_BG)),
+    ];
+    if let Some(b) = row.badge {
+        spans.push(Span::styled(
+            b.glyph,
+            Style::default()
+                .bg(DIALOG_BG)
+                .fg(b.color)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            b.label,
+            Style::default()
+                .bg(DIALOG_BG)
+                .fg(Color::DarkGray),
+        ));
+    }
+    ListItem::new(Line::from(spans))
 }
 
 fn draw_titled_dialog(
@@ -756,7 +854,7 @@ async fn list_agents(wire: &mut Wire) -> Result<Vec<String>> {
     }
 }
 
-async fn list_workspaces(wire: &mut Wire) -> Result<Vec<String>> {
+async fn list_workspaces(wire: &mut Wire) -> Result<Vec<crate::proto::WorkspaceInfo>> {
     wire.out_tx
         .send(OutFrame::Text(ClientToHub::ListWorkspaces))
         .await

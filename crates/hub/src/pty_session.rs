@@ -309,7 +309,31 @@ where
                         let _ = send_client(sink, &HubToClient::SessionError { message: e }).await;
                     }
                     None => {
-                        let _ = send_client(sink, &HubToClient::WorkspaceList { items }).await;
+                        // Decorate each item with whether a cloudcode
+                        // client is currently attached (look it up in
+                        // the global workspace mutex). tmux_alive came
+                        // straight from the agent.
+                        let agent_name = conn.name.clone();
+                        let account = ctx.account_name.clone();
+                        let infos: Vec<crate::pty_proto::WorkspaceInfo> = items
+                            .into_iter()
+                            .map(|it| {
+                                let key =
+                                    (agent_name.clone(), account.clone(), it.name.clone());
+                                let has_client =
+                                    ctx.state.workspaces.contains_key(&key);
+                                crate::pty_proto::WorkspaceInfo {
+                                    name: it.name,
+                                    tmux_alive: it.tmux_alive,
+                                    has_client,
+                                }
+                            })
+                            .collect();
+                        let _ = send_client(
+                            sink,
+                            &HubToClient::WorkspaceList { items: infos },
+                        )
+                        .await;
                     }
                 },
                 _ => {

@@ -1,5 +1,5 @@
 use crate::config::{ClaudeConfig, RecordingConfig, SandboxConfig, TmuxConfig};
-use crate::tunnel::{pack_pty_frame, ClientMsg, ServerMsg, TAG_PTY_OUTPUT};
+use crate::tunnel::{pack_pty_frame, ClientMsg, ServerMsg, WorkspaceItem, TAG_PTY_OUTPUT};
 use anyhow::{Context, Result};
 use chrono::SecondsFormat;
 use dashmap::DashMap;
@@ -404,7 +404,7 @@ impl PtyManager {
             Ok(()) => {
                 let root = self.account_root(&account);
                 let _ = std::fs::create_dir_all(&root);
-                let mut items = Vec::new();
+                let mut names: Vec<String> = Vec::new();
                 let mut error: Option<String> = None;
                 match std::fs::read_dir(&root) {
                     Ok(rd) => {
@@ -412,7 +412,7 @@ impl PtyManager {
                             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                                 if let Some(n) = entry.file_name().to_str().map(String::from) {
                                     if !n.starts_with('.') {
-                                        items.push(n);
+                                        names.push(n);
                                     }
                                 }
                             }
@@ -420,7 +420,14 @@ impl PtyManager {
                     }
                     Err(e) => error = Some(format!("read_dir: {}", e)),
                 }
-                items.sort();
+                names.sort();
+                let items = names
+                    .into_iter()
+                    .map(|name| {
+                        let tmux_alive = tmux_session_alive(&account, &name);
+                        WorkspaceItem { name, tmux_alive }
+                    })
+                    .collect();
                 (items, error)
             }
         };
@@ -641,4 +648,31 @@ fn expand_path(p: &Path) -> PathBuf {
         }
     }
     p.to_path_buf()
+}
+
+/// Quick liveness probe for the per-workspace tmux server we spawn
+/// with `-L cc-<account>-<workspace>`. We avoid running tmux itself
+/// (that would *create* a fresh server if one isn't around). Instead
+/// we just try to connect to the unix socket; the socket only exists
+/// while the server is alive, and connect() returns ECONNREFUSED if
+/// it died and left a stale socket behind.
+fn tmux_session_alive(account: &str, workspace: &str) -> bool {
+    let label = format!("cc-{}-{}", account, workspace);
+    let Some(path) = tmux_socket_path(&label) else {
+        return false;
+    };
+    std::os::unix::net::UnixStream::connect(&path).is_ok()
+}
+
+fn tmux_socket_path(label: &str) -> Option<PathBuf> {
+    // tmux puts sockets at $TMUX_TMPDIR/tmux-<uid>/<label>, falling back
+    // to $TMPDIR or /tmp. macOS gives every process a private TMPDIR
+    // under /var/folders/, so honour that first.
+    let base = std::env::var_os("TMUX_TMPDIR")
+        .or_else(|| std::env::var_os("TMPDIR"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/tmp"));
+    // SAFETY: getuid is always safe.
+    let uid = unsafe { libc::getuid() };
+    Some(base.join(format!("tmux-{}", uid)).join(label))
 }

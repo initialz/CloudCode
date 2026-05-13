@@ -83,7 +83,7 @@ pub enum ClientMsg {
     /// Workspace management replies (not bound to a PTY session).
     WorkspaceListResult {
         request_id: Uuid,
-        items: Vec<String>,
+        items: Vec<WorkspaceItem>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -97,6 +97,15 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+}
+
+/// One row in a WorkspaceListResult. Same shape on both sides of the
+/// tunnel; hub layers on `has_client` separately when forwarding to
+/// the cloudcode client.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkspaceItem {
+    pub name: String,
+    pub tmux_alive: bool,
 }
 
 /// Frames sent from the hub to the agent (text JSON).
