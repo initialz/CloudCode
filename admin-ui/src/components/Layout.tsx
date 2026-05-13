@@ -26,6 +26,7 @@ export function Layout() {
               Dashboard
             </Tab>
             <Tab to="/accounts">Accounts</Tab>
+            <Tab to="/agents">Agents</Tab>
             <Tab to="/workspaces">Workspaces</Tab>
             <Tab to="/sessions">Sessions</Tab>
             <Tab to="/audit">Audit</Tab>

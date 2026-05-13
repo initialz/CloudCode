@@ -307,6 +307,51 @@ impl Db {
         Ok(rows.into_iter().map(|r| r.get("agent")).collect())
     }
 
+    pub async fn list_allowed_accounts_for_agent(&self, agent: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT account FROM account_allowed_agents WHERE agent = ?1 ORDER BY account",
+        )
+        .bind(agent)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get("account")).collect())
+    }
+
+    pub async fn set_allowed_accounts_for_agent(
+        &self,
+        agent: &str,
+        accounts: &[String],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM account_allowed_agents WHERE agent = ?1")
+            .bind(agent)
+            .execute(&mut *tx)
+            .await?;
+        for account in accounts {
+            sqlx::query(
+                "INSERT OR IGNORE INTO account_allowed_agents (account, agent) VALUES (?1, ?2)",
+            )
+            .bind(account)
+            .bind(agent)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn count_allowed_accounts_per_agent(&self) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT agent, COUNT(*) AS n FROM account_allowed_agents GROUP BY agent",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("agent"), r.get::<i64, _>("n")))
+            .collect())
+    }
+
     // ---- audit ---------------------------------------------------------
 
     pub async fn list_audit_events(

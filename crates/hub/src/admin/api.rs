@@ -42,6 +42,13 @@ fn valid_account_name(s: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+fn valid_agent_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 fn token_prefix(token: &str) -> String {
     let n = token.chars().count();
     if n <= 6 {
@@ -411,6 +418,120 @@ pub async fn account_allowed_agents_set(
     agents.sort();
     agents.dedup();
     if let Err(e) = state.app.db.set_allowed_agents(&name, &agents).await {
+        return internal(e);
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+// ---------------------------------------------------------------------
+// Agents — admin view of allow-list from the agent side
+// ---------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct AgentRowDto {
+    name: String,
+    online: bool,
+    allowed_account_count: i64,
+}
+
+pub async fn agents_list(State(state): State<AdminState>) -> Response {
+    let known = match state.app.db.distinct_known_agents().await {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    let online_list = state.app.registry.list_active();
+    let online: std::collections::HashSet<String> = online_list.iter().cloned().collect();
+    let mut names: Vec<String> = known;
+    for n in &online_list {
+        if !names.iter().any(|k| k == n) {
+            names.push(n.clone());
+        }
+    }
+    names.sort();
+    names.dedup();
+    let counts = match state.app.db.count_allowed_accounts_per_agent().await {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    let count_map: std::collections::HashMap<String, i64> = counts.into_iter().collect();
+    let dto: Vec<AgentRowDto> = names
+        .into_iter()
+        .map(|n| {
+            let allowed_account_count = count_map.get(&n).copied().unwrap_or(0);
+            let is_online = online.contains(&n);
+            AgentRowDto {
+                name: n,
+                online: is_online,
+                allowed_account_count,
+            }
+        })
+        .collect();
+    Json(dto).into_response()
+}
+
+#[derive(Serialize)]
+struct AllowedAccountsResponse {
+    allowed: Vec<String>,
+    accounts: Vec<String>,
+    online: bool,
+}
+
+pub async fn agent_allowed_accounts_get(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+) -> Response {
+    if !valid_agent_name(&name) {
+        return err(StatusCode::BAD_REQUEST, "invalid_input", "invalid agent name");
+    }
+    let allowed = match state.app.db.list_allowed_accounts_for_agent(&name).await {
+        Ok(v) => v,
+        Err(e) => return internal(e),
+    };
+    let accounts = match state.app.db.list_accounts().await {
+        Ok(rows) => rows.into_iter().map(|a| a.name).collect::<Vec<_>>(),
+        Err(e) => return internal(e),
+    };
+    let online = state
+        .app
+        .registry
+        .list_active()
+        .iter()
+        .any(|n| n == &name);
+    Json(AllowedAccountsResponse {
+        allowed,
+        accounts,
+        online,
+    })
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct SetAllowedAccountsRequest {
+    pub accounts: Vec<String>,
+}
+
+pub async fn agent_allowed_accounts_set(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    Json(req): Json<SetAllowedAccountsRequest>,
+) -> Response {
+    if !valid_agent_name(&name) {
+        return err(StatusCode::BAD_REQUEST, "invalid_input", "invalid agent name");
+    }
+    let mut accounts: Vec<String> = req
+        .accounts
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    accounts.sort();
+    accounts.dedup();
+    if let Err(e) = state
+        .app
+        .db
+        .set_allowed_accounts_for_agent(&name, &accounts)
+        .await
+    {
         return internal(e);
     }
     StatusCode::NO_CONTENT.into_response()

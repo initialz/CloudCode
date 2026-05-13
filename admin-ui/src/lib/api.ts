@@ -117,6 +117,16 @@ export const apiClient = {
         body: JSON.stringify({ agents }),
       }),
   },
+  agents: {
+    list: () => api<AgentRowDto[]>('/agents'),
+    allowedAccounts: (name: string) =>
+      api<AllowedAccountsDto>(`/agents/${encodeURIComponent(name)}/allowed-accounts`),
+    setAllowedAccounts: (name: string, accounts: string[]) =>
+      api<void>(`/agents/${encodeURIComponent(name)}/allowed-accounts`, {
+        method: 'PUT',
+        body: JSON.stringify({ accounts }),
+      }),
+  },
   workspaces: {
     list: () => api<WorkspaceRowDto[]>('/workspaces'),
   },
@@ -171,6 +181,20 @@ export type AllowedAgentsDto = {
   known: string[];
   /// Subset of `known` that's connected right now.
   online: string[];
+};
+
+export type AgentRowDto = {
+  name: string;
+  online: boolean;
+  allowed_account_count: number;
+};
+
+export type AllowedAccountsDto = {
+  /// Accounts currently whitelisted for this agent.
+  allowed: string[];
+  /// Every account in the system (the picker pool).
+  accounts: string[];
+  online: boolean;
 };
 
 export type WorkspaceStatus = 'active' | 'saved' | 'fresh';

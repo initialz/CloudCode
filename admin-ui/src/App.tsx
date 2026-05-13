@@ -3,6 +3,7 @@ import { Layout } from '@/components/Layout';
 import { Login } from '@/pages/Login';
 import { Dashboard } from '@/pages/Dashboard';
 import { Accounts } from '@/pages/Accounts';
+import { Agents } from '@/pages/Agents';
 import { Audit } from '@/pages/Audit';
 import { Sessions } from '@/pages/Sessions';
 import { SessionDetail } from '@/pages/SessionDetail';
@@ -24,6 +25,7 @@ export default function App() {
         >
           <Route index element={<Dashboard />} />
           <Route path="accounts" element={<Accounts />} />
+          <Route path="agents" element={<Agents />} />
           <Route path="workspaces" element={<Workspaces />} />
           <Route path="sessions" element={<Sessions />} />
           <Route path="sessions/:id" element={<SessionDetail />} />
