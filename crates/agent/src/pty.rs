@@ -290,6 +290,7 @@ impl PtyManager {
         // and tears the wrapper down with it.
         const WRAPPER: &str = r#"
 first=1
+sess="$(tmux display-message -p '#S' 2>/dev/null)"
 while :; do
     if [ "$first" = "1" ]; then
         "$@"
@@ -297,10 +298,17 @@ while :; do
     else
         claude --continue
     fi
-    # Disconnect any cloudcode clients so they pop back to the picker.
-    tmux detach-client -a 2>/dev/null
-    # Wait for somebody to reattach before we respawn claude.
-    while [ "$(tmux list-clients -F . 2>/dev/null | wc -l)" -eq 0 ]; do
+    # Disconnect every client attached to THIS session. We pass -s
+    # explicitly because `detach-client -a` from a non-attached
+    # caller (our wrapper bash is a server-side child, not a client)
+    # has ambiguous semantics on some tmux versions.
+    if [ -n "$sess" ]; then
+        tmux detach-client -s "$sess" 2>/dev/null
+    else
+        tmux detach-client -a 2>/dev/null
+    fi
+    # Park until somebody reattaches, then respawn claude.
+    while [ "$(tmux list-clients -t "$sess" -F . 2>/dev/null | wc -l)" -eq 0 ]; do
         sleep 1
     done
 done
