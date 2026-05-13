@@ -39,7 +39,7 @@ export function Login() {
         className="w-full max-w-sm space-y-4 p-6 rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 shadow-sm"
       >
         <div>
-          <h1 className="text-lg font-semibold">cloudcode admin</h1>
+          <h1 className="text-lg font-semibold">CloudCode admin</h1>
           <p className="text-sm text-zinc-500 mt-1">Sign in with the admin token.</p>
         </div>
 

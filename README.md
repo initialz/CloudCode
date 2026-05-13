@@ -1,16 +1,16 @@
-# cloudcode
+# CloudCode
 
 > Drive your own `claude` from any terminal, anywhere.
 
-`claude /login` runs on one host — your workstation, a home server, a cloud VM. cloudcode lets you talk to that claude from a laptop, a phone, any SSH terminal, without copying credentials around. The remote terminal **is** the native claude TUI; cloudcode just streams PTY bytes.
+`claude /login` runs on one host — your workstation, a home server, a cloud VM. CloudCode lets you talk to that claude from a laptop, a phone, any SSH terminal, without copying credentials around. The remote terminal **is** the native claude TUI; CloudCode just streams PTY bytes.
 
 **Solo use only.** Subscription plans (Claude Max / Pro) are per-individual under Anthropic's Terms of Service. Sharing one across users violates them and the account may get banned. One user → one subscription → one agent.
 
-![architecture](docs/architecture.svg?v=2)
+![architecture](docs/architecture.svg?v=3)
 
 ## Highlights
 
-- **Native claude TUI, end to end.** No wrapper layer — slash commands, todos, diffs, permission prompts all work because cloudcode forwards raw PTY bytes from `tmux+claude` on the agent.
+- **Native claude TUI, end to end.** No wrapper layer — slash commands, todos, diffs, permission prompts all work because CloudCode forwards raw PTY bytes from `tmux+claude` on the agent.
 - **Persistent workspaces.** Close the laptop, lose Wi-Fi, switch from terminal to phone. tmux + claude keep running on the agent. Reconnect and pick up exactly where you left off, mid-task.
 - **macOS Seatbelt sandbox (opt-in).** Each workspace's claude runs sealed off from `~/.ssh`, Keychain, sibling workspaces, and cross-account state. Network stays open.
 - **Self-hosted admin UI.** Single binary, embedded React SPA at `/admin/`. Manage accounts and agents with **two-way strict-whitelist ACL** (per-account agent access, per-agent account access), browse live & historical workspaces, sessions, and audit events.
@@ -51,7 +51,7 @@ Open the admin UI at `http://<hub>:7101/admin/`, paste the admin token, grant yo
 
 ## Acknowledgements
 
-macOS Seatbelt sandbox design inspired by [boxsh](https://github.com/xicilion/boxsh). No boxsh code is included (boxsh is GPL v3); cloudcode is MIT.
+macOS Seatbelt sandbox design inspired by [boxsh](https://github.com/xicilion/boxsh). No boxsh code is included (boxsh is GPL v3); CloudCode is MIT.
 
 ## License
 

@@ -16,7 +16,7 @@
     </marker>
   </defs>
 
-  <text x="700" y="48" text-anchor="middle" font-size="28" font-weight="700" fill="#111827">cloudcode architecture</text>
+  <text x="700" y="48" text-anchor="middle" font-size="28" font-weight="700" fill="#111827">CloudCode architecture</text>
   <text x="700" y="80" text-anchor="middle" font-size="16" fill="#4b5563">PTY bytes stream from a native tmux+claude on the agent through the hub to any terminal</text>
 
   <!-- ============================================================

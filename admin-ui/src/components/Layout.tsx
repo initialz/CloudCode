@@ -20,7 +20,7 @@ export function Layout() {
     <div className="min-h-full flex flex-col">
       <header className="border-b border-zinc-200 dark:border-zinc-800 px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-6">
-          <h1 className="font-semibold text-lg">cloudcode admin</h1>
+          <h1 className="font-semibold text-lg">CloudCode admin</h1>
           <nav className="flex gap-4 text-sm">
             <Tab to="/" end>
               Dashboard
