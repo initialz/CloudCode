@@ -301,14 +301,19 @@ while :; do
         "$@"
         first=0
     else
-        # Try to resume the previous conversation. If claude has no
-        # saved session to continue (fresh workspace, just-reset, or
-        # the first run was so short no jsonl got written) `--continue`
-        # bails with "No conversation found to continue" and a non-zero
-        # exit. Fall back to the original command + args so the user
-        # at least gets a working claude on reattach instead of a
-        # tight error loop.
-        claude --continue || "$@"
+        # Only attempt `--continue` if there's actually saved history
+        # under ~/.claude/projects/<encoded-cwd>/. If the first run
+        # /exit'd before writing any jsonl (or the slot was just
+        # reset) `claude --continue` would either print "No
+        # conversation found to continue" or drop into an empty
+        # session — both leave the user stuck. The agent passes the
+        # exact encoded path via CLOUDCODE_CLAUDE_PROJECT_DIR.
+        if [ -n "$CLOUDCODE_CLAUDE_PROJECT_DIR" ] \
+            && ls "$CLOUDCODE_CLAUDE_PROJECT_DIR"/*.jsonl >/dev/null 2>&1; then
+            claude --continue || "$@"
+        else
+            "$@"
+        fi
     fi
     # Disconnect every client attached to THIS session. We pass -s
     # explicitly because `detach-client -a` from a non-attached
@@ -353,6 +358,12 @@ done
             "TERM",
             std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
         );
+        // Tell the wrapper where claude's per-project jsonl history
+        // for this workspace lives, so it can decide whether
+        // `--continue` is safe to try on reattach.
+        let home_for_proj = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        let claude_proj_dir = crate::jsonl::project_dir(&home_for_proj, &cwd);
+        cmd.env("CLOUDCODE_CLAUDE_PROJECT_DIR", &claude_proj_dir);
 
         let child = match pair.slave.spawn_command(cmd) {
             Ok(c) => c,
