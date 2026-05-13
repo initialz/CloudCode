@@ -1,10 +1,13 @@
+import { useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { apiClient } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
+import { SettingsModal } from './SettingsModal';
 
 export function Layout() {
   const { setOut } = useAuth();
   const nav = useNavigate();
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   async function handleLogout() {
     try {
@@ -32,16 +35,26 @@ export function Layout() {
             <Tab to="/audit">Audit</Tab>
           </nav>
         </div>
-        <button
-          onClick={handleLogout}
-          className="text-sm px-3 py-1.5 rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-        >
-          Sign out
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setSettingsOpen(true)}
+            className="text-sm px-3 py-1.5 rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+            title="Admin settings"
+          >
+            Settings
+          </button>
+          <button
+            onClick={handleLogout}
+            className="text-sm px-3 py-1.5 rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+          >
+            Sign out
+          </button>
+        </div>
       </header>
       <main className="flex-1 px-6 py-6 max-w-screen-xl w-full mx-auto">
         <Outlet />
       </main>
+      <SettingsModal open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </div>
   );
 }

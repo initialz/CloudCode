@@ -38,6 +38,19 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
+    /// Hub WebSocket URL (overrides `hub_url` in the config file).
+    /// Pass this together with --token to skip the config file
+    /// entirely — useful for one-liner install + run.
+    #[arg(long, value_name = "URL")]
+    hub_url: Option<String>,
+
+    /// Account token (overrides `token` in the config file). Goes
+    /// into shell history on most shells, so prefer the config
+    /// file for long-lived setups; the flag is meant for paste-
+    /// and-run commands handed out by the admin UI.
+    #[arg(long, value_name = "TOKEN")]
+    token: Option<String>,
+
     /// One-time setup: write a fresh client config.toml template at
     /// the resolved config path (`--config <path>` if given, otherwise
     /// the default). Refuses to overwrite if the file already exists.
@@ -92,6 +105,28 @@ fn load_config(override_path: Option<&PathBuf>) -> Result<ClientConfig> {
         )
     })?;
     Ok(toml::from_str(&s)?)
+}
+
+/// Merge --hub-url / --token over the config file. If both CLI flags
+/// are given, the file is not read at all — paste-and-run installs
+/// work without writing config.toml first.
+fn resolve_config(
+    cli_hub_url: Option<String>,
+    cli_token: Option<String>,
+    config_override: Option<&PathBuf>,
+) -> Result<ClientConfig> {
+    let file = if cli_hub_url.is_some() && cli_token.is_some() {
+        None
+    } else {
+        Some(load_config(config_override)?)
+    };
+    let hub_url = cli_hub_url
+        .or_else(|| file.as_ref().map(|c| c.hub_url.clone()))
+        .ok_or_else(|| anyhow!("hub_url missing — set in config or pass --hub-url"))?;
+    let token = cli_token
+        .or_else(|| file.as_ref().map(|c| c.token.clone()))
+        .ok_or_else(|| anyhow!("token missing — set in config or pass --token"))?;
+    Ok(ClientConfig { hub_url, token })
 }
 
 fn state_dir() -> Result<PathBuf> {
@@ -165,7 +200,16 @@ async fn main() -> ExitCode {
         }
     } else {
         match cli.cmd {
-            None => run_chat(cli.agent, cli.claude_args, cli.config.as_ref()).await,
+            None => {
+                run_chat(
+                    cli.agent,
+                    cli.claude_args,
+                    cli.config.as_ref(),
+                    cli.hub_url,
+                    cli.token,
+                )
+                .await
+            }
             Some(Cmd::Config) => show_config(cli.config.as_ref()),
         }
     };
@@ -227,8 +271,10 @@ async fn run_chat(
     agent_flag: Option<String>,
     claude_args: Vec<String>,
     config_override: Option<&PathBuf>,
+    cli_hub_url: Option<String>,
+    cli_token: Option<String>,
 ) -> Result<()> {
-    let cfg = load_config(config_override)?;
+    let cfg = resolve_config(cli_hub_url, cli_token, config_override)?;
     let mut wire = wire::connect(&cfg.hub_url, &cfg.token).await?;
 
     let account_name = match wire.in_text_rx.recv().await {
