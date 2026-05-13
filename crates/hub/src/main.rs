@@ -309,9 +309,13 @@ registration_token_hash = "{agent_token_hash}"
 # token_hash = "$argon2id$v=19$..."
 
 [admin]
-# Listen address for the admin UI. 127.0.0.1 by default — put a reverse
-# proxy with TLS in front if you want remote access.
-listen = "127.0.0.1:7101"
+# Listen address for the admin UI. 0.0.0.0 by default so a fresh
+# install is reachable. The login token is the only auth, so in
+# production put a TLS-terminating reverse proxy in front (caddy /
+# nginx) and use a firewall / cloud security group to limit who can
+# hit this port. Switch to 127.0.0.1 if you only want SSH-tunnel
+# access.
+listen = "0.0.0.0:7101"
 # Path to the SQLite database (accounts, audit events, session records).
 db_path = "./cloudcode-hub.db"
 # argon2id hash of the admin UI login token. The plaintext was printed

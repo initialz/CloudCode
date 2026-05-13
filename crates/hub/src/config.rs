@@ -52,8 +52,11 @@ pub struct AdminConfig {
     /// `cloudcode-hub --init`.
     #[serde(default)]
     pub token_hash: Option<String>,
-    /// HTTP listen address for the admin UI. Defaults to localhost only
-    /// — put a TLS-terminating reverse proxy in front for remote access.
+    /// HTTP listen address for the admin UI. Defaults to all interfaces
+    /// on port 7101 so a fresh install is reachable out of the box; put
+    /// a TLS-terminating reverse proxy in front in production so the
+    /// admin token doesn't traverse the network in cleartext, and use
+    /// a firewall / cloud security group to gate who can hit it.
     #[serde(default = "default_admin_listen")]
     pub listen: String,
 }
@@ -73,7 +76,7 @@ fn default_db_path() -> PathBuf {
 }
 
 fn default_admin_listen() -> String {
-    "127.0.0.1:7101".into()
+    "0.0.0.0:7101".into()
 }
 
 impl Config {

@@ -29,8 +29,11 @@ token_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
 # token_hash = "$argon2id$..."
 
 [admin]
-# 管理界面监听地址。默认只绑 127.0.0.1；远程访问请放在 TLS 反向代理后面。
-listen = "127.0.0.1:7101"
+# 管理界面监听地址。默认 0.0.0.0 方便新装直接可访问。生产环境强烈
+# 建议放在 TLS 反向代理 (caddy/nginx) 后面，并用防火墙/安全组限制
+# 来源 IP，避免 admin token 走 HTTP 明文。只想本地 SSH 隧道访问可
+# 改回 127.0.0.1。
+listen = "0.0.0.0:7101"
 # SQLite 数据库文件，存账号、审计、session 记录。
 db_path = "./cloudcode-hub.db"
 # 管理 UI 登录 token 的 argon2id 哈希。明文由 `cloudcode-hub --init`
