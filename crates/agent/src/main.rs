@@ -24,6 +24,7 @@ pub struct AppState {
 #[derive(Parser)]
 #[command(
     name = "cloudcode-agent",
+    version,
     about = "Cloudcode agent: dials a hub via WebSocket and runs claude subprocesses on demand"
 )]
 struct Cli {

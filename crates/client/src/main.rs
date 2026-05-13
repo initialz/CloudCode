@@ -15,6 +15,7 @@ use crate::wire::OutFrame;
 #[derive(Parser)]
 #[command(
     name = "cloudcode",
+    version,
     about = "Cloudcode client: open an interactive claude session on a remote agent",
     long_about = "Running `cloudcode` with no subcommand opens a workspace \
                   picker for the configured remote agent, then drops into \

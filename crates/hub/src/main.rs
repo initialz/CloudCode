@@ -35,7 +35,7 @@ pub struct AppState {
 }
 
 #[derive(Parser)]
-#[command(name = "cloudcode-hub", about = "Cloudcode hub: claude task gateway")]
+#[command(name = "cloudcode-hub", version, about = "Cloudcode hub: claude task gateway")]
 struct Cli {
     /// Path to hub config. With no subcommand, hub runs in the foreground
     /// using this config and streams logs to stdout.
