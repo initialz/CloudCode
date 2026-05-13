@@ -2,6 +2,7 @@ import { Routes, Route } from 'react-router-dom';
 import { Layout } from '@/components/Layout';
 import { Login } from '@/pages/Login';
 import { Dashboard } from '@/pages/Dashboard';
+import { Accounts } from '@/pages/Accounts';
 import { Stub } from '@/pages/Stub';
 import { AuthProvider, RequireAuth } from '@/lib/auth';
 
@@ -19,7 +20,7 @@ export default function App() {
           }
         >
           <Route index element={<Dashboard />} />
-          <Route path="accounts" element={<Stub title="Accounts" />} />
+          <Route path="accounts" element={<Accounts />} />
           <Route path="sessions" element={<Stub title="Sessions" />} />
           <Route path="audit" element={<Stub title="Audit" />} />
         </Route>
