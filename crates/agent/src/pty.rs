@@ -266,15 +266,52 @@ impl PtyManager {
         cmd.arg("-y");
         cmd.arg(rows.to_string());
         cmd.cwd(&cwd);
-        // The command to run on first create. tmux ignores this when attaching
-        // an existing session, so a reconnect just gets back to whatever
-        // state claude was in.
+        // Wrap claude in a small shell loop instead of execing it
+        // directly. The semantics we want:
+        //
+        //   1. First boot: run `claude <args>` exactly as the CLI asked.
+        //   2. When claude exits (/exit, Ctrl+C, crash): detach every
+        //      attached tmux client so the cloudcode user pops straight
+        //      back to the menu. The tmux session itself stays alive
+        //      (the wrapper is still running), so the picker shows
+        //      it as "saved".
+        //   3. Sit in a polling sleep until somebody attaches again.
+        //   4. On reattach, restart claude with `--continue` so it
+        //      resumes the previous conversation from
+        //      ~/.claude/projects/<cwd>/.
+        //
+        // Explicit cleanup (delete workspace) still goes through the
+        // menu's `d` action, which kills the per-workspace tmux server
+        // and tears the wrapper down with it.
+        const WRAPPER: &str = r#"
+first=1
+while :; do
+    if [ "$first" = "1" ]; then
+        "$@"
+        first=0
+    else
+        claude --continue
+    fi
+    # Disconnect any cloudcode clients so they pop back to the picker.
+    tmux detach-client -a 2>/dev/null
+    # Wait for somebody to reattach before we respawn claude.
+    while [ "$(tmux list-clients -F . 2>/dev/null | wc -l)" -eq 0 ]; do
+        sleep 1
+    done
+done
+"#;
+        cmd.arg("bash");
+        cmd.arg("-c");
+        cmd.arg(WRAPPER);
+        // bash's $0 label, not used by the script.
+        cmd.arg("cloudcode-claude");
         cmd.arg(&self.claude.executable);
         for arg in &self.claude.extra_args {
             cmd.arg(arg);
         }
         // Per-session args forwarded from the client (everything after `--`
-        // on the cloudcode CLI). tmux ignores all of this on re-attach.
+        // on the cloudcode CLI). Only honoured for the first boot; after
+        // that the wrapper switches to `claude --continue`.
         for arg in &claude_args {
             cmd.arg(arg);
         }
