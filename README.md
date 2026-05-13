@@ -6,7 +6,7 @@
 
 **Solo use only.** Subscription plans (Claude Max / Pro) are per-individual under Anthropic's Terms of Service. Sharing one across users violates them and the account may get banned. One user → one subscription → one agent.
 
-![architecture](docs/architecture.svg?v=3)
+![architecture](docs/architecture.svg?v=4)
 
 ## Highlights
 

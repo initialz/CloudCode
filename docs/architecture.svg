@@ -14,6 +14,10 @@
             markerWidth="8" markerHeight="8" orient="auto">
       <path d="M 10 0 L 0 5 L 10 10 z" fill="#374151"/>
     </marker>
+    <marker id="arrow-muted" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#9ca3af"/>
+    </marker>
   </defs>
 
   <text x="700" y="48" text-anchor="middle" font-size="28" font-weight="700" fill="#111827">CloudCode architecture</text>
@@ -72,16 +76,17 @@
 
   <!-- tmux + claude subprocess pill -->
   <rect x="220" y="836" width="620" height="92" rx="8" fill="#ffffff" stroke="#c2410c" stroke-width="1.5" stroke-dasharray="5,4"/>
-  <text x="530" y="860" text-anchor="middle" font-size="15" font-weight="600" fill="#7c2d12">tmux + claude (per workspace)</text>
+  <text x="530" y="860" text-anchor="middle" font-size="15" font-weight="600" fill="#7c2d12">tmux + coding CLI (per workspace)</text>
   <text x="530" y="884" text-anchor="middle" font-size="13" font-family="ui-monospace, Menlo, monospace" fill="#1f2937">tmux -L cc-&lt;acct&gt;-&lt;ws&gt;</text>
-  <text x="530" y="906" text-anchor="middle" font-size="13" font-family="ui-monospace, Menlo, monospace" fill="#1f2937">└─ claude (native TUI)</text>
+  <text x="530" y="906" text-anchor="middle" font-size="13" font-family="ui-monospace, Menlo, monospace" fill="#1f2937">└─ claude · codex · …</text>
 
-  <!-- Anthropic -->
-  <rect x="970" y="700" width="280" height="200" rx="14" fill="#ede9fe" stroke="#6d28d9" stroke-width="2"/>
-  <text x="1110" y="742" text-anchor="middle" font-size="22" font-weight="700" fill="#4c1d95">Anthropic</text>
-  <text x="1110" y="770" text-anchor="middle" font-size="17" fill="#6d28d9">api.anthropic.com</text>
-  <text x="1110" y="822" text-anchor="middle" font-size="14" fill="#475569" font-style="italic">OAuth tokens never</text>
-  <text x="1110" y="846" text-anchor="middle" font-size="14" fill="#475569" font-style="italic">leave the agent host</text>
+  <!-- Upstream provider API (deliberately generic — cloudcode forwards
+       PTY, the inner CLI talks to whichever provider it wants). -->
+  <rect x="970" y="700" width="280" height="200" rx="14" fill="#f3f4f6" stroke="#9ca3af" stroke-width="1.5"/>
+  <text x="1110" y="742" text-anchor="middle" font-size="20" font-weight="700" fill="#4b5563">Provider API</text>
+  <text x="1110" y="772" text-anchor="middle" font-size="15" fill="#6b7280">Anthropic · OpenAI · …</text>
+  <text x="1110" y="820" text-anchor="middle" font-size="13" fill="#6b7280" font-style="italic">each coding CLI talks</text>
+  <text x="1110" y="840" text-anchor="middle" font-size="13" fill="#6b7280" font-style="italic">to its own upstream</text>
 
   <!-- ============================================================
        Edges
@@ -105,7 +110,7 @@
   <text x="546" y="610" font-size="13" fill="#374151">WSS tunnel</text>
   <text x="546" y="630" font-size="13" fill="#6b7280">agent dials out</text>
 
-  <!-- Agent -> Anthropic (HTTPS OAuth) -->
-  <line x1="880" y1="800" x2="970" y2="800" stroke="#374151" stroke-width="2.5" marker-end="url(#arrow)"/>
-  <text x="925" y="790" text-anchor="middle" font-size="13" fill="#374151">HTTPS · OAuth</text>
+  <!-- Agent -> upstream provider (deliberately unlabeled — cloudcode
+       is provider-agnostic; this edge is "whatever the inner CLI does"). -->
+  <line x1="880" y1="800" x2="970" y2="800" stroke="#9ca3af" stroke-width="1.5" marker-end="url(#arrow-muted)"/>
 </svg>
