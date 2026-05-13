@@ -236,15 +236,32 @@ where
 {
     match frame {
         ClientToHub::SelectAgent { agent } => {
-            let pick = match agent {
-                Some(name) => ctx.state.registry.get(&name),
+            // Resolve which name the client is asking for: explicit, or
+            // "first available" when None.
+            let target_name = match agent {
+                Some(name) => Some(name),
                 None => {
                     let mut active = ctx.state.registry.list_active();
                     active.sort();
-                    active.first().and_then(|n| ctx.state.registry.get(n))
+                    // Pick the first agent in the allowlist; fall back to
+                    // the first online agent only if the allowlist is empty.
+                    let mut allowed_pick: Option<String> = None;
+                    for n in &active {
+                        if ctx
+                            .state
+                            .db
+                            .is_agent_allowed(&ctx.account_name, n)
+                            .await
+                            .unwrap_or(false)
+                        {
+                            allowed_pick = Some(n.clone());
+                            break;
+                        }
+                    }
+                    allowed_pick.or_else(|| active.first().cloned())
                 }
             };
-            let Some(conn) = pick else {
+            let Some(name) = target_name else {
                 let _ = send_client(
                     sink,
                     &HubToClient::SessionError {
@@ -254,21 +271,77 @@ where
                 .await;
                 return true;
             };
-            let name = conn.name.clone();
+            match ctx.state.db.is_agent_allowed(&ctx.account_name, &name).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    ctx.state.audit.write(AuditEvent {
+                        account: Some(ctx.account_name.clone()),
+                        agent: Some(name.clone()),
+                        status: Some(403),
+                        reason: Some("agent not in account allowlist".into()),
+                        ..AuditEvent::new("agent_access_denied")
+                    });
+                    let _ = send_client(
+                        sink,
+                        &HubToClient::SessionError {
+                            message: format!(
+                                "account '{}' is not allowed to use agent '{}'",
+                                ctx.account_name, name
+                            ),
+                        },
+                    )
+                    .await;
+                    return true;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "allowlist lookup failed");
+                    let _ = send_client(
+                        sink,
+                        &HubToClient::SessionError {
+                            message: "internal error".into(),
+                        },
+                    )
+                    .await;
+                    return true;
+                }
+            }
+            let Some(conn) = ctx.state.registry.get(&name) else {
+                let _ = send_client(
+                    sink,
+                    &HubToClient::SessionError {
+                        message: "agent not online".into(),
+                    },
+                )
+                .await;
+                return true;
+            };
             ctx.selected_agent = Some(conn);
             let _ = send_client(sink, &HubToClient::AgentSelected { agent: name }).await;
             true
         }
         ClientToHub::ListAgents => {
+            // Strict-whitelist semantics: only show agents this account
+            // is allowed to use. The list comes from the registry of
+            // currently-connected agents, intersected with the db
+            // allowlist.
             let names = ctx.state.registry.list_active();
             let current = ctx.selected_agent.as_ref().map(|c| c.name.clone());
-            let items: Vec<AgentInfo> = names
-                .into_iter()
-                .map(|n| AgentInfo {
+            let mut items: Vec<AgentInfo> = Vec::new();
+            for n in names {
+                let allowed = ctx
+                    .state
+                    .db
+                    .is_agent_allowed(&ctx.account_name, &n)
+                    .await
+                    .unwrap_or(false);
+                if !allowed {
+                    continue;
+                }
+                items.push(AgentInfo {
                     current: current.as_deref() == Some(&n),
                     name: n,
-                })
-                .collect();
+                });
+            }
             let _ = send_client(sink, &HubToClient::AgentList { items }).await;
             true
         }

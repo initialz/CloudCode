@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "5";
+pub const PROTOCOL_VERSION: &str = "6";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
@@ -100,6 +100,15 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+
+    /// Reply to a `WorkspaceListAll` admin query: every (account, workspace)
+    /// pair this agent currently has on disk, with tmux-alive state.
+    WorkspaceListAllResult {
+        request_id: Uuid,
+        items: Vec<WorkspaceFullItem>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// One row in a WorkspaceListResult. `tmux_alive` lets the picker
@@ -107,6 +116,15 @@ pub enum ClientMsg {
 /// "blank slot" (fresh).
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WorkspaceItem {
+    pub name: String,
+    pub tmux_alive: bool,
+}
+
+/// Row in a `WorkspaceListAllResult`. Carries the account because the
+/// admin view aggregates across every account this agent serves.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WorkspaceFullItem {
+    pub account: String,
     pub name: String,
     pub tmux_alive: bool,
 }
@@ -165,6 +183,12 @@ pub enum ServerMsg {
         request_id: Uuid,
         account: String,
         name: String,
+    },
+    /// Admin-only: ask the agent for every (account, workspace) it knows
+    /// about, regardless of which account is asking. Used by the admin
+    /// UI to render a cross-account workspace inventory.
+    WorkspaceListAll {
+        request_id: Uuid,
     },
 }
 

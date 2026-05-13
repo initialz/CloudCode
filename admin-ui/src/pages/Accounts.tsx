@@ -1,9 +1,18 @@
 import { useEffect, useState } from 'react';
-import { apiClient, type AccountDto } from '@/lib/api';
+import { apiClient, type AccountDto, type AllowedAgentsDto } from '@/lib/api';
 import { Modal } from '@/components/Modal';
 import { CopyableToken } from '@/components/CopyableToken';
 
 type TokenModal = { name: string; token: string; mode: 'created' | 'rotated' };
+
+type AgentsModalState = {
+  account: string;
+  data: AllowedAgentsDto | null;
+  selected: Set<string>;
+  loading: boolean;
+  saving: boolean;
+  err: string | null;
+};
 
 export function Accounts() {
   const [accounts, setAccounts] = useState<AccountDto[] | null>(null);
@@ -16,6 +25,7 @@ export function Accounts() {
   const [tokenModal, setTokenModal] = useState<TokenModal | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const [agentsModal, setAgentsModal] = useState<AgentsModalState | null>(null);
 
   async function reload() {
     try {
@@ -71,6 +81,61 @@ export function Accounts() {
     }
   }
 
+  async function openAgentsModal(account: string) {
+    setAgentsModal({
+      account,
+      data: null,
+      selected: new Set(),
+      loading: true,
+      saving: false,
+      err: null,
+    });
+    try {
+      const data = await apiClient.accounts.allowedAgents(account);
+      setAgentsModal({
+        account,
+        data,
+        selected: new Set(data.allowed),
+        loading: false,
+        saving: false,
+        err: null,
+      });
+    } catch (e: any) {
+      setAgentsModal((cur) =>
+        cur && cur.account === account
+          ? { ...cur, loading: false, err: e?.message ?? 'failed to load' }
+          : cur,
+      );
+    }
+  }
+
+  function toggleAgent(name: string) {
+    setAgentsModal((cur) => {
+      if (!cur) return cur;
+      const next = new Set(cur.selected);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return { ...cur, selected: next };
+    });
+  }
+
+  async function saveAllowedAgents() {
+    if (!agentsModal) return;
+    setAgentsModal({ ...agentsModal, saving: true, err: null });
+    try {
+      await apiClient.accounts.setAllowedAgents(
+        agentsModal.account,
+        Array.from(agentsModal.selected).sort(),
+      );
+      setAgentsModal(null);
+      await reload();
+    } catch (e: any) {
+      setAgentsModal((cur) =>
+        cur ? { ...cur, saving: false, err: e?.message ?? 'save failed' } : cur,
+      );
+    }
+  }
+
   async function onDelete(name: string) {
     setPending(true);
     try {
@@ -116,6 +181,7 @@ export function Accounts() {
                 <th className="px-3 py-2 text-left">Name</th>
                 <th className="px-3 py-2 text-left">Token suffix</th>
                 <th className="px-3 py-2 text-left">Status</th>
+                <th className="px-3 py-2 text-left">Agents</th>
                 <th className="px-3 py-2 text-left">Created</th>
                 <th className="px-3 py-2 text-right">Actions</th>
               </tr>
@@ -123,7 +189,7 @@ export function Accounts() {
             <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800 bg-white dark:bg-zinc-900">
               {accounts.length === 0 ? (
                 <tr>
-                  <td colSpan={5} className="px-3 py-6 text-center text-zinc-500">
+                  <td colSpan={6} className="px-3 py-6 text-center text-zinc-500">
                     No accounts yet. Create one above.
                   </td>
                 </tr>
@@ -144,6 +210,24 @@ export function Accounts() {
                           active
                         </span>
                       )}
+                    </td>
+                    <td className="px-3 py-2">
+                      <button
+                        onClick={() => openAgentsModal(a.name)}
+                        className="text-xs font-mono px-2 py-0.5 rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                        title="Edit agent access"
+                      >
+                        {a.allowed_agents.length === 0 ? (
+                          <span className="text-red-600 dark:text-red-400">
+                            none
+                          </span>
+                        ) : (
+                          <>
+                            {a.allowed_agents.length} agent
+                            {a.allowed_agents.length === 1 ? '' : 's'}
+                          </>
+                        )}
+                      </button>
                     </td>
                     <td className="px-3 py-2 text-zinc-500">
                       {new Date(a.created_at * 1000).toISOString().slice(0, 10)}
@@ -239,6 +323,83 @@ export function Accounts() {
           This token is shown only once. Copy it before closing this dialog.
         </p>
         {tokenModal && <CopyableToken token={tokenModal.token} />}
+      </Modal>
+
+      <Modal
+        open={agentsModal !== null}
+        onClose={() => agentsModal && !agentsModal.saving && setAgentsModal(null)}
+        title={
+          agentsModal
+            ? `Allowed agents for ${agentsModal.account}`
+            : 'Allowed agents'
+        }
+        footer={
+          <>
+            <button
+              disabled={agentsModal?.saving}
+              onClick={() => setAgentsModal(null)}
+              className="px-3 py-1.5 text-sm rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              disabled={!agentsModal || agentsModal.loading || agentsModal.saving}
+              onClick={saveAllowedAgents}
+              className="px-3 py-1.5 text-sm rounded bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:opacity-90 disabled:opacity-50"
+            >
+              {agentsModal?.saving ? 'Saving…' : 'Save'}
+            </button>
+          </>
+        }
+      >
+        <p className="text-sm text-zinc-600 dark:text-zinc-400">
+          Strict whitelist — this account can connect only to the agents
+          checked below. Uncheck all to lock the account out without
+          rotating its token.
+        </p>
+        {agentsModal?.err && (
+          <div className="text-sm rounded border-l-2 border-red-500 bg-red-50 dark:bg-red-950/30 px-3 py-2 text-red-700 dark:text-red-300">
+            {agentsModal.err}
+          </div>
+        )}
+        {agentsModal?.loading ? (
+          <div className="text-sm text-zinc-500">Loading…</div>
+        ) : agentsModal?.data && agentsModal.data.known.length === 0 ? (
+          <div className="text-sm text-zinc-500">
+            No agents have ever connected to this hub. Wait until at
+            least one agent is online before granting access.
+          </div>
+        ) : agentsModal?.data ? (
+          <div className="max-h-72 overflow-y-auto rounded border border-zinc-200 dark:border-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-800">
+            {agentsModal.data.known.map((name) => {
+              const online = agentsModal.data!.online.includes(name);
+              const checked = agentsModal.selected.has(name);
+              return (
+                <label
+                  key={name}
+                  className="flex items-center gap-3 px-3 py-2 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900/50 cursor-pointer"
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggleAgent(name)}
+                    className="rounded"
+                  />
+                  <span className="font-mono flex-1">{name}</span>
+                  {online ? (
+                    <span className="text-xs px-2 py-0.5 rounded bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300">
+                      online
+                    </span>
+                  ) : (
+                    <span className="text-xs px-2 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500">
+                      offline
+                    </span>
+                  )}
+                </label>
+              );
+            })}
+          </div>
+        ) : null}
       </Modal>
 
       <Modal

@@ -114,6 +114,24 @@ impl Db {
                 offset            INTEGER NOT NULL,
                 updated_at        INTEGER NOT NULL
             )",
+            // Per-account whitelist of agents this account may connect to.
+            // Semantics: strict whitelist — a row must exist for the
+            // (account, agent) pair, otherwise the account is denied. An
+            // account with zero rows cannot select any agent (admin must
+            // explicitly grant access from the admin UI). To keep upgrades
+            // from breaking existing deployments, the seed below grants
+            // each pre-existing account everything it has historically
+            // connected to (derived from the sessions table). The
+            // INSERT OR IGNORE is harmless on subsequent hub starts.
+            "CREATE TABLE IF NOT EXISTS account_allowed_agents (
+                account TEXT NOT NULL,
+                agent   TEXT NOT NULL,
+                PRIMARY KEY (account, agent)
+            )",
+            "INSERT OR IGNORE INTO account_allowed_agents (account, agent)
+                SELECT DISTINCT s.account, s.agent
+                  FROM sessions s
+                  JOIN accounts a ON a.name = s.account",
         ];
         for sql in stmts {
             sqlx::query(sql)
@@ -223,6 +241,70 @@ impl Db {
             anyhow::bail!("account '{}' not found", name);
         }
         Ok(())
+    }
+
+    // ---- account → agent whitelist ------------------------------------
+
+    pub async fn list_allowed_agents(&self, account: &str) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT agent FROM account_allowed_agents WHERE account = ?1 ORDER BY agent",
+        )
+        .bind(account)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get("agent")).collect())
+    }
+
+    pub async fn is_agent_allowed(&self, account: &str, agent: &str) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT 1 AS one FROM account_allowed_agents
+              WHERE account = ?1 AND agent = ?2",
+        )
+        .bind(account)
+        .bind(agent)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    /// Replace this account's allowlist with the given set atomically.
+    /// Caller is responsible for whatever de-duplication / validation
+    /// makes sense (admin UI). An empty `agents` slice clears the list,
+    /// which under strict-whitelist semantics means "this account can
+    /// connect to nothing" — useful for soft-disable.
+    pub async fn set_allowed_agents(&self, account: &str, agents: &[String]) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM account_allowed_agents WHERE account = ?1")
+            .bind(account)
+            .execute(&mut *tx)
+            .await?;
+        for agent in agents {
+            sqlx::query(
+                "INSERT OR IGNORE INTO account_allowed_agents (account, agent) VALUES (?1, ?2)",
+            )
+            .bind(account)
+            .bind(agent)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Union of every agent name we've ever seen — historical sessions
+    /// plus current allowlist entries. Used by the admin UI to render
+    /// the "known agents" multi-select even when an agent is offline.
+    pub async fn distinct_known_agents(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT agent FROM (
+                SELECT agent FROM sessions
+                UNION
+                SELECT agent FROM account_allowed_agents
+            ) ORDER BY agent",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get("agent")).collect())
     }
 
     // ---- audit ---------------------------------------------------------
@@ -529,6 +611,31 @@ impl Db {
             .fetch_one(&self.pool)
             .await?;
         Ok(row.get::<i64, _>("n"))
+    }
+
+    /// Latest `started_at` per (agent, account, workspace). Used by the
+    /// admin Workspaces page to show when each slot was last touched.
+    pub async fn last_started_per_workspace(
+        &self,
+    ) -> Result<Vec<(String, String, String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT agent, account, workspace, MAX(started_at) AS last_started
+               FROM sessions
+              GROUP BY agent, account, workspace",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("agent"),
+                    r.get::<String, _>("account"),
+                    r.get::<String, _>("workspace"),
+                    r.get::<i64, _>("last_started"),
+                )
+            })
+            .collect())
     }
 
     pub async fn end_session(&self, session_id: &str, reason: Option<&str>) {

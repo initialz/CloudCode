@@ -86,6 +86,12 @@ impl AgentRegistry {
     pub fn list_active(&self) -> Vec<String> {
         self.agents.iter().map(|e| e.key().clone()).collect()
     }
+
+    /// Snapshot of every currently-connected agent. Used by the admin
+    /// workspaces endpoint to fan out a `WorkspaceListAll` request.
+    pub fn list_conns(&self) -> Vec<Arc<AgentConn>> {
+        self.agents.iter().map(|e| e.value().clone()).collect()
+    }
 }
 
 impl Default for AgentRegistry {
@@ -200,7 +206,8 @@ fn classify(frame: &ClientMsg) -> Routing {
         ClientMsg::WorkspaceListResult { request_id, .. }
         | ClientMsg::WorkspaceCreateResult { request_id, .. }
         | ClientMsg::WorkspaceDeleteResult { request_id, .. }
-        | ClientMsg::WorkspaceResetResult { request_id, .. } => Routing::Workspace(*request_id),
+        | ClientMsg::WorkspaceResetResult { request_id, .. }
+        | ClientMsg::WorkspaceListAllResult { request_id, .. } => Routing::Workspace(*request_id),
         ClientMsg::Hello { .. } | ClientMsg::Pong | ClientMsg::Message { .. } => {
             // Message frames are intercepted upstream in ws_handler and
             // persisted to the admin db directly — they never reach

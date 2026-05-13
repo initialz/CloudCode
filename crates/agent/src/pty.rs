@@ -1,5 +1,7 @@
 use crate::config::{ClaudeConfig, RecordingConfig, SandboxConfig, TmuxConfig};
-use crate::tunnel::{pack_pty_frame, ClientMsg, ServerMsg, WorkspaceItem, TAG_PTY_OUTPUT};
+use crate::tunnel::{
+    pack_pty_frame, ClientMsg, ServerMsg, WorkspaceFullItem, WorkspaceItem, TAG_PTY_OUTPUT,
+};
 use anyhow::{Context, Result};
 use chrono::SecondsFormat;
 use dashmap::DashMap;
@@ -132,6 +134,9 @@ impl PtyManager {
                 account,
                 name,
             } => self.workspace_reset(request_id, account, name, tx).await,
+            ServerMsg::WorkspaceListAll { request_id } => {
+                self.workspace_list_all(request_id, tx).await
+            }
             ServerMsg::Welcome { .. } | ServerMsg::Rejected { .. } | ServerMsg::Ping => {}
         }
     }
@@ -600,6 +605,58 @@ done
         let _ = tx
             .send(OutFrame::Text(ClientMsg::WorkspaceResetResult {
                 request_id,
+                error,
+            }))
+            .await;
+    }
+
+    /// Admin inventory: enumerate every (account, workspace) directory
+    /// under workspace_root and probe tmux liveness for each.
+    async fn workspace_list_all(&self, request_id: Uuid, tx: mpsc::Sender<OutFrame>) {
+        let root = self.workspace_root();
+        let mut items: Vec<WorkspaceFullItem> = Vec::new();
+        let mut error: Option<String> = None;
+        match std::fs::read_dir(&root) {
+            Ok(rd) => {
+                let mut accounts: Vec<String> = rd
+                    .flatten()
+                    .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| !n.starts_with('.') && validate_name(n, "account").is_ok())
+                    .collect();
+                accounts.sort();
+                for account in accounts {
+                    let acct_dir = root.join(&account);
+                    let Ok(rd2) = std::fs::read_dir(&acct_dir) else {
+                        continue;
+                    };
+                    let mut workspaces: Vec<String> = rd2
+                        .flatten()
+                        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+                        .filter_map(|e| e.file_name().into_string().ok())
+                        .filter(|n| !n.starts_with('.') && validate_name(n, "workspace").is_ok())
+                        .collect();
+                    workspaces.sort();
+                    for name in workspaces {
+                        let tmux_alive = tmux_session_alive(&account, &name);
+                        items.push(WorkspaceFullItem {
+                            account: account.clone(),
+                            name,
+                            tmux_alive,
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    error = Some(format!("read_dir: {}", e));
+                }
+            }
+        }
+        let _ = tx
+            .send(OutFrame::Text(ClientMsg::WorkspaceListAllResult {
+                request_id,
+                items,
                 error,
             }))
             .await;

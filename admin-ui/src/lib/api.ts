@@ -50,6 +50,8 @@ export type AccountDto = {
   token_prefix: string | null;
   created_at: number;
   disabled: boolean;
+  /// Agents whitelisted for this account (strict whitelist).
+  allowed_agents: string[];
 };
 
 export type DashboardDto = {
@@ -105,6 +107,18 @@ export const apiClient = {
       api<void>(`/accounts/${encodeURIComponent(name)}/toggle`, { method: 'POST' }),
     delete: (name: string) =>
       api<void>(`/accounts/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+    allowedAgents: (name: string) =>
+      api<AllowedAgentsDto>(
+        `/accounts/${encodeURIComponent(name)}/allowed-agents`,
+      ),
+    setAllowedAgents: (name: string, agents: string[]) =>
+      api<void>(`/accounts/${encodeURIComponent(name)}/allowed-agents`, {
+        method: 'PUT',
+        body: JSON.stringify({ agents }),
+      }),
+  },
+  workspaces: {
+    list: () => api<WorkspaceRowDto[]>('/workspaces'),
   },
   audit: {
     list: (q: Record<string, string | number | undefined>) => {
@@ -148,4 +162,26 @@ export type MessageDto = {
   ts: number;
   kind: string;
   body: any;
+};
+
+export type AllowedAgentsDto = {
+  /// Agents currently whitelisted for this account.
+  allowed: string[];
+  /// Union of historical + online + already-allowed (admin picker pool).
+  known: string[];
+  /// Subset of `known` that's connected right now.
+  online: string[];
+};
+
+export type WorkspaceStatus = 'active' | 'saved' | 'fresh';
+
+export type WorkspaceRowDto = {
+  agent: string;
+  account: string;
+  workspace: string;
+  status: WorkspaceStatus;
+  has_client: boolean;
+  tmux_alive: boolean;
+  agent_online: boolean;
+  last_started_at: number | null;
 };
