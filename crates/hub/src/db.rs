@@ -89,6 +89,31 @@ impl Db {
             )",
             "CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_sessions_active ON sessions(ended_at) WHERE ended_at IS NULL",
+            // Conversation messages tailed from claude's per-project
+            // jsonl logs. One row per JSONL line; `kind` is the outer
+            // `type` field (user / assistant / permission-mode / ...);
+            // `body` is the raw line as JSON.
+            "CREATE TABLE IF NOT EXISTS messages (
+                id                INTEGER PRIMARY KEY AUTOINCREMENT,
+                cc_session_id     TEXT NOT NULL,
+                claude_session_id TEXT NOT NULL,
+                ts                INTEGER NOT NULL,
+                kind              TEXT NOT NULL,
+                body              TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_messages_cc_session ON messages(cc_session_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_claude_session ON messages(claude_session_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts DESC)",
+            // Track each jsonl file's byte offset so the agent can resume
+            // tailing where it left off after a restart. Keyed on the
+            // claude session id (== filename without .jsonl); the cc
+            // session that first saw it is recorded for routing.
+            "CREATE TABLE IF NOT EXISTS jsonl_progress (
+                claude_session_id TEXT PRIMARY KEY,
+                cc_session_id     TEXT NOT NULL,
+                offset            INTEGER NOT NULL,
+                updated_at        INTEGER NOT NULL
+            )",
         ];
         for sql in stmts {
             sqlx::query(sql)
@@ -403,6 +428,65 @@ impl Db {
         Ok(row.get::<i64, _>("n"))
     }
 
+    // ---- messages ------------------------------------------------------
+
+    /// Append one conversation message. Idempotency is the caller's job
+    /// (agent dedupes via jsonl_progress offsets).
+    pub async fn insert_message(&self, row: &MessageRow) {
+        let res = sqlx::query(
+            "INSERT INTO messages (cc_session_id, claude_session_id, ts, kind, body)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )
+        .bind(&row.cc_session_id)
+        .bind(&row.claude_session_id)
+        .bind(row.ts)
+        .bind(&row.kind)
+        .bind(&row.body)
+        .execute(&self.pool)
+        .await;
+        if let Err(e) = res {
+            tracing::debug!(error = %e, "message insert failed");
+        }
+    }
+
+    pub async fn list_messages_for_session(
+        &self,
+        cc_session_id: &str,
+        limit: i64,
+    ) -> Result<Vec<MessageDisplayRow>> {
+        let rows = sqlx::query(
+            "SELECT id, cc_session_id, claude_session_id, ts, kind, body
+               FROM messages
+              WHERE cc_session_id = ?1
+              ORDER BY id ASC
+              LIMIT ?2",
+        )
+        .bind(cc_session_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| MessageDisplayRow {
+                id: r.get("id"),
+                cc_session_id: r.get("cc_session_id"),
+                claude_session_id: r.get("claude_session_id"),
+                ts: r.get("ts"),
+                kind: r.get("kind"),
+                body: r.get("body"),
+            })
+            .collect())
+    }
+
+    pub async fn count_messages_for_session(&self, cc_session_id: &str) -> Result<i64> {
+        let row =
+            sqlx::query("SELECT COUNT(*) AS n FROM messages WHERE cc_session_id = ?1")
+                .bind(cc_session_id)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(row.get::<i64, _>("n"))
+    }
+
     /// Number of sessions started within the last `seconds` seconds.
     pub async fn count_sessions_since(&self, seconds: i64) -> Result<i64> {
         let cutoff = chrono::Utc::now().timestamp() - seconds;
@@ -471,6 +555,25 @@ pub struct SessionsFilter {
     pub workspace: Option<String>,
     pub active_only: bool,
     pub since: Option<i64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageRow {
+    pub cc_session_id: String,
+    pub claude_session_id: String,
+    pub ts: i64,
+    pub kind: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageDisplayRow {
+    pub id: i64,
+    pub cc_session_id: String,
+    pub claude_session_id: String,
+    pub ts: i64,
+    pub kind: String,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Default)]

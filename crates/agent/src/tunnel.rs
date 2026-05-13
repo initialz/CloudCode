@@ -67,6 +67,17 @@ pub enum ClientMsg {
         message: String,
     },
 
+    /// One JSONL line tailed from claude's per-project history file.
+    /// Streamed to the hub so the admin UI can show the conversation
+    /// associated with each session.
+    Message {
+        session_id: Uuid,
+        claude_session_id: String,
+        ts: i64,
+        kind: String,
+        body: String,
+    },
+
     /// Workspace management replies (not bound to a PTY session).
     WorkspaceListResult {
         request_id: Uuid,

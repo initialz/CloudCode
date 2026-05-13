@@ -200,6 +200,11 @@ fn classify(frame: &ClientMsg) -> Routing {
         ClientMsg::WorkspaceListResult { request_id, .. }
         | ClientMsg::WorkspaceCreateResult { request_id, .. }
         | ClientMsg::WorkspaceDeleteResult { request_id, .. } => Routing::Workspace(*request_id),
-        ClientMsg::Hello { .. } | ClientMsg::Pong => Routing::Discard,
+        ClientMsg::Hello { .. } | ClientMsg::Pong | ClientMsg::Message { .. } => {
+            // Message frames are intercepted upstream in ws_handler and
+            // persisted to the admin db directly — they never reach
+            // here under normal operation. Discard defensively.
+            Routing::Discard
+        }
     }
 }

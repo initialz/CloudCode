@@ -104,6 +104,27 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         };
         match msg {
             Message::Text(s) => match serde_json::from_str::<ClientMsg>(&s) {
+                Ok(ClientMsg::Message {
+                    session_id,
+                    claude_session_id,
+                    ts,
+                    kind,
+                    body,
+                }) => {
+                    // Conversation event from the agent's jsonl tail.
+                    // Persisted straight to the admin db; no client
+                    // forwarding needed.
+                    state
+                        .db
+                        .insert_message(&crate::db::MessageRow {
+                            cc_session_id: session_id.to_string(),
+                            claude_session_id,
+                            ts,
+                            kind,
+                            body,
+                        })
+                        .await;
+                }
                 Ok(frame) => conn.handle_text_frame(frame).await,
                 Err(e) => tracing::warn!(agent = %name, error = %e, "bad frame"),
             },
