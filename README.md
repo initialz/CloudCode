@@ -25,13 +25,21 @@ cloudcode-hub daemon start --config ./hub.toml
 - **agent registration token** → hand to every agent operator (goes into `agent.toml`)
 - **admin UI token** → keep for yourself; you'll paste it once into the admin login page
 
-By default the admin UI listens on `127.0.0.1:7101`. Open <http://localhost:7101/admin/login> (or run an SSH tunnel from your laptop), paste the admin token, and you can:
+By default the admin UI listens on `127.0.0.1:7101`. Open <http://localhost:7101/admin/login> (or run an SSH tunnel from your laptop), paste the admin token, and you get:
 
-- create / delete accounts and rotate their tokens (no more SSH-to-host + `gen-token`)
-- browse the audit timeline with filters
-- see active sessions, sessions in the last 24h, online agents
+- **Dashboard** — accounts / active sessions / sessions in the last 24h / online agents, plus an hourly chart of session starts.
+- **Accounts** — create, rotate token, disable / enable, delete. Newly issued tokens are displayed once with a Copy button.
+- **Sessions** — paged list, filter by account / agent / workspace, "active only" toggle. Live sessions show a pulsing dot; closed ones show duration and close reason.
+- **Audit** — paged timeline, filter by account / agent / kind / time range. Detail column opens a modal with the full JSON event.
 
-For remote access, put a TLS-terminating reverse proxy in front of `127.0.0.1:7101`.
+The whole UI is a React SPA built with Vite and Tailwind. It's bundled into the hub binary at build time — single-file deploy, no extra static directory to ship.
+
+For remote access, put a TLS-terminating reverse proxy in front of `127.0.0.1:7101`. SSH tunneling also works:
+
+```bash
+ssh -N -L 7101:127.0.0.1:7101 user@hub-host
+# then open http://127.0.0.1:7101/admin/ in your local browser
+```
 
 ### As an agent operator (run claude on this host)
 
