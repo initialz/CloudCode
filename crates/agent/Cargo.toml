@@ -30,6 +30,7 @@ rustls.workspace = true
 chrono.workspace = true
 portable-pty = "0.8"
 which = "6"
+notify.workspace = true
 cloudcode-daemon = { path = "../daemon" }
 
 [target.'cfg(unix)'.dependencies]

@@ -1,4 +1,5 @@
 mod config;
+mod jsonl;
 mod name;
 mod pty;
 mod sandbox;

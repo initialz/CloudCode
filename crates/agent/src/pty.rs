@@ -33,6 +33,9 @@ pub struct PtyManager {
 struct PtyHandle {
     master: Arc<Mutex<Box<dyn MasterPty + Send>>>,
     writer: Mutex<Box<dyn Write + Send>>,
+    /// Stops the jsonl watcher task on drop. Held only for its
+    /// Drop side-effect.
+    _jsonl: crate::jsonl::WatcherHandle,
 }
 
 impl PtyManager {
@@ -330,10 +333,16 @@ impl PtyManager {
             }
         };
 
+        // Start tailing claude's per-project JSONL log for this
+        // session. The watcher dies when the PtyHandle is dropped.
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        let jsonl = crate::jsonl::spawn(session_id, cwd.clone(), home, tx.clone());
+
         let master = Arc::new(Mutex::new(pair.master));
         let handle = Arc::new(PtyHandle {
             master,
             writer: Mutex::new(writer),
+            _jsonl: jsonl,
         });
         self.sessions.insert(session_id, handle.clone());
 
