@@ -31,8 +31,16 @@ struct Cli {
     #[arg(long)]
     agent: Option<String>,
 
-    /// One-time setup: write a fresh client config.toml template in the user
-    /// config dir. Refuses to overwrite if the file already exists.
+    /// Path to the client config TOML. Defaults to
+    /// `$XDG_CONFIG_HOME/cloudcode/config.toml` (i.e. usually
+    /// `~/.config/cloudcode/config.toml`). Handy when you want
+    /// multiple hub profiles side by side.
+    #[arg(long, value_name = "PATH")]
+    config: Option<PathBuf>,
+
+    /// One-time setup: write a fresh client config.toml template at
+    /// the resolved config path (`--config <path>` if given, otherwise
+    /// the default). Refuses to overwrite if the file already exists.
     #[arg(long)]
     init: bool,
 
@@ -58,7 +66,7 @@ struct ClientConfig {
     token: String,
 }
 
-fn config_path() -> Result<PathBuf> {
+fn default_config_path() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("XDG_CONFIG_HOME") {
         if !p.is_empty() {
             return Ok(PathBuf::from(p).join("cloudcode").join("config.toml"));
@@ -68,8 +76,15 @@ fn config_path() -> Result<PathBuf> {
     Ok(home.join(".config").join("cloudcode").join("config.toml"))
 }
 
-fn load_config() -> Result<ClientConfig> {
-    let path = config_path()?;
+fn resolve_config_path(override_path: Option<&PathBuf>) -> Result<PathBuf> {
+    match override_path {
+        Some(p) => Ok(p.clone()),
+        None => default_config_path(),
+    }
+}
+
+fn load_config(override_path: Option<&PathBuf>) -> Result<ClientConfig> {
+    let path = resolve_config_path(override_path)?;
     let s = std::fs::read_to_string(&path).with_context(|| {
         format!(
             "reading {} (run `cloudcode config` for instructions)",
@@ -146,12 +161,12 @@ async fn main() -> ExitCode {
         if cli.cmd.is_some() {
             Err(anyhow!("--init cannot be combined with a subcommand"))
         } else {
-            init_config()
+            init_config(cli.config.as_ref())
         }
     } else {
         match cli.cmd {
-            None => run_chat(cli.agent, cli.claude_args).await,
-            Some(Cmd::Config) => show_config(),
+            None => run_chat(cli.agent, cli.claude_args, cli.config.as_ref()).await,
+            Some(Cmd::Config) => show_config(cli.config.as_ref()),
         }
     };
     match result {
@@ -163,10 +178,10 @@ async fn main() -> ExitCode {
     }
 }
 
-fn show_config() -> Result<()> {
-    let path = config_path()?;
+fn show_config(override_path: Option<&PathBuf>) -> Result<()> {
+    let path = resolve_config_path(override_path)?;
     println!("config file: {}", path.display());
-    match load_config() {
+    match load_config(override_path) {
         Ok(c) => {
             println!("hub_url: {}", c.hub_url);
             let masked: String = c.token.chars().take(10).collect();
@@ -181,8 +196,8 @@ fn show_config() -> Result<()> {
     Ok(())
 }
 
-fn init_config() -> Result<()> {
-    let path = config_path()?;
+fn init_config(override_path: Option<&PathBuf>) -> Result<()> {
+    let path = resolve_config_path(override_path)?;
     if path.exists() {
         return Err(anyhow!(
             "{} already exists; refusing to overwrite. Delete it first if you really want to re-init.",
@@ -208,8 +223,12 @@ token   = "cc_PASTE_TOKEN_HERE"
     Ok(())
 }
 
-async fn run_chat(agent_flag: Option<String>, claude_args: Vec<String>) -> Result<()> {
-    let cfg = load_config()?;
+async fn run_chat(
+    agent_flag: Option<String>,
+    claude_args: Vec<String>,
+    config_override: Option<&PathBuf>,
+) -> Result<()> {
+    let cfg = load_config(config_override)?;
     let mut wire = wire::connect(&cfg.hub_url, &cfg.token).await?;
 
     let account_name = match wire.in_text_rx.recv().await {
