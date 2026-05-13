@@ -1,40 +1,39 @@
-//! Admin UI — login-gated HTTP frontend served on a separate listener.
+//! Admin server — JSON API for the React SPA in `admin-ui/`.
 //!
-//! Mounted by `serve()` in main.rs when `[admin].token_hash` is set. The
-//! whole UI lives under `/admin`. Authentication is a single shared
-//! login token (argon2id-hashed in hub.toml); successful login mints a
-//! random session id, stored in an in-memory map. The session id is
-//! returned to the browser as an `HttpOnly` cookie. Sessions don't
-//! survive a hub restart — operator re-logs in.
+//! Mounted by `serve()` in main.rs when `[admin].token_hash` is set.
+//! Lives on its own HTTP listener (default 127.0.0.1:7101). The single
+//! shared admin login token (argon2id-hashed in hub.toml) mints
+//! in-memory session ids on `POST /admin/api/login`; the id rides in an
+//! `HttpOnly` cookie and authenticates all other `/admin/api/*` calls.
+//! Sessions don't survive a hub restart — operator re-logs in.
+//!
+//! `/admin` and `/admin/*` (anything non-/api) serves the SPA shell
+//! (M8 will embed the Vite build; until then it's a placeholder).
 
-mod handlers;
+mod api;
 
 use crate::auth;
 use crate::AppState;
 use axum::{
     extract::{Request, State},
-    http::{header::COOKIE, HeaderMap},
+    http::{header::COOKIE, HeaderMap, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Redirect, Response},
-    routing::{get, post},
-    Router,
+    response::{Html, IntoResponse, Response},
+    routing::{delete, get, post},
+    Json, Router,
 };
 use dashmap::DashMap;
+use serde_json::json;
 use std::sync::Arc;
 
 pub const SESSION_COOKIE: &str = "cc_admin";
 
-/// Combined state passed into admin handlers: the existing hub state
-/// (db, registry, config) plus per-admin-server session bookkeeping.
 #[derive(Clone)]
 pub struct AdminState {
     pub app: Arc<AppState>,
     pub auth: Arc<AdminAuth>,
 }
 
-/// In-memory session table. Each successful login mints a session id and
-/// inserts it here. Logout deletes the entry. Hub restart wipes
-/// everything — that's intentional; admin re-logs in.
 pub struct AdminAuth {
     sessions: DashMap<String, ()>,
     token_hash: String,
@@ -48,8 +47,6 @@ impl AdminAuth {
         }
     }
 
-    /// Verify the plaintext token; on success allocate and return a
-    /// fresh session id to set as a cookie.
     pub fn login(&self, plaintext: &str) -> Option<String> {
         if auth::verify_token(plaintext, &self.token_hash) {
             let sid = auth::generate_session_id();
@@ -69,9 +66,6 @@ impl AdminAuth {
     }
 }
 
-/// Pull the `cc_admin` session id out of the Cookie request header, if
-/// any. Cookies arrive as a single header value of the form
-/// `name1=value1; name2=value2; ...`.
 pub fn session_cookie(headers: &HeaderMap) -> Option<String> {
     let raw = headers.get(COOKIE).and_then(|v| v.to_str().ok())?;
     for part in raw.split(';') {
@@ -83,51 +77,83 @@ pub fn session_cookie(headers: &HeaderMap) -> Option<String> {
     None
 }
 
-/// Middleware applied to protected admin routes. Unauthenticated
-/// requests get a 302 to the login page.
+/// Reject unauthenticated `/admin/api/*` traffic with a 401 JSON envelope
+/// instead of redirecting (SPA handles redirect itself).
 async fn require_admin(State(state): State<AdminState>, req: Request, next: Next) -> Response {
     if let Some(sid) = session_cookie(req.headers()) {
         if state.auth.is_valid(&sid) {
             return next.run(req).await;
         }
     }
-    Redirect::to("/admin/login").into_response()
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "unauthenticated", "message": "login required"})),
+    )
+        .into_response()
 }
 
 pub fn router(state: AdminState) -> Router {
     let gate = middleware::from_fn_with_state(state.clone(), require_admin);
+
     Router::new()
+        // -- auth (unauthenticated) --
+        .route("/admin/api/login", post(api::login))
+        .route("/admin/api/logout", post(api::logout))
+        // -- protected api --
+        .route("/admin/api/me", get(api::me).route_layer(gate.clone()))
         .route(
-            "/admin/login",
-            get(handlers::login_page).post(handlers::login_submit),
+            "/admin/api/dashboard",
+            get(api::dashboard).route_layer(gate.clone()),
         )
-        .route("/admin/logout", post(handlers::logout))
-        .route("/admin/", get(handlers::dashboard).route_layer(gate.clone()))
         .route(
-            "/admin/accounts",
-            get(handlers::accounts_list)
-                .post(handlers::accounts_create)
+            "/admin/api/sessions/hourly",
+            get(api::sessions_hourly).route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/api/accounts",
+            get(api::accounts_list)
+                .post(api::accounts_create)
                 .route_layer(gate.clone()),
         )
         .route(
-            "/admin/accounts/:name/rotate",
-            post(handlers::accounts_rotate).route_layer(gate.clone()),
+            "/admin/api/accounts/:name/rotate",
+            post(api::accounts_rotate).route_layer(gate.clone()),
         )
         .route(
-            "/admin/accounts/:name/toggle",
-            post(handlers::accounts_toggle).route_layer(gate.clone()),
+            "/admin/api/accounts/:name/toggle",
+            post(api::accounts_toggle).route_layer(gate.clone()),
         )
         .route(
-            "/admin/accounts/:name/delete",
-            post(handlers::accounts_delete).route_layer(gate.clone()),
+            "/admin/api/accounts/:name",
+            delete(api::accounts_delete).route_layer(gate.clone()),
         )
         .route(
-            "/admin/audit",
-            get(handlers::audit_list).route_layer(gate.clone()),
+            "/admin/api/audit",
+            get(api::audit_list).route_layer(gate.clone()),
         )
         .route(
-            "/admin/sessions",
-            get(handlers::sessions_list).route_layer(gate),
+            "/admin/api/audit/kinds",
+            get(api::audit_kinds).route_layer(gate.clone()),
         )
+        .route(
+            "/admin/api/sessions",
+            get(api::sessions_list).route_layer(gate),
+        )
+        // -- SPA shell (placeholder until M8 embeds the Vite build) --
+        .route("/admin", get(spa_placeholder))
+        .route("/admin/", get(spa_placeholder))
+        .route("/admin/*spa", get(spa_placeholder))
         .with_state(state)
+}
+
+async fn spa_placeholder() -> Html<&'static str> {
+    Html(r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>cloudcode admin</title>
+<style>body{font-family:system-ui,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1rem;color-scheme:light dark;}</style>
+</head><body>
+<h1>cloudcode admin</h1>
+<p>The new React-based admin UI is being built. The JSON API is already live at <code>/admin/api/*</code>.</p>
+<p>Try: <code>curl -X POST http://127.0.0.1:7101/admin/api/login -H 'Content-Type: application/json' -d '{"token":"&lt;admin-token&gt;"}'</code></p>
+</body></html>"#)
 }
