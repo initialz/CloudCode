@@ -127,6 +127,11 @@ impl PtyManager {
                 account,
                 name,
             } => self.workspace_delete(request_id, account, name, tx).await,
+            ServerMsg::WorkspaceReset {
+                request_id,
+                account,
+                name,
+            } => self.workspace_reset(request_id, account, name, tx).await,
             ServerMsg::Welcome { .. } | ServerMsg::Rejected { .. } | ServerMsg::Ping => {}
         }
     }
@@ -546,6 +551,46 @@ done
         };
         let _ = tx
             .send(OutFrame::Text(ClientMsg::WorkspaceDeleteResult {
+                request_id,
+                error,
+            }))
+            .await;
+    }
+
+    /// Clear the saved session state for a workspace without removing
+    /// its files: kill the per-workspace tmux server (which terminates
+    /// the wrapper's `--continue` breadcrumb) and wipe claude's
+    /// per-project history. Next OpenSession on this workspace gets a
+    /// fresh claude with whatever args the client passes.
+    async fn workspace_reset(
+        &self,
+        request_id: Uuid,
+        account: String,
+        name: String,
+        tx: mpsc::Sender<OutFrame>,
+    ) {
+        let error = match validate_name(&account, "account")
+            .and_then(|_| validate_name(&name, "workspace"))
+        {
+            Err(e) => Some(e),
+            Ok(()) => {
+                let dir = self.account_root(&account).join(&name);
+                if !dir.exists() {
+                    Some(format!("workspace '{}' does not exist", name))
+                } else {
+                    let _ = std::process::Command::new(&self.tmux.executable)
+                        .args(["-L", &format!("cc-{}-{}", account, name), "kill-server"])
+                        .output();
+                    if let Some(home) = dirs::home_dir() {
+                        let claude_proj = crate::jsonl::project_dir(&home, &dir);
+                        let _ = std::fs::remove_dir_all(&claude_proj);
+                    }
+                    None
+                }
+            }
+        };
+        let _ = tx
+            .send(OutFrame::Text(ClientMsg::WorkspaceResetResult {
                 request_id,
                 error,
             }))

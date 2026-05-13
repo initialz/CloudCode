@@ -190,7 +190,7 @@ async fn run_inner<B: ratatui::backend::Backend>(
                     &format!("Select workspace on {}", agent),
                     &workspace_rows,
                     &mut w_state,
-                    "↑↓ move · Enter pick · c create · d delete · Esc back · q quit",
+                    "↑↓ Enter · c create · r reset · d delete · Esc back · q quit",
                     false,
                 )
             })?;
@@ -229,12 +229,32 @@ async fn run_inner<B: ratatui::backend::Backend>(
                         }
                     }
                 }
+                MenuKey::Char('r') => {
+                    if let Some(sel) = w_state.selected() {
+                        if let Some(ws) = workspaces.get(sel) {
+                            let confirmed = prompt_confirm(
+                                term,
+                                bytes,
+                                keys,
+                                &format!(
+                                    "reset session for '{}'? Files stay; tmux + conversation history cleared.",
+                                    ws.name
+                                ),
+                            )
+                            .await?;
+                            if confirmed {
+                                reset_workspace(wire, &ws.name).await?;
+                                w_state.select(None);
+                            }
+                        }
+                    }
+                }
                 _ => match handle_list_key(k, &mut w_state, workspaces.len()) {
                     ListAction::Pick => {
                         if let Some(sel) = w_state.selected() {
                             if let Some(ws) = workspaces.get(sel).cloned() {
                                 let title = format!("Select workspace on {}", agent);
-                                let hint = "↑↓ move · Enter pick · c create · d delete · Esc back · q quit";
+                                let hint = "↑↓ Enter · c create · r reset · d delete · Esc back · q quit";
                                 let mut redraw = |pressed: bool| -> Result<()> {
                                     term.draw(|f| {
                                         draw_layout(
@@ -904,6 +924,26 @@ async fn delete_workspace(wire: &mut Wire, name: &str) -> Result<()> {
         let m = expect_text(wire).await?;
         match m {
             HubToClient::WorkspaceDeleted { .. } => return Ok(()),
+            HubToClient::SessionError { .. } => return Ok(()),
+            HubToClient::Ping => {
+                let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
+            }
+            _ => continue,
+        }
+    }
+}
+
+async fn reset_workspace(wire: &mut Wire, name: &str) -> Result<()> {
+    wire.out_tx
+        .send(OutFrame::Text(ClientToHub::ResetWorkspace {
+            name: name.into(),
+        }))
+        .await
+        .map_err(|_| anyhow!("hub disconnected"))?;
+    loop {
+        let m = expect_text(wire).await?;
+        match m {
+            HubToClient::WorkspaceReset { .. } => return Ok(()),
             HubToClient::SessionError { .. } => return Ok(()),
             HubToClient::Ping => {
                 let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;

@@ -95,6 +95,11 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    WorkspaceResetResult {
+        request_id: Uuid,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// One row in a WorkspaceListResult. `tmux_alive` lets the picker
@@ -152,6 +157,11 @@ pub enum ServerMsg {
         name: String,
     },
     WorkspaceDelete {
+        request_id: Uuid,
+        account: String,
+        name: String,
+    },
+    WorkspaceReset {
         request_id: Uuid,
         account: String,
         name: String,

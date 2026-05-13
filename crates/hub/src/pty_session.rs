@@ -468,6 +468,73 @@ where
             }
             true
         }
+        ClientToHub::ResetWorkspace { name } => {
+            let Some(conn) = ctx.selected_agent.clone() else {
+                let _ = send_client(
+                    sink,
+                    &HubToClient::SessionError {
+                        message: "no agent selected".into(),
+                    },
+                )
+                .await;
+                return true;
+            };
+            if ctx.state.workspaces.contains_key(&(
+                conn.name.clone(),
+                ctx.account_name.clone(),
+                name.clone(),
+            )) {
+                let _ = send_client(
+                    sink,
+                    &HubToClient::SessionError {
+                        message: format!("workspace '{}' is currently in use", name),
+                    },
+                )
+                .await;
+                return true;
+            }
+            let request_id = Uuid::new_v4();
+            let (tx, rx) = oneshot::channel();
+            conn.register_workspace_request(request_id, tx);
+            if conn
+                .send(ServerMsg::WorkspaceReset {
+                    request_id,
+                    account: ctx.account_name.clone(),
+                    name: name.clone(),
+                })
+                .await
+                .is_err()
+            {
+                let _ = send_client(
+                    sink,
+                    &HubToClient::SessionError {
+                        message: "agent disconnected".into(),
+                    },
+                )
+                .await;
+                return true;
+            }
+            match tokio::time::timeout(WORKSPACE_REQUEST_TIMEOUT, rx).await {
+                Ok(Ok(ClientMsg::WorkspaceResetResult { error, .. })) => match error {
+                    Some(e) => {
+                        let _ = send_client(sink, &HubToClient::SessionError { message: e }).await;
+                    }
+                    None => {
+                        let _ = send_client(sink, &HubToClient::WorkspaceReset { name }).await;
+                    }
+                },
+                _ => {
+                    let _ = send_client(
+                        sink,
+                        &HubToClient::SessionError {
+                            message: "workspace reset timed out".into(),
+                        },
+                    )
+                    .await;
+                }
+            }
+            true
+        }
         ClientToHub::OpenSession {
             workspace,
             cols,

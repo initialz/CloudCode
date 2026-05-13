@@ -29,6 +29,14 @@ pub enum ClientToHub {
     DeleteWorkspace {
         name: String,
     },
+    /// Wipe the saved session for a workspace without touching its
+    /// files: kills the per-workspace tmux server (terminating
+    /// `claude --continue`'s breadcrumb) and removes claude's
+    /// per-project history. The next OpenSession on this workspace
+    /// will get a fresh claude with the args the user passes.
+    ResetWorkspace {
+        name: String,
+    },
     /// Open a PTY session in the given workspace on the selected agent.
     /// `claude_args` is forwarded verbatim to `claude`'s argv when the
     /// session is first created (tmux ignores it on re-attach, so it
@@ -77,6 +85,9 @@ pub enum HubToClient {
         name: String,
     },
     WorkspaceDeleted {
+        name: String,
+    },
+    WorkspaceReset {
         name: String,
     },
     /// PTY session is up.

@@ -199,7 +199,8 @@ fn classify(frame: &ClientMsg) -> Routing {
         | ClientMsg::PtyError { session_id, .. } => Routing::Session(*session_id),
         ClientMsg::WorkspaceListResult { request_id, .. }
         | ClientMsg::WorkspaceCreateResult { request_id, .. }
-        | ClientMsg::WorkspaceDeleteResult { request_id, .. } => Routing::Workspace(*request_id),
+        | ClientMsg::WorkspaceDeleteResult { request_id, .. }
+        | ClientMsg::WorkspaceResetResult { request_id, .. } => Routing::Workspace(*request_id),
         ClientMsg::Hello { .. } | ClientMsg::Pong | ClientMsg::Message { .. } => {
             // Message frames are intercepted upstream in ws_handler and
             // persisted to the admin db directly — they never reach
