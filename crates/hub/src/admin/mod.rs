@@ -11,6 +11,7 @@
 //! (M8 will embed the Vite build; until then it's a placeholder).
 
 mod api;
+mod assets;
 
 use crate::auth;
 use crate::AppState;
@@ -18,7 +19,7 @@ use axum::{
     extract::{Request, State},
     http::{header::COOKIE, HeaderMap, StatusCode},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -139,21 +140,12 @@ pub fn router(state: AdminState) -> Router {
             "/admin/api/sessions",
             get(api::sessions_list).route_layer(gate),
         )
-        // -- SPA shell (placeholder until M8 embeds the Vite build) --
-        .route("/admin", get(spa_placeholder))
-        .route("/admin/", get(spa_placeholder))
-        .route("/admin/*spa", get(spa_placeholder))
+        // -- SPA bundle (built by `cd admin-ui && npm run build`) --
+        // /admin/assets/<hash>.{js,css,...} → long-cache hashed file
+        // anything else under /admin → index.html, SPA router handles
+        .route("/admin/assets/*path", get(assets::serve_asset))
+        .route("/admin", get(assets::serve_index))
+        .route("/admin/", get(assets::serve_index))
+        .route("/admin/*spa", get(assets::serve_index))
         .with_state(state)
-}
-
-async fn spa_placeholder() -> Html<&'static str> {
-    Html(r#"<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<title>cloudcode admin</title>
-<style>body{font-family:system-ui,sans-serif;max-width:40rem;margin:4rem auto;padding:0 1rem;color-scheme:light dark;}</style>
-</head><body>
-<h1>cloudcode admin</h1>
-<p>The new React-based admin UI is being built. The JSON API is already live at <code>/admin/api/*</code>.</p>
-<p>Try: <code>curl -X POST http://127.0.0.1:7101/admin/api/login -H 'Content-Type: application/json' -d '{"token":"&lt;admin-token&gt;"}'</code></p>
-</body></html>"#)
 }

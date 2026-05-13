@@ -42,6 +42,16 @@ jobs:
             echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           fi
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build admin-ui bundle
+        run: |
+          cd admin-ui
+          npm ci
+          npm run build
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
