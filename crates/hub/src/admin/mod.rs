@@ -198,6 +198,6 @@ pub fn router(state: AdminState) -> Router {
         // on a blank screen. Force the canonical trailing slash.
         .route("/admin", get(|| async { Redirect::permanent("/admin/") }))
         .route("/admin/", get(assets::serve_index))
-        .route("/admin/*spa", get(assets::serve_index))
+        .route("/admin/*spa", get(assets::serve_spa))
         .with_state(state)
 }

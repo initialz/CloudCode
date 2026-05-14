@@ -44,6 +44,22 @@ pub async fn serve_asset(Path(path): Path<String>) -> Response {
     }
 }
 
+/// `/admin/*spa` — first try to serve an exact file from dist root
+/// (favicon.svg, logo.svg, robots.txt, etc, anything Vite copies from
+/// `public/`); fall back to index.html so React Router can resolve
+/// deep links and reloads.
+pub async fn serve_spa(Path(path): Path<String>) -> Response {
+    // Strip leading slashes and reject path traversal.
+    let key = path.trim_start_matches('/');
+    if key.is_empty() || key.contains("..") {
+        return serve_index(Uri::from_static("/admin/")).await;
+    }
+    if let Some(file) = Asset::get(key) {
+        return file_response(key, file);
+    }
+    serve_index(Uri::from_static("/admin/")).await
+}
+
 fn file_response(path: &str, file: EmbeddedFile) -> Response {
     let mime = mime_for(path);
     let cache = if path.ends_with("index.html") {
