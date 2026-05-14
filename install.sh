@@ -127,6 +127,18 @@ EOF
   agent)
     install_bin cloudcode-agent
 
+    # Wipe the agent/current symlink (and the previous-version rollback
+    # pointer) so the next `daemon start` re-bootstraps from the binary
+    # we just installed. Without this, a daemon that was previously
+    # bumped via admin-UI self-update would keep running the older
+    # binary the symlink still points at — running `install.sh agent`
+    # is an explicit "use this binary" signal, so we honour it.
+    AGENT_STATE_DIR="${CLOUDCODE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/cloudcode}/agent"
+    if [ -L "$AGENT_STATE_DIR/current" ] || [ -e "$AGENT_STATE_DIR/current" ]; then
+      rm -f "$AGENT_STATE_DIR/current" "$AGENT_STATE_DIR/previous"
+      echo "  (cleared $AGENT_STATE_DIR/current — daemon will use the new binary on next start)"
+    fi
+
     cat <<EOF
 
 Agent installed.
