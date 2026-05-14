@@ -58,6 +58,12 @@ enum Cmd {
     /// clean exit (so self-update rolls forward). Forwards SIGTERM /
     /// SIGINT to the child.
     Supervise,
+    /// Clear the `agent/current` symlink so the next `daemon start` /
+    /// `supervise` bootstraps it from the currently-installed binary.
+    /// Use after a manual reinstall (install.sh ...) when you want to
+    /// undo a prior self-update and pin the daemon to the binary on
+    /// PATH.
+    ResetBinary,
     /// 后台管理 agent daemon（start/stop/restart/status）— daemon `start`
     /// 实际 spawn 的是 `cloudcode-agent supervise`，因此 self-update 能在
     /// 后台运行时透明热切换。
@@ -106,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
         None => serve(cli.config).await,
         Some(Cmd::Run) => serve(cli.config).await,
         Some(Cmd::Supervise) => supervise::run(cli.config),
+        Some(Cmd::ResetBinary) => supervise::reset_current(),
         // daemon start re-execs us with the `supervise` subcommand so
         // crashes (and self-update exits) can be recovered without
         // tearing the daemon down.

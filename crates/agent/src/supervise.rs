@@ -239,6 +239,42 @@ fn try_rollback_to_previous() -> bool {
     true
 }
 
+/// Remove `agent/current` (and the `agent/previous` rollback pointer)
+/// so the next supervisor start bootstraps the symlink from whatever
+/// `cloudcode-agent` is currently on PATH. Used by the `reset-binary`
+/// subcommand after a manual reinstall when the operator wants to
+/// undo a prior self-update.
+pub fn reset_current() -> Result<()> {
+    let state = state_dir().ok_or_else(|| anyhow::anyhow!("could not determine state dir"))?;
+    let agent_dir = state.join("agent");
+    let current = agent_dir.join("current");
+    let previous = agent_dir.join("previous");
+
+    let mut cleared = Vec::new();
+    for path in [&current, &previous] {
+        match std::fs::remove_file(path) {
+            Ok(()) => cleared.push(path.display().to_string()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "could not remove {}: {}",
+                    path.display(),
+                    e
+                ))
+            }
+        }
+    }
+    if cleared.is_empty() {
+        println!("agent/current was not set — nothing to reset.");
+    } else {
+        for p in &cleared {
+            println!("removed {}", p);
+        }
+        println!("Next `cloudcode-agent daemon start` will bootstrap from the installed binary.");
+    }
+    Ok(())
+}
+
 /// Create `agent/current` -> `self_exe` if no such symlink exists yet.
 /// Idempotent: a present symlink (even a stale / dangling one) is left
 /// alone — only a self-update is supposed to rewrite it. We deliberately
