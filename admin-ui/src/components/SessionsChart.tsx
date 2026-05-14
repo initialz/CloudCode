@@ -1,5 +1,6 @@
 import { useMemo } from 'react';
 import type { HourlyBucket } from '@/lib/api';
+import { formatDateHour, formatHour2 } from '@/lib/time';
 
 // Hand-drawn SVG line chart. 24 (or 'hours') buckets across the x axis.
 // No external chart lib — keeps the bundle small and the look matches
@@ -78,8 +79,7 @@ export function SessionsChart({ data, hours }: Props) {
       {filled.map((b, i) => {
         const stride = Math.max(1, Math.floor(hours / 4));
         if (i % stride !== 0 && i !== filled.length - 1) return null;
-        const d = new Date(b.ts * 1000);
-        const hh = d.getUTCHours().toString().padStart(2, '0');
+        const hh = formatHour2(b.ts);
         return (
           <text
             key={i}
@@ -145,7 +145,5 @@ function niceTicks(max: number): number[] {
 }
 
 function tooltip(b: HourlyBucket): string {
-  const d = new Date(b.ts * 1000);
-  const hh = d.toISOString().slice(0, 13).replace('T', ' ');
-  return `${hh}:00 UTC — ${b.count} session${b.count === 1 ? '' : 's'}`;
+  return `${formatDateHour(b.ts)}:00 — ${b.count} session${b.count === 1 ? '' : 's'}`;
 }

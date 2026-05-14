@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { apiClient, type AccountDto, type AllowedAgentsDto } from '@/lib/api';
 import { Modal } from '@/components/Modal';
 import { CopyableToken } from '@/components/CopyableToken';
+import { formatDate } from '@/lib/time';
 
 type TokenModal = { name: string; token: string; mode: 'created' | 'rotated' };
 
@@ -230,7 +231,7 @@ export function Accounts() {
                       </button>
                     </td>
                     <td className="px-3 py-2 text-zinc-500">
-                      {new Date(a.created_at * 1000).toISOString().slice(0, 10)}
+                      {formatDate(a.created_at)}
                     </td>
                     <td className="px-3 py-2 text-right space-x-1 whitespace-nowrap">
                       <button

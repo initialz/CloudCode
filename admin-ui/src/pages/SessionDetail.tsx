@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { apiClient, type MessageDto, type SessionDetailDto } from '@/lib/api';
+import { formatDateTime } from '@/lib/time';
 
 export function SessionDetail() {
   const { id } = useParams<{ id: string }>();
@@ -200,7 +201,7 @@ function Pair({ k, v }: { k: string; v: ReactNode }) {
 }
 
 function formatTs(unix: number): string {
-  return new Date(unix * 1000).toISOString().slice(0, 19).replace('T', ' ') + 'Z';
+  return formatDateTime(unix);
 }
 
 function formatDuration(seconds: number): string {

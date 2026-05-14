@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { apiClient, type SessionDto } from '@/lib/api';
+import { formatDateTime } from '@/lib/time';
 
 export function Sessions() {
   const [params, setParams] = useSearchParams();
@@ -240,7 +241,7 @@ function Dim({ children }: { children: ReactNode }) {
 }
 
 function formatTs(unix: number): string {
-  return new Date(unix * 1000).toISOString().slice(0, 19).replace('T', ' ') + 'Z';
+  return formatDateTime(unix);
 }
 
 function formatDuration(seconds: number): string {
