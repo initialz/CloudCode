@@ -2,6 +2,14 @@
 // its Hello frame; GitHub Releases tags carry a leading "v" ("v1.6.4").
 // Normalise on the frontend so the two are comparable.
 
+// Older agent binaries either can't self-update (v1.6.0 / v1.6.1
+// shipped a supervisor that ignored the agent/current symlink, so
+// the new binary landed on disk but never started) or have other
+// known wedge-y bugs that this codebase has since fixed. The admin
+// UI hides anything below this tag from the update target dropdown
+// so an operator can't roll forward into a broken release.
+export const MIN_AGENT_TARGET_VERSION = 'v1.6.2';
+
 export function normalizeVersion(v: string | null | undefined): string | null {
   if (v == null) return null;
   return v.startsWith('v') ? v.slice(1) : v;

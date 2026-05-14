@@ -1,7 +1,11 @@
 import { useEffect, useState } from 'react';
 import { apiClient, type AgentRowDto, type ReleaseDto } from '@/lib/api';
 import { Modal } from '@/components/Modal';
-import { compareSemver, versionsEqual } from '@/lib/version';
+import {
+  compareSemver,
+  versionsEqual,
+  MIN_AGENT_TARGET_VERSION,
+} from '@/lib/version';
 
 interface Props {
   open: boolean;
@@ -32,11 +36,17 @@ export function UpdateAgentModal({ open, onClose, agent, onUpdated }: Props) {
     apiClient.agents
       .releases()
       .then((data) => {
-        setReleases(data.releases);
-        // Default: latest, or agent.version if present in list, fallback to first.
+        // Hide releases below the known-good supervisor floor.
+        const eligible = data.releases.filter(
+          (r) => compareSemver(r.tag, MIN_AGENT_TARGET_VERSION) >= 0,
+        );
+        setReleases(eligible);
+        const latestEligible =
+          data.latest && compareSemver(data.latest, MIN_AGENT_TARGET_VERSION) >= 0
+            ? data.latest
+            : null;
         const defaultTarget =
-          data.latest ??
-          (data.releases.length > 0 ? data.releases[0].tag : '');
+          latestEligible ?? (eligible.length > 0 ? eligible[0].tag : '');
         setTarget(defaultTarget);
       })
       .catch((e: any) => {
