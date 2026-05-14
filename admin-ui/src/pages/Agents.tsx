@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { apiClient, type AgentRowDto, type AllowedAccountsDto } from '@/lib/api';
 import { Modal } from '@/components/Modal';
 import { UpdateAgentModal } from '@/components/UpdateAgentModal';
+import { versionsEqual } from '@/lib/version';
 
 type AccountsModalState = {
   agentName: string;
@@ -142,15 +143,12 @@ export function Agents() {
                 </tr>
               ) : (
                 agents.map((a) => {
-                  const isUpToDate =
-                    a.version !== null &&
-                    a.latest_version !== null &&
-                    a.version === a.latest_version;
+                  const isUpToDate = versionsEqual(a.version, a.latest_version);
                   const hasUpdate =
                     a.online &&
                     a.version !== null &&
                     a.latest_version !== null &&
-                    a.version !== a.latest_version;
+                    !isUpToDate;
 
                   let updateBtnLabel: string;
                   let updateBtnClass: string;

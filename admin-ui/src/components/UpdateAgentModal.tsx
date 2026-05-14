@@ -1,22 +1,7 @@
 import { useEffect, useState } from 'react';
 import { apiClient, type AgentRowDto, type ReleaseDto } from '@/lib/api';
 import { Modal } from '@/components/Modal';
-
-// Compare semver tags like "v1.5.0". Returns -1 | 0 | 1.
-function compareSemver(a: string, b: string): -1 | 0 | 1 {
-  const parse = (s: string) => s.replace(/^v/, '').split('.').map(Number);
-  const [aMaj, aMin, aPat] = parse(a);
-  const [bMaj, bMin, bPat] = parse(b);
-  for (const [x, y] of [
-    [aMaj, bMaj],
-    [aMin, bMin],
-    [aPat, bPat],
-  ] as [number, number][]) {
-    if (x > y) return 1;
-    if (x < y) return -1;
-  }
-  return 0;
-}
+import { compareSemver, versionsEqual } from '@/lib/version';
 
 interface Props {
   open: boolean;
@@ -85,7 +70,7 @@ export function UpdateAgentModal({ open, onClose, agent, onUpdated }: Props) {
   } else if (!target || loading) {
     submitLabel = 'Update';
     submitDisabled = true;
-  } else if (target === agent.version) {
+  } else if (versionsEqual(target, agent.version)) {
     submitLabel = 'Same as current';
     submitDisabled = true;
   } else if (cmp !== null && cmp < 0) {
