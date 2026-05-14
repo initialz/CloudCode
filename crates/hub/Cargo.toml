@@ -32,5 +32,6 @@ chrono.workspace = true
 dashmap.workspace = true
 uuid.workspace = true
 sqlx.workspace = true
+reqwest.workspace = true
 rust-embed = { version = "8", features = ["debug-embed"] }
 cloudcode-daemon = { path = "../daemon" }

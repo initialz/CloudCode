@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { apiClient, type AgentRowDto, type AllowedAccountsDto } from '@/lib/api';
 import { Modal } from '@/components/Modal';
+import { UpdateAgentModal } from '@/components/UpdateAgentModal';
 
 type AccountsModalState = {
   agentName: string;
@@ -17,6 +18,7 @@ export function Agents() {
   const [accountsModal, setAccountsModal] = useState<AccountsModalState | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [updateModal, setUpdateModal] = useState<AgentRowDto | null>(null);
 
   async function reload() {
     try {
@@ -126,6 +128,7 @@ export function Agents() {
               <tr>
                 <th className="px-3 py-2 text-left">Name</th>
                 <th className="px-3 py-2 text-left">Status</th>
+                <th className="px-3 py-2 text-left">Version</th>
                 <th className="px-3 py-2 text-left">Accounts</th>
                 <th className="px-3 py-2 text-right">Actions</th>
               </tr>
@@ -133,60 +136,105 @@ export function Agents() {
             <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800 bg-white dark:bg-zinc-900">
               {agents.length === 0 ? (
                 <tr>
-                  <td colSpan={4} className="px-3 py-6 text-center text-zinc-500">
+                  <td colSpan={5} className="px-3 py-6 text-center text-zinc-500">
                     No agents have ever connected to this hub yet.
                   </td>
                 </tr>
               ) : (
-                agents.map((a) => (
-                  <tr key={a.name}>
-                    <td className="px-3 py-2 font-mono">{a.name}</td>
-                    <td className="px-3 py-2">
-                      {a.online ? (
-                        <span className="text-xs px-2 py-0.5 rounded bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300">
-                          online
-                        </span>
-                      ) : (
-                        <span className="text-xs px-2 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200">
-                          offline
-                        </span>
-                      )}
-                    </td>
-                    <td className="px-3 py-2">
-                      <button
-                        onClick={() => openAccountsModal(a.name)}
-                        className="text-xs font-mono px-2 py-0.5 rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                        title="Edit account access"
-                      >
-                        {a.allowed_account_count === 0 ? (
-                          <span className="text-red-600 dark:text-red-400">none</span>
+                agents.map((a) => {
+                  const isUpToDate =
+                    a.version !== null &&
+                    a.latest_version !== null &&
+                    a.version === a.latest_version;
+                  const hasUpdate =
+                    a.online &&
+                    a.version !== null &&
+                    a.latest_version !== null &&
+                    a.version !== a.latest_version;
+
+                  let updateBtnLabel: string;
+                  let updateBtnClass: string;
+                  if (!a.online) {
+                    updateBtnLabel = '—';
+                    updateBtnClass = 'text-xs text-zinc-400';
+                  } else if (hasUpdate) {
+                    updateBtnLabel = `Update to ${a.latest_version}`;
+                    updateBtnClass =
+                      'px-2 py-1 text-xs rounded border border-red-300 dark:border-red-700/50 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/20';
+                  } else if (isUpToDate) {
+                    updateBtnLabel = 'Up to date';
+                    updateBtnClass =
+                      'px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800/50';
+                  } else {
+                    // online but version unknown
+                    updateBtnLabel = 'Update…';
+                    updateBtnClass =
+                      'px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800/50';
+                  }
+
+                  return (
+                    <tr key={a.name}>
+                      <td className="px-3 py-2 font-mono">{a.name}</td>
+                      <td className="px-3 py-2">
+                        {a.online ? (
+                          <span className="text-xs px-2 py-0.5 rounded bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300">
+                            online
+                          </span>
                         ) : (
-                          <>
-                            {a.allowed_account_count} account
-                            {a.allowed_account_count === 1 ? '' : 's'}
-                          </>
+                          <span className="text-xs px-2 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-800 dark:text-zinc-200">
+                            offline
+                          </span>
                         )}
-                      </button>
-                    </td>
-                    <td className="px-3 py-2 text-right whitespace-nowrap">
-                      {a.online ? (
-                        <span
-                          className="text-xs text-zinc-400"
-                          title="Online agents can't be deleted — disconnect on the agent host first"
-                        >
-                          —
-                        </span>
-                      ) : (
+                      </td>
+                      <td className="px-3 py-2">
+                        <span className="font-mono text-xs">{a.version ?? '—'}</span>
+                      </td>
+                      <td className="px-3 py-2">
                         <button
-                          onClick={() => setConfirmDelete(a.name)}
-                          className="px-2 py-1 text-xs rounded border border-red-300 dark:border-red-700/50 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/20"
+                          onClick={() => openAccountsModal(a.name)}
+                          className="text-xs font-mono px-2 py-0.5 rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                          title="Edit account access"
                         >
-                          Delete
+                          {a.allowed_account_count === 0 ? (
+                            <span className="text-red-600 dark:text-red-400">none</span>
+                          ) : (
+                            <>
+                              {a.allowed_account_count} account
+                              {a.allowed_account_count === 1 ? '' : 's'}
+                            </>
+                          )}
                         </button>
-                      )}
-                    </td>
-                  </tr>
-                ))
+                      </td>
+                      <td className="px-3 py-2 text-right whitespace-nowrap space-x-1">
+                        {a.online ? (
+                          <button
+                            onClick={() => setUpdateModal(a)}
+                            className={updateBtnClass}
+                          >
+                            {updateBtnLabel}
+                          </button>
+                        ) : (
+                          <span className="text-xs text-zinc-400">—</span>
+                        )}
+                        {a.online ? (
+                          <span
+                            className="text-xs text-zinc-400"
+                            title="Online agents can't be deleted — disconnect on the agent host first"
+                          >
+                            {/* spacer */}
+                          </span>
+                        ) : (
+                          <button
+                            onClick={() => setConfirmDelete(a.name)}
+                            className="px-2 py-1 text-xs rounded border border-red-300 dark:border-red-700/50 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/20"
+                          >
+                            Delete
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })
               )}
             </tbody>
           </table>
@@ -256,6 +304,18 @@ export function Agents() {
           </div>
         ) : null}
       </Modal>
+
+      {updateModal !== null && (
+        <UpdateAgentModal
+          open={updateModal !== null}
+          agent={updateModal}
+          onClose={() => setUpdateModal(null)}
+          onUpdated={() => {
+            setUpdateModal(null);
+            reload();
+          }}
+        />
+      )}
 
       <Modal
         open={confirmDelete !== null}

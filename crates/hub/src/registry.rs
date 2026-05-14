@@ -40,6 +40,8 @@ impl AgentRegistry {
     pub fn try_register(
         self: &Arc<Self>,
         name: String,
+        agent_version: Option<String>,
+        target_triple: Option<String>,
         send: mpsc::Sender<OutgoingFrame>,
     ) -> Option<Arc<AgentConn>> {
         match self.agents.entry(name.clone()) {
@@ -47,6 +49,8 @@ impl AgentRegistry {
             dashmap::mapref::entry::Entry::Vacant(v) => {
                 let conn = Arc::new(AgentConn {
                     name,
+                    agent_version,
+                    target_triple,
                     id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
                     send,
                     sessions: DashMap::new(),
@@ -102,11 +106,17 @@ impl Default for AgentRegistry {
 
 pub struct AgentConn {
     pub name: String,
+    /// Self-reported agent build version from the hello frame
+    /// (`CARGO_PKG_VERSION`), if the agent is new enough to send it.
+    pub agent_version: Option<String>,
+    /// Rust target triple of the agent binary, used to pick the right
+    /// release asset on self-update.
+    pub target_triple: Option<String>,
     id: u64,
     send: mpsc::Sender<OutgoingFrame>,
     /// Active PTY sessions hosted by this agent, keyed by session_id.
     sessions: DashMap<Uuid, mpsc::Sender<PtyEventOut>>,
-    /// One-shot reply slots for workspace_list / create / delete by request_id.
+    /// One-shot reply slots for workspace_list / create / delete / update by request_id.
     workspace_requests: DashMap<Uuid, oneshot::Sender<ClientMsg>>,
 }
 
@@ -207,7 +217,8 @@ fn classify(frame: &ClientMsg) -> Routing {
         | ClientMsg::WorkspaceCreateResult { request_id, .. }
         | ClientMsg::WorkspaceDeleteResult { request_id, .. }
         | ClientMsg::WorkspaceResetResult { request_id, .. }
-        | ClientMsg::WorkspaceListAllResult { request_id, .. } => Routing::Workspace(*request_id),
+        | ClientMsg::WorkspaceListAllResult { request_id, .. }
+        | ClientMsg::UpdateAgentResult { request_id, .. } => Routing::Workspace(*request_id),
         ClientMsg::Hello { .. } | ClientMsg::Pong | ClientMsg::Message { .. } => {
             // Message frames are intercepted upstream in ws_handler and
             // persisted to the admin db directly — they never reach

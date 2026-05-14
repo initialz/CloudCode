@@ -56,6 +56,8 @@ async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
         name: state.name.clone(),
         secret: state.config.auth.registration_token.clone(),
         version: PROTOCOL_VERSION.into(),
+        agent_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        target_triple: Some(crate::update::target_triple().to_string()),
     };
     let hello_json = serde_json::to_string(&hello)
         .map_err(|e| RunError::Transient(format!("encode hello: {}", e)))?;
@@ -132,6 +134,54 @@ where
                 }
                 Ok(ServerMsg::Rejected { reason }) => {
                     return Err(RunError::Fatal(reject_label(reason).into()));
+                }
+                Ok(ServerMsg::UpdateAgent {
+                    request_id,
+                    target_version,
+                    download_url,
+                    sha256_url,
+                }) => {
+                    // Self-update is a top-level concern, not a PTY/workspace
+                    // operation, so we handle it here rather than in
+                    // PtyManager::handle. On success the agent process
+                    // exits cleanly and the supervisor relaunches us on
+                    // the new binary.
+                    let tx_reply = tx.clone();
+                    tokio::spawn(async move {
+                        let req = crate::update::UpdateRequest {
+                            request_id,
+                            target_version: target_version.clone(),
+                            download_url,
+                            sha256_url,
+                        };
+                        match crate::update::perform_update(req).await {
+                            Ok(()) => {
+                                let _ = tx_reply
+                                    .send(OutFrame::Text(ClientMsg::UpdateAgentResult {
+                                        request_id,
+                                        error: None,
+                                    }))
+                                    .await;
+                                // Give the writer task a beat to flush the
+                                // ack frame onto the wire before we exit.
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                tracing::info!(
+                                    %target_version,
+                                    "self-update applied; exiting for supervisor to relaunch"
+                                );
+                                std::process::exit(0);
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "self-update failed");
+                                let _ = tx_reply
+                                    .send(OutFrame::Text(ClientMsg::UpdateAgentResult {
+                                        request_id,
+                                        error: Some(e),
+                                    }))
+                                    .await;
+                            }
+                        }
+                    });
                 }
                 Ok(frame) => {
                     let mgr = state.manager.clone();

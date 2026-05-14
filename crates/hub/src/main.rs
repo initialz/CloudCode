@@ -132,6 +132,7 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         let admin_state = admin::AdminState {
             app: state.clone(),
             auth: Arc::new(admin::AdminAuth::new(token_hash)),
+            releases: Arc::new(admin::ReleasesCache::new()),
         };
         let admin_app = admin::router(admin_state);
         let admin_listener = tokio::net::TcpListener::bind(&admin_listen)

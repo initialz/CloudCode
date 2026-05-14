@@ -128,6 +128,12 @@ export const apiClient = {
       }),
     delete: (name: string) =>
       api<void>(`/agents/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+    releases: () => api<ReleasesResponseDto>('/agents/releases'),
+    update: (name: string, version: string) =>
+      api<{ ok: true }>(`/agents/${encodeURIComponent(name)}/update`, {
+        method: 'POST',
+        body: JSON.stringify({ version }),
+      }),
   },
   workspaces: {
     list: () => api<WorkspaceRowDto[]>('/workspaces'),
@@ -189,7 +195,12 @@ export type AgentRowDto = {
   name: string;
   online: boolean;
   allowed_account_count: number;
+  version: string | null;
+  latest_version: string | null;
 };
+
+export type ReleaseDto = { tag: string; date: string };
+export type ReleasesResponseDto = { releases: ReleaseDto[]; latest: string | null };
 
 export type AllowedAccountsDto = {
   /// Accounts currently whitelisted for this agent.

@@ -13,6 +13,8 @@
 mod api;
 mod assets;
 
+pub use api::ReleasesCache;
+
 use crate::auth;
 use crate::AppState;
 use axum::{
@@ -33,6 +35,11 @@ pub const SESSION_COOKIE: &str = "cc_admin";
 pub struct AdminState {
     pub app: Arc<AppState>,
     pub auth: Arc<AdminAuth>,
+    /// Cached GitHub releases for the agent self-update flow. Refreshed
+    /// lazily on first hit + every 30 min after that. `None` until the
+    /// first fetch; an outer Result lets us surface fetch errors without
+    /// trampling the previous cached value.
+    pub releases: Arc<api::ReleasesCache>,
 }
 
 pub struct AdminAuth {
@@ -139,10 +146,18 @@ pub fn router(state: AdminState) -> Router {
             get(api::agents_list).route_layer(gate.clone()),
         )
         .route(
+            "/admin/api/agents/releases",
+            get(api::agents_releases).route_layer(gate.clone()),
+        )
+        .route(
             "/admin/api/agents/:name/allowed-accounts",
             get(api::agent_allowed_accounts_get)
                 .put(api::agent_allowed_accounts_set)
                 .route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/api/agents/:name/update",
+            post(api::agent_update).route_layer(gate.clone()),
         )
         .route(
             "/admin/api/agents/:name",

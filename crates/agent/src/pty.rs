@@ -137,6 +137,12 @@ impl PtyManager {
             ServerMsg::WorkspaceListAll { request_id } => {
                 self.workspace_list_all(request_id, tx).await
             }
+            // Self-update is intercepted in ws::read_loop before reaching
+            // the manager; the arm exists only to keep the match
+            // exhaustive. If we somehow see it here, log and drop.
+            ServerMsg::UpdateAgent { request_id, .. } => {
+                tracing::warn!(%request_id, "UpdateAgent reached PtyManager; should be handled in ws");
+            }
             ServerMsg::Welcome { .. } | ServerMsg::Rejected { .. } | ServerMsg::Ping => {}
         }
     }

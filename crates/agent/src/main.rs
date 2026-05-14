@@ -3,7 +3,9 @@ mod jsonl;
 mod name;
 mod pty;
 mod sandbox;
+mod supervise;
 mod tunnel;
+mod update;
 mod ws;
 
 use anyhow::{anyhow, Context};
@@ -46,7 +48,19 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 后台管理 agent daemon（start/stop/restart/status）
+    /// Run the agent main loop (connect to hub, serve PTYs). This is the
+    /// child of the supervisor; you usually want `supervise` or `daemon`
+    /// rather than calling `run` directly. Kept exposed so the supervisor
+    /// can re-exec the same binary.
+    Run,
+    /// Keep an agent process alive: spawn `cloudcode-agent run`, restart
+    /// it on crash with exponential backoff, restart it immediately on a
+    /// clean exit (so self-update rolls forward). Forwards SIGTERM /
+    /// SIGINT to the child.
+    Supervise,
+    /// 后台管理 agent daemon（start/stop/restart/status）— daemon `start`
+    /// 实际 spawn 的是 `cloudcode-agent supervise`，因此 self-update 能在
+    /// 后台运行时透明热切换。
     Daemon {
         #[command(subcommand)]
         cmd: cloudcode_daemon::DaemonCmd,
@@ -87,8 +101,17 @@ async fn main() -> anyhow::Result<()> {
         return init_config(&cli.config);
     }
     match cli.cmd {
+        // Backward compat: pre-v1.6 daemon installs invoke the binary
+        // with no subcommand. We treat that the same as `run`.
         None => serve(cli.config).await,
-        Some(Cmd::Daemon { cmd }) => cloudcode_daemon::run("agent", "agent.toml", cmd),
+        Some(Cmd::Run) => serve(cli.config).await,
+        Some(Cmd::Supervise) => supervise::run(cli.config),
+        // daemon start re-execs us with the `supervise` subcommand so
+        // crashes (and self-update exits) can be recovered without
+        // tearing the daemon down.
+        Some(Cmd::Daemon { cmd }) => {
+            cloudcode_daemon::run_with_prefix("agent", "agent.toml", cmd, &["supervise"])
+        }
         Some(Cmd::SandboxExec {
             workspace,
             workspace_root,

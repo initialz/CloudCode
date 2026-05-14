@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "6";
+pub const PROTOCOL_VERSION: &str = "7";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
@@ -45,6 +45,14 @@ pub enum ClientMsg {
         name: String,
         secret: String,
         version: String,
+        /// Self-reported agent build version (`CARGO_PKG_VERSION`). Optional
+        /// for compatibility with pre-v1.6.0 agents that don't send it.
+        #[serde(default)]
+        agent_version: Option<String>,
+        /// Rust target triple of the agent binary (e.g. `aarch64-apple-darwin`).
+        /// Used by the hub to pick the right release asset on self-update.
+        #[serde(default)]
+        target_triple: Option<String>,
     },
     Pong,
 
@@ -108,6 +116,14 @@ pub enum ClientMsg {
     WorkspaceListAllResult {
         request_id: Uuid,
         items: Vec<WorkspaceFullItem>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    /// Reply to a hub-initiated `UpdateAgent` request. On success the agent
+    /// exits cleanly so the supervisor relaunches it on the new binary.
+    UpdateAgentResult {
+        request_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -191,6 +207,20 @@ pub enum ServerMsg {
     /// UI to render a cross-account workspace inventory.
     WorkspaceListAll {
         request_id: Uuid,
+    },
+
+    /// Admin-only: instruct the agent to download a new release tarball,
+    /// verify its sha256, and swap the `current` symlink. On success the
+    /// agent process exits cleanly and the supervisor relaunches it on
+    /// the new binary.
+    UpdateAgent {
+        request_id: Uuid,
+        /// Tag of the form `vX.Y.Z` (matches the release tag on GitHub).
+        target_version: String,
+        /// `.tar.gz` asset URL for this agent's target triple.
+        download_url: String,
+        /// `.sha256` manifest URL covering the same asset.
+        sha256_url: String,
     },
 }
 

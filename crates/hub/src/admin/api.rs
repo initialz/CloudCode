@@ -432,6 +432,15 @@ struct AgentRowDto {
     name: String,
     online: bool,
     allowed_account_count: i64,
+    /// Self-reported agent build version from the most recent hello frame.
+    /// `None` if the agent is offline or it's a pre-v1.6 build that
+    /// doesn't yet send `agent_version`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<String>,
+    /// Latest agent release available from GitHub at the time of this
+    /// call. Used by the admin UI to surface an "update available" badge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_version: Option<String>,
 }
 
 pub async fn agents_list(State(state): State<AdminState>) -> Response {
@@ -454,19 +463,365 @@ pub async fn agents_list(State(state): State<AdminState>) -> Response {
         Err(e) => return internal(e),
     };
     let count_map: std::collections::HashMap<String, i64> = counts.into_iter().collect();
+    // Best-effort latest version lookup: don't fail the whole listing if
+    // GitHub is unreachable — the agents table is still useful without it.
+    let latest_version = state.releases.latest_cached_or_refresh().await;
     let dto: Vec<AgentRowDto> = names
         .into_iter()
         .map(|n| {
             let allowed_account_count = count_map.get(&n).copied().unwrap_or(0);
             let is_online = online.contains(&n);
+            let version = if is_online {
+                state
+                    .app
+                    .registry
+                    .get(&n)
+                    .and_then(|c| c.agent_version.clone())
+            } else {
+                None
+            };
             AgentRowDto {
                 name: n,
                 online: is_online,
                 allowed_account_count,
+                version,
+                latest_version: latest_version.clone(),
             }
         })
         .collect();
     Json(dto).into_response()
+}
+
+// ---------------------------------------------------------------------
+// Agent releases + self-update
+// ---------------------------------------------------------------------
+
+const RELEASES_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const GITHUB_RELEASES_URL: &str =
+    "https://api.github.com/repos/initialz/cloudcode/releases";
+const UPDATE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const VERSION_RE_HINT: &str = "vX.Y.Z";
+
+#[derive(Serialize, Clone)]
+pub struct ReleaseDto {
+    pub tag: String,
+    /// Publish date in ISO format (YYYY-MM-DD). Empty when GitHub didn't
+    /// supply `published_at` (draft / unpublished releases).
+    pub date: String,
+}
+
+#[derive(Serialize, Clone)]
+pub struct ReleasesResponse {
+    pub releases: Vec<ReleaseDto>,
+    pub latest: Option<String>,
+}
+
+/// Cached release listing. We keep both the public DTO (returned to
+/// admin UI) and the full asset map (used by the update endpoint to
+/// resolve the right download URL).
+#[derive(Clone)]
+struct ReleasesCacheEntry {
+    fetched_at: std::time::Instant,
+    public: ReleasesResponse,
+    /// For each tag, the asset map keyed by asset filename.
+    assets: std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+}
+
+pub struct ReleasesCache {
+    inner: tokio::sync::RwLock<Option<ReleasesCacheEntry>>,
+}
+
+impl ReleasesCache {
+    pub fn new() -> Self {
+        Self {
+            inner: tokio::sync::RwLock::new(None),
+        }
+    }
+
+    /// Return the cached entry if present and fresh, otherwise refresh.
+    /// On refresh failure with a stale cache, prefer the stale data over
+    /// a hard error so the admin UI degrades gracefully.
+    async fn get_fresh(&self) -> Result<ReleasesCacheEntry, String> {
+        if let Some(entry) = self.inner.read().await.clone() {
+            if entry.fetched_at.elapsed() < RELEASES_TTL {
+                return Ok(entry);
+            }
+        }
+        match fetch_releases().await {
+            Ok(fresh) => {
+                let mut w = self.inner.write().await;
+                *w = Some(fresh.clone());
+                Ok(fresh)
+            }
+            Err(e) => {
+                if let Some(entry) = self.inner.read().await.clone() {
+                    tracing::warn!(error = %e, "releases refresh failed; serving stale cache");
+                    return Ok(entry);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Best-effort "latest tag" lookup used by callers that don't care if
+    /// the cache is empty (e.g. agents_list). Returns None if there's
+    /// nothing cached and a fresh fetch fails.
+    pub async fn latest_cached_or_refresh(&self) -> Option<String> {
+        self.get_fresh().await.ok().and_then(|e| e.public.latest)
+    }
+}
+
+impl Default for ReleasesCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+async fn fetch_releases() -> Result<ReleasesCacheEntry, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent(format!("cloudcode-hub/{}", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| format!("build client: {e}"))?;
+    let resp = client
+        .get(GITHUB_RELEASES_URL)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|e| format!("GET releases: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("GitHub releases returned HTTP {}", resp.status()));
+    }
+    let raw: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("parse releases JSON: {e}"))?;
+    let arr = raw
+        .as_array()
+        .ok_or_else(|| "releases response was not a JSON array".to_string())?;
+
+    let mut entries: Vec<(String, String, std::collections::HashMap<String, String>)> = Vec::new();
+    for r in arr {
+        let Some(tag) = r.get("tag_name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let published_at = r
+            .get("published_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let date = published_at.get(..10).unwrap_or("").to_string();
+        let mut asset_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        if let Some(assets) = r.get("assets").and_then(|v| v.as_array()) {
+            for a in assets {
+                let Some(name) = a.get("name").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(url) = a.get("browser_download_url").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                asset_map.insert(name.to_string(), url.to_string());
+            }
+        }
+        entries.push((tag.to_string(), date, asset_map));
+    }
+    // Sort by published date desc; ties keep GitHub's order.
+    entries.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let public_releases: Vec<ReleaseDto> = entries
+        .iter()
+        .map(|(tag, date, _)| ReleaseDto {
+            tag: tag.clone(),
+            date: date.clone(),
+        })
+        .collect();
+    let latest = public_releases.first().map(|r| r.tag.clone());
+    let mut asset_table: std::collections::HashMap<
+        String,
+        std::collections::HashMap<String, String>,
+    > = std::collections::HashMap::new();
+    for (tag, _, assets) in entries {
+        asset_table.insert(tag, assets);
+    }
+    Ok(ReleasesCacheEntry {
+        fetched_at: std::time::Instant::now(),
+        public: ReleasesResponse {
+            releases: public_releases,
+            latest,
+        },
+        assets: asset_table,
+    })
+}
+
+pub async fn agents_releases(State(state): State<AdminState>) -> Response {
+    match state.releases.get_fresh().await {
+        Ok(entry) => Json(entry.public.clone()).into_response(),
+        Err(e) => err(StatusCode::SERVICE_UNAVAILABLE, "upstream_unavailable", e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct UpdateAgentRequest {
+    pub version: String,
+}
+
+pub async fn agent_update(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateAgentRequest>,
+) -> Response {
+    if !valid_agent_name(&name) {
+        return err(StatusCode::BAD_REQUEST, "invalid_input", "invalid agent name");
+    }
+    let target_version = req.version.trim().to_string();
+    if !is_valid_version_tag(&target_version) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            format!("version must match {}", VERSION_RE_HINT),
+        );
+    }
+
+    // Resolve the live connection. We don't hold a registry lock across
+    // the await below — `get` returns an Arc<AgentConn>.
+    let Some(conn) = state.app.registry.get(&name) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "agent_offline",
+            format!("agent '{}' is not connected", name),
+        );
+    };
+    let Some(target_triple) = conn.target_triple.clone() else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "target_unknown",
+            "agent did not report its target_triple in the hello frame; \
+             upgrade the agent to v1.6+ before driving a remote update",
+        );
+    };
+    let asset_os = match map_target_to_release_os(&target_triple) {
+        Some(s) => s,
+        None => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "unsupported_target",
+                format!("no release asset mapping for target {}", target_triple),
+            );
+        }
+    };
+
+    // Look up release + assets.
+    let entry = match state.releases.get_fresh().await {
+        Ok(e) => e,
+        Err(e) => {
+            return err(StatusCode::SERVICE_UNAVAILABLE, "upstream_unavailable", e);
+        }
+    };
+    let Some(assets) = entry.assets.get(&target_version) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "release_not_found",
+            format!("no release tagged {}", target_version),
+        );
+    };
+    let download_name = format!("cloudcode-{}-{}.tar.gz", target_version, asset_os);
+    let sha256_name = format!("cloudcode-{}-{}.sha256", target_version, asset_os);
+    let download_url = match assets.get(&download_name) {
+        Some(u) => u.clone(),
+        None => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                "missing_asset",
+                format!(
+                    "release {} has no asset {} for target {}",
+                    target_version, download_name, target_triple
+                ),
+            );
+        }
+    };
+    let sha256_url = match assets.get(&sha256_name) {
+        Some(u) => u.clone(),
+        None => {
+            return err(
+                StatusCode::BAD_GATEWAY,
+                "missing_asset",
+                format!(
+                    "release {} has no sha256 manifest {} for target {}",
+                    target_version, sha256_name, target_triple
+                ),
+            );
+        }
+    };
+
+    // Register a one-shot reply slot, fire the request, await with a
+    // generous timeout (downloads can be slow on small VPSes).
+    let request_id = uuid::Uuid::new_v4();
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    conn.register_workspace_request(request_id, reply_tx);
+    if conn
+        .send(crate::tunnel::ServerMsg::UpdateAgent {
+            request_id,
+            target_version: target_version.clone(),
+            download_url,
+            sha256_url,
+        })
+        .await
+        .is_err()
+    {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent_offline",
+            "agent disconnected before update request was sent",
+        );
+    }
+    match tokio::time::timeout(UPDATE_REPLY_TIMEOUT, reply_rx).await {
+        Ok(Ok(crate::tunnel::ClientMsg::UpdateAgentResult {
+            error: Some(error),
+            ..
+        })) => err(StatusCode::UNPROCESSABLE_ENTITY, "agent_update_failed", error),
+        Ok(Ok(crate::tunnel::ClientMsg::UpdateAgentResult { error: None, .. })) => (
+            StatusCode::ACCEPTED,
+            Json(json!({"ok": true})),
+        )
+            .into_response(),
+        Ok(Ok(_)) => err(
+            StatusCode::BAD_GATEWAY,
+            "unexpected_reply",
+            "agent returned an unexpected frame",
+        ),
+        Ok(Err(_)) => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent_offline",
+            "agent disconnected before reply",
+        ),
+        Err(_) => err(
+            StatusCode::GATEWAY_TIMEOUT,
+            "agent_timeout",
+            "agent did not reply within 10 minutes",
+        ),
+    }
+}
+
+fn is_valid_version_tag(v: &str) -> bool {
+    let Some(rest) = v.strip_prefix('v') else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('.').collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    parts
+        .iter()
+        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn map_target_to_release_os(target: &str) -> Option<&'static str> {
+    match target {
+        "aarch64-apple-darwin" => Some("macos-aarch64"),
+        "aarch64-unknown-linux-musl" => Some("linux-aarch64"),
+        "x86_64-unknown-linux-musl" => Some("linux-x86_64"),
+        _ => None,
+    }
 }
 
 #[derive(Serialize)]

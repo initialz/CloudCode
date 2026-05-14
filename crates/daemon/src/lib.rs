@@ -33,12 +33,25 @@ pub enum DaemonCmd {
 }
 
 pub fn run(name: &str, default_config: &str, cmd: DaemonCmd) -> Result<()> {
+    run_with_prefix(name, default_config, cmd, &[])
+}
+
+/// Same as [`run`] but `prefix_args` are inserted before `--config` when
+/// spawning the daemon child. Useful when the daemonized binary needs a
+/// subcommand (e.g. `cloudcode-agent supervise --config …`) rather than
+/// running its default mode.
+pub fn run_with_prefix(
+    name: &str,
+    default_config: &str,
+    cmd: DaemonCmd,
+    prefix_args: &[&str],
+) -> Result<()> {
     match cmd {
-        DaemonCmd::Start { config } => start(name, default_config, config),
+        DaemonCmd::Start { config } => start(name, default_config, config, prefix_args),
         DaemonCmd::Stop => stop(name),
         DaemonCmd::Restart { config } => {
             let _ = stop(name);
-            start(name, default_config, config)
+            start(name, default_config, config, prefix_args)
         }
         DaemonCmd::Status => status(name),
     }
@@ -92,7 +105,12 @@ fn is_alive(pid: i32) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-fn start(name: &str, default_config: &str, config: Option<PathBuf>) -> Result<()> {
+fn start(
+    name: &str,
+    default_config: &str,
+    config: Option<PathBuf>,
+    prefix_args: &[&str],
+) -> Result<()> {
     let pid_p = pid_path(name)?;
     let log_p = log_path(name)?;
 
@@ -119,6 +137,9 @@ fn start(name: &str, default_config: &str, config: Option<PathBuf>) -> Result<()
     let dev_null = File::open("/dev/null").context("opening /dev/null")?;
 
     let mut cmd = Command::new(&exe);
+    for a in prefix_args {
+        cmd.arg(a);
+    }
     cmd.arg("--config")
         .arg(&cfg)
         .stdin(Stdio::from(dev_null))
