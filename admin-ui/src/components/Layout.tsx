@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { apiClient } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
@@ -8,6 +8,14 @@ export function Layout() {
   const { setOut } = useAuth();
   const nav = useNavigate();
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [hubVersion, setHubVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    apiClient.me().then(
+      (r) => setHubVersion(r.hub_version ?? null),
+      () => setHubVersion(null),
+    );
+  }, []);
 
   async function handleLogout() {
     try {
@@ -23,7 +31,17 @@ export function Layout() {
     <div className="min-h-full flex flex-col">
       <header className="border-b border-zinc-200 dark:border-zinc-800 px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-6">
-          <h1 className="font-semibold text-lg">CloudCode admin</h1>
+          <h1 className="font-semibold text-lg flex items-center gap-2">
+            <span>CloudCode admin</span>
+            {hubVersion && (
+              <span
+                className="font-mono text-xs font-normal px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500"
+                title="Hub binary version"
+              >
+                hub {hubVersion}
+              </span>
+            )}
+          </h1>
           <nav className="flex gap-4 text-sm">
             <Tab to="/" end>
               Dashboard

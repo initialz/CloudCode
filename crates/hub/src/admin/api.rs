@@ -121,7 +121,17 @@ pub async fn logout(State(state): State<AdminState>, headers: HeaderMap) -> Resp
 
 pub async fn me() -> Response {
     // Reaching this handler at all means require_admin let us through.
-    (StatusCode::OK, Json(json!({"ok": true}))).into_response()
+    // Surface the hub's own build version so the admin UI can show
+    // which hub instance is talking to it (helps narrow down "did the
+    // hub actually upgrade?" questions during a self-update flow).
+    (
+        StatusCode::OK,
+        Json(json!({
+            "ok": true,
+            "hub_version": env!("CARGO_PKG_VERSION"),
+        })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------
