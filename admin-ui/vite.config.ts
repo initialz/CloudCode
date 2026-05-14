@@ -7,7 +7,28 @@ import path from 'node:path';
 // when the bundle is served from there.
 export default defineConfig({
   base: '/admin/',
-  plugins: [react()],
+  plugins: [
+    react(),
+    // /admin (no trailing slash) is unreachable under Vite's
+    // `base: '/admin/'` — the dev server returns a "did you mean
+    // /admin/?" hint instead of redirecting. Mirror what the hub
+    // does in production and 301 to the canonical URL so deep-links
+    // and address-bar typos just work in dev too.
+    {
+      name: 'redirect-admin-trailing-slash',
+      configureServer(server) {
+        server.middlewares.use((req, res, next) => {
+          if (req.url === '/admin') {
+            res.statusCode = 301;
+            res.setHeader('Location', '/admin/');
+            res.end();
+            return;
+          }
+          next();
+        });
+      },
+    },
+  ],
   resolve: {
     alias: { '@': path.resolve(__dirname, './src') },
   },
