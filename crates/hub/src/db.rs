@@ -116,22 +116,46 @@ impl Db {
             )",
             // Per-account whitelist of agents this account may connect to.
             // Semantics: strict whitelist — a row must exist for the
-            // (account, agent) pair, otherwise the account is denied. An
-            // account with zero rows cannot select any agent (admin must
-            // explicitly grant access from the admin UI). To keep upgrades
-            // from breaking existing deployments, the seed below grants
-            // each pre-existing account everything it has historically
-            // connected to (derived from the sessions table). The
-            // INSERT OR IGNORE is harmless on subsequent hub starts.
+            // (account, agent) pair, otherwise the account is denied.
+            // First-run seed (below) grants each pre-existing account
+            // every agent it had historically connected to (derived from
+            // sessions), so v0.9 upgrades didn't lock anyone out.
             "CREATE TABLE IF NOT EXISTS account_allowed_agents (
                 account TEXT NOT NULL,
                 agent   TEXT NOT NULL,
                 PRIMARY KEY (account, agent)
             )",
+            // Key-value scratchpad for migrations that need to run
+            // exactly once across the lifetime of the database. Without
+            // this table the ACL seed below would re-run on every hub
+            // restart and resurrect rows the admin had explicitly
+            // deleted from the UI.
+            "CREATE TABLE IF NOT EXISTS db_meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            )",
+            // Compat for deployments that already ran the unguarded
+            // seed (pre-v1.8.x): if the ACL table is non-empty, assume
+            // the seed has logically happened and lock the marker in,
+            // so the WHERE NOT EXISTS guard below short-circuits and
+            // we don't undelete anything on the next start.
+            "INSERT OR IGNORE INTO db_meta (key, value)
+                SELECT 'seeded_acl_v0_9', '1'
+                 WHERE EXISTS (SELECT 1 FROM account_allowed_agents)",
+            // Fresh deployments: actually run the seed. Guarded so it
+            // only happens once.
             "INSERT OR IGNORE INTO account_allowed_agents (account, agent)
                 SELECT DISTINCT s.account, s.agent
                   FROM sessions s
-                  JOIN accounts a ON a.name = s.account",
+                  JOIN accounts a ON a.name = s.account
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM db_meta WHERE key = 'seeded_acl_v0_9'
+                 )",
+            // Lock the marker in unconditionally — even for fresh dbs
+            // with zero historical sessions, so the seed doesn't try
+            // again once the admin starts using the system.
+            "INSERT OR IGNORE INTO db_meta (key, value)
+                VALUES ('seeded_acl_v0_9', '1')",
         ];
         for sql in stmts {
             sqlx::query(sql)
