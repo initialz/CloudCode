@@ -314,26 +314,17 @@ export default function Workbench() {
           const tab = tabsRef.current.find((t) => t.id === id);
           tab?.term.write(data);
         },
-        onClose: (_code, reason) => {
-          dispatchTabs({
-            type: 'UPDATE',
-            id,
-            patch: {
-              status: 'closed',
-              errorMsg: reason || 'Disconnected',
-            },
-          });
-          // Refresh workspace list so status dot updates
+        onClose: (_code, _reason) => {
+          // WS dropped — close the tab so the user doesn't have to
+          // click ✕ on a dead session. Refresh the sidebar so the
+          // workspace's status dot tracks reality.
           if (ctrlAgentRef.current === agent) {
             ctrlWsRef.current?.send({ type: 'list_workspaces' });
           }
+          closeTabRef.current(id);
         },
         onError: () => {
-          dispatchTabs({
-            type: 'UPDATE',
-            id,
-            patch: { status: 'error', errorMsg: 'WebSocket error' },
-          });
+          closeTabRef.current(id);
         },
       });
 
@@ -422,21 +413,15 @@ export default function Workbench() {
         break;
       }
       case 'session_error':
-        dispatchTabs({
-          type: 'UPDATE',
-          id: tabId,
-          patch: { status: 'error', errorMsg: msg.message },
-        });
-        break;
       case 'session_closed':
-        dispatchTabs({
-          type: 'UPDATE',
-          id: tabId,
-          patch: { status: 'closed', errorMsg: msg.reason ?? 'Session closed' },
-        });
+        // claude exited (/exit, Ctrl+C, crash) or the open failed —
+        // collapse the tab immediately so the user doesn't have to
+        // click ✕. The sidebar's status dot tracks the workspace
+        // separately.
         if (ctrlAgentRef.current === agent) {
           ctrlWsRef.current?.send({ type: 'list_workspaces' });
         }
+        closeTabRef.current(tabId);
         break;
       default:
         break;
@@ -470,6 +455,12 @@ export default function Workbench() {
     },
     [],
   );
+
+  // openTab's callbacks are created before closeTab in source order
+  // but reference it; route through a ref so the call site doesn't
+  // close over an undefined identifier on first render.
+  const closeTabRef = useRef<(id: string) => void>(() => {});
+  closeTabRef.current = closeTab;
 
   // ── Switch active tab ─────────────────────────────────────────────────────
 
