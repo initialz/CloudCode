@@ -1,4 +1,5 @@
 mod admin;
+mod app;
 mod audit;
 mod auth;
 mod config;
@@ -10,13 +11,19 @@ mod tunnel;
 mod ws_handler;
 
 use anyhow::{anyhow, Context};
-use axum::{routing::get, Router};
+use axum::{
+    middleware,
+    response::Redirect,
+    routing::{get, post},
+    Router,
+};
 use clap::{Parser, Subcommand};
 use dashmap::DashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
 
+use crate::app::UserAuth;
 use crate::audit::AuditLog;
 use crate::config::Config;
 use crate::db::Db;
@@ -32,6 +39,10 @@ pub struct AppState {
     /// account+workspace at once. Different accounts on the same agent get
     /// separate namespaces.
     pub workspaces: DashMap<(String, String, String), Uuid>,
+    /// User-facing webterm SPA session store. Maps an HttpOnly cookie
+    /// session id to the logged-in account name. Backs `/app/api/*`
+    /// and the cookie-auth path through `/v1/pty/ws`.
+    pub user_auth: Arc<UserAuth>,
 }
 
 #[derive(Parser)]
@@ -111,12 +122,30 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         db,
         registry: Arc::new(AgentRegistry::new()),
         workspaces: DashMap::new(),
+        user_auth: Arc::new(UserAuth::new()),
     });
+
+    // /app/* — user-facing webterm SPA + its JSON API. Lives on the
+    // same listener as /v1/pty/ws so cookie auth carries through to
+    // the WebSocket upgrade.
+    let user_gate = middleware::from_fn_with_state(state.clone(), app::require_user);
+    let app_router = Router::new()
+        .route("/app/api/login", post(app::api::login))
+        .route("/app/api/logout", post(app::api::logout))
+        .route(
+            "/app/api/me",
+            get(app::api::me).route_layer(user_gate.clone()),
+        )
+        .route("/app", get(|| async { Redirect::permanent("/app/") }))
+        .route("/app/", get(app::assets::serve_index))
+        .route("/app/assets/*path", get(app::assets::serve_asset))
+        .route("/app/*spa", get(app::assets::serve_spa));
 
     let app = Router::new()
         .route("/v1/pty/ws", get(pty_session::upgrade))
         .route("/v1/agent/ws", get(ws_handler::upgrade))
         .route("/healthz", get(|| async { "ok" }))
+        .merge(app_router)
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&listen)

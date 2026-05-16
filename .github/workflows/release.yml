@@ -52,6 +52,12 @@ jobs:
           npm ci
           npm run build
 
+      - name: Build webterm bundle
+        run: |
+          cd webterm
+          npm ci
+          npm run build
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}

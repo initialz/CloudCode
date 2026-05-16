@@ -11,6 +11,7 @@
 //! Only an explicit ClientToHub::Close (or WS close) ends the whole
 //! connection.
 
+use crate::app::{self, USER_SESSION_COOKIE};
 use crate::audit::AuditEvent;
 use crate::auth;
 use crate::pty_proto::{AgentInfo, ClientToHub, HubToClient};
@@ -19,6 +20,7 @@ use crate::tunnel::{ClientMsg, ServerMsg};
 use crate::AppState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::response::Response;
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -31,15 +33,25 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 const WORKSPACE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PTY_EVENT_QUEUE: usize = 1024;
 
-pub async fn upgrade(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state))
+pub async fn upgrade(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Response {
+    // Resolve cookie auth *before* the WS upgrade; once the socket is
+    // open we no longer have access to the original request headers.
+    // `None` means "fall back to in-protocol Hello token auth", which
+    // is what the CLI client uses.
+    let pre_auth = app::parse_cookie(&headers, USER_SESSION_COOKIE)
+        .and_then(|sid| state.user_auth.lookup(&sid));
+    ws.on_upgrade(move |socket| handle_socket(socket, state, pre_auth))
 }
 
-async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
+async fn handle_socket(socket: WebSocket, state: Arc<AppState>, pre_auth: Option<String>) {
     let (mut sink, mut stream) = socket.split();
 
     // ---- Hello (auth) ----
-    let account_name = match authenticate(&state, &mut sink, &mut stream).await {
+    let account_name = match authenticate(&state, &mut sink, &mut stream, pre_auth).await {
         Some(a) => a,
         None => return,
     };
@@ -161,11 +173,20 @@ impl ConnCtx {
     }
 }
 
-async fn authenticate<S, R>(state: &Arc<AppState>, sink: &mut S, stream: &mut R) -> Option<String>
+async fn authenticate<S, R>(
+    state: &Arc<AppState>,
+    sink: &mut S,
+    stream: &mut R,
+    pre_auth: Option<String>,
+) -> Option<String>
 where
     S: SinkExt<Message, Error = axum::Error> + Unpin,
     R: futures::Stream<Item = Result<Message, axum::Error>> + Unpin,
 {
+    // Still expect a Hello frame even when the cookie pre-authed the
+    // connection — the protocol shape is shared with the CLI client
+    // and the frame's `version` field is part of the contract. We just
+    // ignore the embedded token when we already trust the cookie.
     let hello = tokio::time::timeout(HELLO_TIMEOUT, stream.next()).await;
     let token = match hello {
         Ok(Some(Ok(Message::Text(s)))) => match serde_json::from_str::<ClientToHub>(&s) {
@@ -183,6 +204,25 @@ where
         },
         _ => return None,
     };
+
+    // Cookie-authed (webterm) path: take the account from the verified
+    // session id, ignore whatever token the SPA put in Hello.token.
+    if let Some(account_name) = pre_auth {
+        if send_client(
+            sink,
+            &HubToClient::Welcome {
+                account: account_name.clone(),
+            },
+        )
+        .await
+        .is_err()
+        {
+            return None;
+        }
+        return Some(account_name);
+    }
+
+    // Token-authed (CLI client) path — original behavior.
     let mut headers = axum::http::HeaderMap::new();
     if let Ok(v) = axum::http::HeaderValue::from_str(&format!("Bearer {}", token)) {
         headers.insert(axum::http::header::AUTHORIZATION, v);
