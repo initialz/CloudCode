@@ -1,7 +1,7 @@
 // Left sidebar tree: agents -> workspaces.
 // Expanded agents fetch workspaces via the control WS (handled by parent).
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import type { AgentItem, WorkspaceItem } from '@/lib/wire';
 
 type WorkspaceState =
@@ -25,6 +25,9 @@ type Props = {
   onOpenWorkspace: (agent: string, workspace: string) => void;
   onResetWorkspace: (agent: string, workspace: string) => void;
   onDeleteWorkspace: (agent: string, workspace: string) => void;
+  /** Triggered by the right-click context menu on an agent row,
+   *  pre-filling the "create workspace" dialog with this agent. */
+  onCreateWorkspaceFor: (agent: string) => void;
 };
 
 export default function AgentTree({
@@ -37,8 +40,20 @@ export default function AgentTree({
   onOpenWorkspace,
   onResetWorkspace,
   onDeleteWorkspace,
+  onCreateWorkspaceFor,
 }: Props) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [menu, setMenu] = useState<{ x: number; y: number; agent: string } | null>(null);
+
+  // Close the context menu on Escape.
+  useEffect(() => {
+    if (!menu) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMenu(null);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [menu]);
 
   function toggleAgent(name: string, online: boolean) {
     if (!online) return;
@@ -69,7 +84,33 @@ export default function AgentTree({
   }
 
   return (
-    <div className="flex-1 overflow-y-auto">
+    <div className="flex-1 overflow-y-auto relative">
+      {menu && (
+        <>
+          {/* invisible backdrop: any click outside / right-click closes */}
+          <div
+            className="fixed inset-0 z-40"
+            onClick={() => setMenu(null)}
+            onContextMenu={(e) => { e.preventDefault(); setMenu(null); }}
+          />
+          <div
+            className="fixed z-50 min-w-[10rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
+            style={{ left: menu.x, top: menu.y }}
+          >
+            <button
+              type="button"
+              onClick={() => {
+                const a = menu.agent;
+                setMenu(null);
+                onCreateWorkspaceFor(a);
+              }}
+              className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
+            >
+              Create workspace…
+            </button>
+          </div>
+        </>
+      )}
       {agents.map((agent) => {
         const isExpanded = expanded.has(agent.name);
         const wsState: WorkspaceState = cache.get(agent.name) ?? { status: 'idle' };
@@ -80,10 +121,16 @@ export default function AgentTree({
             <button
               type="button"
               onClick={() => toggleAgent(agent.name, agent.current !== undefined ? true : true)}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                setMenu({ x: e.clientX, y: e.clientY, agent: agent.name });
+              }}
               className={`w-full flex items-center gap-1.5 px-2 py-1 text-left text-xs font-mono transition-colors ${
                 agent.current === false
                   ? 'text-zinc-400 dark:text-zinc-600 cursor-default'
-                  : 'text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
+                  : menu?.agent === agent.name
+                    ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100'
+                    : 'text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
               }`}
               aria-expanded={isExpanded}
             >

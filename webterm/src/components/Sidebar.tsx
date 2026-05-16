@@ -50,9 +50,12 @@ export default function Sidebar({
   const [createName, setCreateName] = useState('');
   const [confirm, setConfirm] = useState<ConfirmState | null>(null);
 
-  function openCreate() {
-    // Pre-select first available agent
-    if (agents.length > 0) setCreateAgent(agents[0].name);
+  function openCreate(forAgent?: string) {
+    // Pre-select the agent the caller named (right-click flow), else
+    // fall back to the first available one (the "+ create workspace"
+    // button at the bottom of the sidebar).
+    if (forAgent) setCreateAgent(forAgent);
+    else if (agents.length > 0) setCreateAgent(agents[0].name);
     setCreateName('');
     setShowCreate(true);
   }
@@ -114,13 +117,14 @@ export default function Sidebar({
             onOpenWorkspace={onOpenWorkspace}
             onResetWorkspace={askReset}
             onDeleteWorkspace={askDelete}
+            onCreateWorkspaceFor={openCreate}
           />
         </div>
 
         {/* Create workspace button */}
         <div className="shrink-0 px-3 py-2 border-t border-zinc-200 dark:border-zinc-800">
           <button
-            onClick={openCreate}
+            onClick={() => openCreate()}
             className="w-full text-left text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors py-0.5"
           >
             + create workspace
