@@ -239,12 +239,10 @@ registration_token = "ag_PASTE_TOKEN_HERE"
 # workspace_root = "~/cloudcode-agent/workspaces"      # one dir per workspace
 # extra_args     = []                                  # appended to claude args
 
-# [sandbox] wraps each spawned claude (and its tmux session) in an OS-level
-# sandbox so it can only touch the active workspace dir + ~/.claude + scratch
-# space. Off by default — opt in once you've confirmed the profile fits the
-# tools your projects use. macOS only at the moment (Seatbelt); Linux is
-# coming. With it enabled, escaping the workspace is a kernel-enforced EPERM
-# rather than a "please don't".
+# [sandbox] is deprecated. The sandbox toggle moved to the hub —
+# it's now per-account, set from the admin UI's Accounts page.
+# Any value here is ignored; the section is left commented out
+# only so older agent.toml files keep parsing.
 # [sandbox]
 # enabled = false
 "#

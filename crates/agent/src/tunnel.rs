@@ -169,6 +169,11 @@ pub enum ServerMsg {
         rows: u16,
         #[serde(default)]
         claude_args: Vec<String>,
+        /// Wrap the spawned tmux+claude in the workspace sandbox.
+        /// Decided per-account on the hub. Defaults to false for
+        /// back-compat with pre-v1.9 hubs that never sent it.
+        #[serde(default)]
+        sandbox: bool,
     },
     PtyResize {
         session_id: Uuid,

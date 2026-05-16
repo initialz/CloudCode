@@ -223,6 +223,9 @@ struct AccountDto {
     /// True iff this account has at least one session currently live
     /// (ended_at IS NULL).
     online: bool,
+    /// Whether claude runs inside the workspace sandbox for this
+    /// account. Replaces the agent.toml-level switch.
+    sandbox_enabled: bool,
 }
 
 pub async fn accounts_list(State(state): State<AdminState>) -> Response {
@@ -259,6 +262,7 @@ pub async fn accounts_list(State(state): State<AdminState>) -> Response {
             allowed_agents: allowed,
             last_used_at,
             online: active_count > 0,
+            sandbox_enabled: a.sandbox_enabled,
         });
     }
     Json(dto).into_response()
@@ -351,6 +355,28 @@ pub async fn accounts_toggle(
     };
     let new_disabled = !current.disabled;
     if let Err(e) = state.app.db.set_account_disabled(&name, new_disabled).await {
+        return err(StatusCode::NOT_FOUND, "not_found", e.to_string());
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+pub async fn accounts_sandbox_toggle(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+) -> Response {
+    let accounts = match state.app.db.list_accounts().await {
+        Ok(a) => a,
+        Err(e) => return internal(e),
+    };
+    let Some(current) = accounts.iter().find(|a| a.name == name) else {
+        return err(StatusCode::NOT_FOUND, "not_found", "account not found");
+    };
+    if let Err(e) = state
+        .app
+        .db
+        .set_account_sandbox(&name, !current.sandbox_enabled)
+        .await
+    {
         return err(StatusCode::NOT_FOUND, "not_found", e.to_string());
     }
     StatusCode::NO_CONTENT.into_response()

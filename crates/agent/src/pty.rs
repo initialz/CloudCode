@@ -45,7 +45,12 @@ impl PtyManager {
         claude: ClaudeConfig,
         tmux: TmuxConfig,
         recording: RecordingConfig,
-        sandbox: SandboxConfig,
+        // Kept in the signature so call sites compile, but the agent
+        // no longer makes the sandbox decision: it's per-account on
+        // the hub now (see ServerMsg::PtyOpen.sandbox). The agent
+        // just figures out whether sandbox is structurally possible
+        // (macOS today) and stands the wrapper-path ready.
+        _sandbox: SandboxConfig,
     ) -> Result<Self> {
         // Fail fast if tmux is not installed.
         let tmux_path = which::which(&tmux.executable).with_context(|| {
@@ -62,20 +67,18 @@ impl PtyManager {
             tracing::warn!(error = %e, dir = %recording.dir.display(), "could not create recording dir");
         }
 
-        let self_exe = if sandbox.enabled {
-            if !crate::sandbox::is_supported() {
-                return Err(anyhow::anyhow!(
-                    "[sandbox] enabled = true in agent.toml, but the workspace sandbox \
-                     is not implemented for this platform yet (macOS only at the moment). \
-                     Set [sandbox] enabled = false to start the agent."
-                ));
-            }
+        // Locate the wrapper binary if this platform can sandbox at
+        // all. `None` -> any PtyOpen that asks for sandbox will be
+        // refused with a PtyError, while sandbox=false sessions still
+        // run as usual.
+        let self_exe = if crate::sandbox::is_supported() {
             let p = std::env::current_exe().context(
                 "locating the running cloudcode-agent binary for the sandbox wrapper",
             )?;
-            tracing::info!(wrapper = %p.display(), "workspace sandbox enabled");
+            tracing::info!(wrapper = %p.display(), "workspace sandbox capability available");
             Some(p)
         } else {
+            tracing::info!("workspace sandbox not supported on this platform");
             None
         };
 
@@ -99,9 +102,12 @@ impl PtyManager {
                 cols,
                 rows,
                 claude_args,
+                sandbox,
             } => {
-                self.open_session(session_id, account, workspace, cols, rows, claude_args, tx)
-                    .await;
+                self.open_session(
+                    session_id, account, workspace, cols, rows, claude_args, sandbox, tx,
+                )
+                .await;
             }
             ServerMsg::PtyResize {
                 session_id,
@@ -184,6 +190,7 @@ impl PtyManager {
         cols: u16,
         rows: u16,
         claude_args: Vec<String>,
+        sandbox: bool,
         tx: mpsc::Sender<OutFrame>,
     ) {
         if let Err(e) = validate_name(&account, "account") {
@@ -254,7 +261,23 @@ impl PtyManager {
         // execing tmux (so tmux + claude inherit the sandbox state).
         let session_name = format!("cloudcode-{}-{}", account, workspace);
         let tmux_label = format!("cc-{}-{}", account, workspace);
-        let mut cmd = if let Some(self_exe) = &self.self_exe {
+        // Sandbox is now a per-session decision driven by the hub
+        // (account.sandbox_enabled). If the hub asked for sandbox but
+        // this platform can't deliver it (Linux), surface that as a
+        // PtyError rather than silently spawning unsandboxed.
+        if sandbox && self.self_exe.is_none() {
+            let _ = tx
+                .send(OutFrame::Text(ClientMsg::PtyError {
+                    session_id,
+                    message: "sandbox requested but not supported on this agent platform"
+                        .to_string(),
+                }))
+                .await;
+            return;
+        }
+        let mut cmd = if sandbox {
+            // self_exe is Some here because we just checked above.
+            let self_exe = self.self_exe.as_ref().unwrap();
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
             let ws_root = self.workspace_root();
             let mut c = CommandBuilder::new(self_exe);

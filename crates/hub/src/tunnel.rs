@@ -171,6 +171,13 @@ pub enum ServerMsg {
         rows: u16,
         #[serde(default)]
         claude_args: Vec<String>,
+        /// Whether the agent should wrap the spawned tmux+claude in
+        /// the workspace sandbox. Decided per-account on the hub
+        /// (`accounts.sandbox_enabled`); the agent.toml `[sandbox]`
+        /// switch is deprecated. Optional for back-compat with pre-
+        /// v1.9 hubs (default false = no sandbox).
+        #[serde(default)]
+        sandbox: bool,
     },
     PtyResize {
         session_id: Uuid,

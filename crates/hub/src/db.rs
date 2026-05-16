@@ -28,6 +28,10 @@ pub struct DbAccount {
     pub token_prefix: Option<String>,
     pub created_at: i64,
     pub disabled: bool,
+    /// Per-account workspace sandbox toggle. Defaults to true on
+    /// fresh installs; existing accounts get true at migration time.
+    /// Replaces the agent.toml-level `[sandbox] enabled` switch.
+    pub sandbox_enabled: bool,
 }
 
 impl Db {
@@ -59,12 +63,18 @@ impl Db {
         // new objects on upgrade.
         let stmts = [
             "CREATE TABLE IF NOT EXISTS accounts (
-                name         TEXT PRIMARY KEY,
-                token_hash   TEXT NOT NULL,
-                token_prefix TEXT,
-                created_at   INTEGER NOT NULL,
-                disabled     INTEGER NOT NULL DEFAULT 0
+                name            TEXT PRIMARY KEY,
+                token_hash      TEXT NOT NULL,
+                token_prefix    TEXT,
+                created_at      INTEGER NOT NULL,
+                disabled        INTEGER NOT NULL DEFAULT 0,
+                sandbox_enabled INTEGER NOT NULL DEFAULT 1
             )",
+            // Idempotent ALTER for deployments that pre-date the
+            // sandbox_enabled column. SQLite errors on duplicate
+            // column; the next statement swallows that case via
+            // the marker check below.
+            "ALTER TABLE accounts ADD COLUMN sandbox_enabled INTEGER NOT NULL DEFAULT 1",
             "CREATE TABLE IF NOT EXISTS audit_events (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts         INTEGER NOT NULL,
@@ -158,10 +168,23 @@ impl Db {
                 VALUES ('seeded_acl_v0_9', '1')",
         ];
         for sql in stmts {
-            sqlx::query(sql)
-                .execute(&self.pool)
-                .await
-                .with_context(|| format!("migrate: {}", sql.split_whitespace().take(4).collect::<Vec<_>>().join(" ")))?;
+            let res = sqlx::query(sql).execute(&self.pool).await;
+            if let Err(e) = res {
+                // Idempotent ALTER TABLE: SQLite returns "duplicate
+                // column name" when the column already exists. Treat
+                // that as success so re-running migrations on an
+                // already-upgraded db is a no-op.
+                let msg = e.to_string();
+                if msg.contains("duplicate column name") {
+                    continue;
+                }
+                return Err(e).with_context(|| {
+                    format!(
+                        "migrate: {}",
+                        sql.split_whitespace().take(4).collect::<Vec<_>>().join(" ")
+                    )
+                });
+            }
         }
         Ok(())
     }
@@ -206,7 +229,7 @@ impl Db {
 
     pub async fn list_accounts(&self) -> Result<Vec<DbAccount>> {
         let rows = sqlx::query(
-            "SELECT name, token_hash, token_prefix, created_at, disabled
+            "SELECT name, token_hash, token_prefix, created_at, disabled, sandbox_enabled
              FROM accounts ORDER BY name",
         )
         .fetch_all(&self.pool)
@@ -219,8 +242,39 @@ impl Db {
                 token_prefix: r.get("token_prefix"),
                 created_at: r.get("created_at"),
                 disabled: r.get::<i64, _>("disabled") != 0,
+                sandbox_enabled: r.get::<i64, _>("sandbox_enabled") != 0,
             })
             .collect())
+    }
+
+    /// Look up a single account's sandbox toggle. Default true if the
+    /// account is missing (the OpenSession handler still validates the
+    /// account before this is consulted; missing here means the row
+    /// vanished between auth and PtyOpen — better to err on the side
+    /// of more isolation).
+    pub async fn account_sandbox_enabled(&self, name: &str) -> Result<bool> {
+        let row = sqlx::query(
+            "SELECT sandbox_enabled FROM accounts WHERE name = ?1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row
+            .map(|r| r.get::<i64, _>("sandbox_enabled") != 0)
+            .unwrap_or(true))
+    }
+
+    pub async fn set_account_sandbox(&self, name: &str, enabled: bool) -> Result<()> {
+        let rows = sqlx::query("UPDATE accounts SET sandbox_enabled = ?1 WHERE name = ?2")
+            .bind(if enabled { 1_i64 } else { 0_i64 })
+            .bind(name)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            anyhow::bail!("account '{}' not found", name);
+        }
+        Ok(())
     }
 
     pub async fn insert_account(

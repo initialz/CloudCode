@@ -82,6 +82,18 @@ export function Accounts() {
     }
   }
 
+  async function onToggleSandbox(name: string) {
+    setPending(true);
+    try {
+      await apiClient.accounts.toggleSandbox(name);
+      await reload();
+    } catch (e: any) {
+      setErr(e?.message ?? 'sandbox toggle failed');
+    } finally {
+      setPending(false);
+    }
+  }
+
   async function openAgentsModal(account: string) {
     setAgentsModal({
       account,
@@ -183,6 +195,7 @@ export function Accounts() {
                 <th className="px-3 py-2 text-left">Token suffix</th>
                 <th className="px-3 py-2 text-left">Status</th>
                 <th className="px-3 py-2 text-left">Online</th>
+                <th className="px-3 py-2 text-left">Sandbox</th>
                 <th className="px-3 py-2 text-left">Agents</th>
                 <th className="px-3 py-2 text-left">Last used</th>
                 <th className="px-3 py-2 text-left">Created</th>
@@ -192,7 +205,7 @@ export function Accounts() {
             <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800 bg-white dark:bg-zinc-900">
               {accounts.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="px-3 py-6 text-center text-zinc-500">
+                  <td colSpan={9} className="px-3 py-6 text-center text-zinc-500">
                     No accounts yet. Create one above.
                   </td>
                 </tr>
@@ -204,15 +217,18 @@ export function Accounts() {
                       …{a.token_prefix ?? <span className="italic">legacy</span>}
                     </td>
                     <td className="px-3 py-2">
-                      {a.disabled ? (
-                        <span className="text-xs px-2 py-0.5 rounded bg-zinc-200 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400">
-                          disabled
-                        </span>
-                      ) : (
-                        <span className="text-xs px-2 py-0.5 rounded bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300">
-                          enabled
-                        </span>
-                      )}
+                      <button
+                        disabled={pending}
+                        onClick={() => onToggle(a.name)}
+                        title={a.disabled ? 'Click to enable' : 'Click to disable'}
+                        className={`text-xs px-2 py-0.5 rounded transition-colors disabled:opacity-50 ${
+                          a.disabled
+                            ? 'bg-zinc-200 dark:bg-zinc-800 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-300 dark:hover:bg-zinc-700'
+                            : 'bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300 hover:bg-green-200 dark:hover:bg-green-900/60'
+                        }`}
+                      >
+                        {a.disabled ? 'disabled' : 'enabled'}
+                      </button>
                     </td>
                     <td className="px-3 py-2">
                       {a.online ? (
@@ -224,6 +240,20 @@ export function Accounts() {
                           offline
                         </span>
                       )}
+                    </td>
+                    <td className="px-3 py-2">
+                      <button
+                        disabled={pending}
+                        onClick={() => onToggleSandbox(a.name)}
+                        title={`Click to turn the workspace sandbox ${a.sandbox_enabled ? 'off' : 'on'}`}
+                        className={`text-xs px-2 py-0.5 rounded transition-colors disabled:opacity-50 ${
+                          a.sandbox_enabled
+                            ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-200 dark:hover:bg-emerald-900/60'
+                            : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-700'
+                        }`}
+                      >
+                        {a.sandbox_enabled ? 'on' : 'off'}
+                      </button>
                     </td>
                     <td className="px-3 py-2">
                       <button
@@ -256,13 +286,6 @@ export function Accounts() {
                         className="px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-50"
                       >
                         Rotate
-                      </button>
-                      <button
-                        disabled={pending}
-                        onClick={() => onToggle(a.name)}
-                        className="px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-50"
-                      >
-                        {a.disabled ? 'Enable' : 'Disable'}
                       </button>
                       <button
                         disabled={pending}
