@@ -48,7 +48,6 @@ function xtermTheme(dark: boolean) {
 type TabAction =
   | { type: 'ADD'; tab: Tab }
   | { type: 'UPDATE'; id: string; patch: Partial<Tab> }
-  | { type: 'SET_CONTAINER'; id: string; container: HTMLDivElement | null }
   | { type: 'REMOVE'; id: string };
 
 function tabsReducer(state: Tab[], action: TabAction): Tab[] {
@@ -57,10 +56,6 @@ function tabsReducer(state: Tab[], action: TabAction): Tab[] {
       return [...state, action.tab];
     case 'UPDATE':
       return state.map((t) => (t.id === action.id ? { ...t, ...action.patch } : t));
-    case 'SET_CONTAINER':
-      return state.map((t) =>
-        t.id === action.id ? { ...t, container: action.container } : t,
-      );
     case 'REMOVE':
       return state.filter((t) => t.id !== action.id);
     default:
@@ -100,6 +95,11 @@ export default function Workbench() {
 
   // Refresh timer ref (30s poll)
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Container DOM nodes per tab id. Kept outside of React state on
+  // purpose — touching them during a ref callback must NOT trigger
+  // a re-render, or the inline ref creates an infinite loop.
+  const containersRef = useRef<Map<string, HTMLDivElement>>(new Map());
 
   // ── Auth check ─────────────────────────────────────────────────────────────
 
@@ -353,7 +353,7 @@ export default function Workbench() {
         ws,
         term,
         fitAddon,
-        container: null,
+        opened: false,
       };
 
       dispatchTabs({ type: 'ADD', tab: newTab });
@@ -387,7 +387,7 @@ export default function Workbench() {
         if (!tab) break;
         let cols = 80;
         let rows = 24;
-        if (tab.container) {
+        if (containersRef.current.has(tab.id)) {
           try {
             tab.fitAddon.fit();
             cols = tab.term.cols;
@@ -404,7 +404,7 @@ export default function Workbench() {
         // Do a proper fit + resize now that session is open
         setTimeout(() => {
           const tab = tabsRef.current.find((t) => t.id === tabId);
-          if (!tab?.container) return;
+          if (!tab || !containersRef.current.has(tab.id)) return;
           try {
             tab.fitAddon.fit();
             tab.ws.send({ type: 'resize', cols: tab.term.cols, rows: tab.term.rows });
@@ -478,7 +478,7 @@ export default function Workbench() {
     // After state flush, fit + focus the terminal
     requestAnimationFrame(() => {
       const tab = tabsRef.current.find((t) => t.id === id);
-      if (!tab?.container) return;
+      if (!tab || !containersRef.current.has(tab.id)) return;
       try {
         tab.fitAddon.fit();
         if (tab.ws.connected) {
@@ -495,16 +495,24 @@ export default function Workbench() {
 
   const attachContainer = useCallback(
     (tabId: string, el: HTMLDivElement | null) => {
-      dispatchTabs({ type: 'SET_CONTAINER', id: tabId, container: el });
-      if (!el) return;
+      // Stash / clear the DOM node in a ref (not React state) so this
+      // callback never triggers a re-render — an inline `ref={(el) =>
+      // attachContainer(id, el)}` is a fresh closure every render,
+      // which React treats as a ref change. If the callback caused a
+      // setState we'd infinite-loop.
+      if (!el) {
+        containersRef.current.delete(tabId);
+        return;
+      }
+      containersRef.current.set(tabId, el);
       const tab = tabsRef.current.find((t) => t.id === tabId);
-      if (!tab) return;
-      // Open terminal into this container if not already opened
+      if (!tab || tab.opened) return;
       try {
         tab.term.open(el);
         tab.fitAddon.fit();
+        tab.opened = true;
       } catch {
-        // Already opened — ignore
+        // StrictMode double-mount — already opened
       }
     },
     [],
@@ -514,8 +522,9 @@ export default function Workbench() {
 
   useEffect(() => {
     if (!activeTabId) return;
-    const tab = tabs.find((t) => t.id === activeTabId);
-    if (!tab?.container) return;
+    const tab = tabsRef.current.find((t) => t.id === activeTabId);
+    const el = containersRef.current.get(activeTabId);
+    if (!tab || !el) return;
 
     let timer: ReturnType<typeof setTimeout> | null = null;
     const ro = new ResizeObserver(() => {
@@ -531,12 +540,12 @@ export default function Workbench() {
         }
       }, 150);
     });
-    ro.observe(tab.container);
+    ro.observe(el);
     return () => {
       ro.disconnect();
       if (timer) clearTimeout(timer);
     };
-  }, [activeTabId, tabs]);
+  }, [activeTabId]);
 
   // ── Theme change: update all terminals ───────────────────────────────────
 

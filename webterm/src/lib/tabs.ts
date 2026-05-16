@@ -15,8 +15,10 @@ export type Tab = {
   ws: WireSocket;
   term: Terminal;
   fitAddon: FitAddon;
-  /** Set by the container div ref callback after first render. */
-  container: HTMLDivElement | null;
+  /** Has term.open() been called for this tab yet? Mutated by the
+   * container-attach ref callback so we don't re-attach on every
+   * render and infinite-loop. */
+  opened: boolean;
 };
 
 /** Stable key used to deduplicate tabs. */
