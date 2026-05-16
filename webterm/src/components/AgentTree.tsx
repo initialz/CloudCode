@@ -229,6 +229,10 @@ function WorkspaceRow({
 // icon-pack dependency. Sized to sit on a one-line tree row.
 
 function ResetIcon() {
+  // Lucide-style rotate-ccw: the arc has a real gap before its ends,
+  // and the arrow sits in that gap pointing back into the loop, so
+  // the head and tail aren't crammed together the way they were on
+  // the previous open-ended arc.
   return (
     <svg
       width="12"
@@ -241,8 +245,8 @@ function ResetIcon() {
       strokeLinejoin="round"
       aria-hidden
     >
-      <path d="M3 12a9 9 0 1 0 3-6.7" />
-      <path d="M3 4v6h6" />
+      <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+      <path d="M3 3v5h5" />
     </svg>
   );
 }
