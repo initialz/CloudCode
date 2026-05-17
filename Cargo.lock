@@ -343,7 +343,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cloudcode-agent"
-version = "1.10.1"
+version = "1.11.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "cloudcode-client"
-version = "1.10.1"
+version = "1.11.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -400,7 +400,7 @@ dependencies = [
 
 [[package]]
 name = "cloudcode-daemon"
-version = "1.10.1"
+version = "1.11.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -410,7 +410,7 @@ dependencies = [
 
 [[package]]
 name = "cloudcode-hub"
-version = "1.10.1"
+version = "1.11.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -421,13 +421,19 @@ dependencies = [
  "clap",
  "cloudcode-daemon",
  "dashmap",
+ "dirs",
+ "flate2",
  "futures",
+ "libc",
  "rand 0.8.6",
  "reqwest",
  "rust-embed",
  "serde",
  "serde_json",
+ "sha2",
+ "signal-hook",
  "sqlx",
+ "tar",
  "thiserror 1.0.69",
  "tokio",
  "toml",

@@ -7,7 +7,9 @@ mod db;
 mod pty_proto;
 mod pty_session;
 mod registry;
+mod supervise;
 mod tunnel;
+mod update;
 mod ws_handler;
 
 use anyhow::{anyhow, Context};
@@ -69,7 +71,15 @@ enum Cmd {
         /// 账号名称
         name: String,
     },
-    /// 后台管理 hub daemon（start/stop/restart/status）
+    /// Keep a hub process alive: spawn the hub binary, restart it on
+    /// crash with exponential backoff, restart it immediately on a
+    /// clean exit (so self-update rolls forward). Forwards SIGTERM /
+    /// SIGINT to the child. Normally the child of `daemon start` —
+    /// not meant to be run directly.
+    Supervise,
+    /// 后台管理 hub daemon（start/stop/restart/status）— daemon `start`
+    /// 实际 spawn 的是 `cloudcode-hub supervise`，因此 self-update 能在
+    /// 后台运行时透明热切换。
     Daemon {
         #[command(subcommand)]
         cmd: cloudcode_daemon::DaemonCmd,
@@ -95,7 +105,12 @@ async fn main() -> anyhow::Result<()> {
     match cli.cmd {
         None => serve(cli.config).await,
         Some(Cmd::GenToken { name }) => gen_token(&name, &cli.config),
-        Some(Cmd::Daemon { cmd }) => cloudcode_daemon::run("hub", "hub.toml", cmd),
+        Some(Cmd::Supervise) => supervise::run(cli.config),
+        // daemon start re-execs us with the `supervise` subcommand so
+        // crashes (and self-update exits) are recovered transparently.
+        Some(Cmd::Daemon { cmd }) => {
+            cloudcode_daemon::run_with_prefix("hub", "hub.toml", cmd, &["supervise"])
+        }
     }
 }
 

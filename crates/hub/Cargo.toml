@@ -33,5 +33,11 @@ dashmap.workspace = true
 uuid.workspace = true
 sqlx.workspace = true
 reqwest.workspace = true
+dirs.workspace = true
+libc.workspace = true
+flate2 = "1"
+tar = "0.4"
+sha2 = "0.10"
+signal-hook = "0.3"
 rust-embed = { version = "8", features = ["debug-embed"] }
 cloudcode-daemon = { path = "../daemon" }

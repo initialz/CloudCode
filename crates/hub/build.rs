@@ -30,6 +30,11 @@ fn main() {
 
     println!("cargo:rerun-if-changed=../../admin-ui/dist/index.html");
     println!("cargo:rerun-if-changed=../../webterm/dist/index.html");
+
+    // Emit the build's Rust target triple so the hub's self-update path
+    // can ask the GitHub release feed for the matching asset.
+    let target = env::var("TARGET").unwrap_or_else(|_| "unknown".to_string());
+    println!("cargo:rustc-env=CLOUDCODE_TARGET={target}");
 }
 
 fn ensure_placeholder(dist: &Path, title: &str, label: &str, build_cmd: &str, api_path: &str) {

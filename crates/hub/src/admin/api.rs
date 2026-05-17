@@ -859,6 +859,119 @@ pub async fn agent_update(
     }
 }
 
+/// `POST /admin/api/hub/update`
+///
+/// Self-update the hub itself. Always pulls the latest release (no
+/// version picker) because rolling back across hub schema migrations
+/// is unsafe — for that, manually reinstall an older binary and run
+/// `cloudcode-hub daemon restart`. Returns ACCEPTED before the
+/// process exits so the frontend can switch into its "waiting for
+/// hub to come back" poll. The supervisor (`cloudcode-hub
+/// supervise`) sees the clean exit and re-execs through the
+/// freshly-flipped `hub/current` symlink.
+pub async fn hub_update(State(state): State<AdminState>) -> Response {
+    let target_triple = crate::update::target_triple();
+    let asset_os = match map_target_to_release_os(target_triple) {
+        Some(s) => s,
+        None => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "unsupported_target",
+                format!("no release asset mapping for target {}", target_triple),
+            );
+        }
+    };
+
+    let entry = match state.releases.get_fresh().await {
+        Ok(e) => e,
+        Err(e) => return err(StatusCode::SERVICE_UNAVAILABLE, "upstream_unavailable", e),
+    };
+    let latest_tag = match entry.public.latest.clone() {
+        Some(t) => t,
+        None => {
+            return err(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_release",
+                "upstream has no current release tag",
+            );
+        }
+    };
+    if !is_valid_version_tag(&latest_tag) {
+        return err(
+            StatusCode::BAD_GATEWAY,
+            "bad_release_tag",
+            format!("upstream returned malformed tag {:?}", latest_tag),
+        );
+    }
+    if latest_tag.trim_start_matches('v') == env!("CARGO_PKG_VERSION") {
+        return err(
+            StatusCode::CONFLICT,
+            "already_latest",
+            format!("hub is already on {}", latest_tag),
+        );
+    }
+    let Some(assets) = entry.assets.get(&latest_tag) else {
+        return err(
+            StatusCode::NOT_FOUND,
+            "release_not_found",
+            format!("no release tagged {}", latest_tag),
+        );
+    };
+    let download_name = format!("cloudcode-{}-{}.tar.gz", latest_tag, asset_os);
+    let sha256_name = format!("cloudcode-{}-{}.sha256", latest_tag, asset_os);
+    let Some(download_url) = assets.get(&download_name).cloned() else {
+        return err(
+            StatusCode::BAD_GATEWAY,
+            "missing_asset",
+            format!(
+                "release {} has no asset {} for target {}",
+                latest_tag, download_name, target_triple
+            ),
+        );
+    };
+    let Some(sha256_url) = assets.get(&sha256_name).cloned() else {
+        return err(
+            StatusCode::BAD_GATEWAY,
+            "missing_asset",
+            format!(
+                "release {} has no sha256 manifest {} for target {}",
+                latest_tag, sha256_name, target_triple
+            ),
+        );
+    };
+
+    // Run the update synchronously inside the request — frontend will
+    // see the 202 response, then immediately fail to reach /admin/api
+    // for a few seconds while the supervisor re-execs the new binary,
+    // then succeed again with the new build.
+    if let Err(e) = crate::update::perform_update(crate::update::UpdateRequest {
+        target_version: latest_tag.clone(),
+        download_url,
+        sha256_url,
+    })
+    .await
+    {
+        return err(StatusCode::UNPROCESSABLE_ENTITY, "hub_update_failed", e);
+    }
+
+    tracing::info!(version = %latest_tag, "hub update installed; scheduling exit");
+    // Spawn the actual exit on a short delay so axum has a chance to
+    // flush the response we're about to return. Without this the
+    // browser may observe the connection reset before the JSON body
+    // arrives, and the SPA's poll logic can't tell "succeeded then
+    // restarting" from "request failed".
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tracing::info!("hub exiting to apply update");
+        std::process::exit(0);
+    });
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"ok": true, "installed": latest_tag})),
+    )
+        .into_response()
+}
+
 fn is_valid_version_tag(v: &str) -> bool {
     let Some(rest) = v.strip_prefix('v') else {
         return false;

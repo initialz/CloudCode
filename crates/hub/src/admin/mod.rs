@@ -164,6 +164,10 @@ pub fn router(state: AdminState) -> Router {
             post(api::agent_update).route_layer(gate.clone()),
         )
         .route(
+            "/admin/api/hub/update",
+            post(api::hub_update).route_layer(gate.clone()),
+        )
+        .route(
             "/admin/api/agents/:name",
             delete(api::agent_delete).route_layer(gate.clone()),
         )

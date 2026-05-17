@@ -143,6 +143,13 @@ export const apiClient = {
         body: JSON.stringify({ version }),
       }),
   },
+  hub: {
+    // Always pulls the latest release; the supervisor re-execs the new
+    // binary after a clean exit. Returns 202 before exiting so the
+    // frontend can switch to its "waiting for hub to come back" poll.
+    update: () =>
+      api<{ ok: true; installed: string }>('/hub/update', { method: 'POST' }),
+  },
   workspaces: {
     list: () => api<WorkspaceRowDto[]>('/workspaces'),
   },
