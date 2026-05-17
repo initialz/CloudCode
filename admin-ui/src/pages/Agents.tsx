@@ -1,7 +1,6 @@
 import { useEffect, useState } from 'react';
 import { apiClient, type AgentRowDto, type AllowedAccountsDto } from '@/lib/api';
 import { Modal } from '@/components/Modal';
-import { UpdateAgentModal } from '@/components/UpdateAgentModal';
 import { versionsEqual } from '@/lib/version';
 
 type AccountsModalState = {
@@ -19,7 +18,11 @@ export function Agents() {
   const [accountsModal, setAccountsModal] = useState<AccountsModalState | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [deleting, setDeleting] = useState(false);
-  const [updateModal, setUpdateModal] = useState<AgentRowDto | null>(null);
+  // Per-agent in-flight update state. Drives the inline "Updating..."
+  // animation. Failures are surfaced inline next to the button.
+  const [updating, setUpdating] = useState<Record<string, true>>({});
+  const [updateErrs, setUpdateErrs] = useState<Record<string, string>>({});
+  const [dot, setDot] = useState(1);
 
   async function reload() {
     try {
@@ -33,6 +36,44 @@ export function Agents() {
   useEffect(() => {
     reload();
   }, []);
+
+  // Dot animation while any agent is mid-update.
+  useEffect(() => {
+    if (Object.keys(updating).length === 0) return;
+    const t = window.setInterval(() => setDot((d) => (d % 3) + 1), 500);
+    return () => window.clearInterval(t);
+  }, [updating]);
+
+  async function handleUpdate(agent: AgentRowDto) {
+    const target = agent.latest_version;
+    if (!target) return;
+    setUpdating((u) => ({ ...u, [agent.name]: true }));
+    setUpdateErrs((e) => {
+      const next = { ...e };
+      delete next[agent.name];
+      return next;
+    });
+    try {
+      // Always update to the latest version that the hub knows
+      // about. The previous per-version dropdown is gone — picking
+      // older releases isn't a documented support path and made the
+      // happy-path UX two clicks longer than necessary.
+      await apiClient.agents.update(agent.name, target);
+      await reload();
+    } catch (e: unknown) {
+      const msg =
+        typeof e === 'object' && e && 'message' in e
+          ? String((e as { message?: unknown }).message ?? 'update failed')
+          : 'update failed';
+      setUpdateErrs((errs) => ({ ...errs, [agent.name]: msg }));
+    } finally {
+      setUpdating((u) => {
+        const next = { ...u };
+        delete next[agent.name];
+        return next;
+      });
+    }
+  }
 
   async function openAccountsModal(agentName: string) {
     setAccountsModal({
@@ -149,12 +190,21 @@ export function Agents() {
                     a.version !== null &&
                     a.latest_version !== null &&
                     !isUpToDate;
+                  const isUpdating = updating[a.name] === true;
+                  const updateErr = updateErrs[a.name];
 
                   let updateBtnLabel: string;
                   let updateBtnClass: string;
+                  let updateBtnDisabled = false;
                   if (!a.online) {
                     updateBtnLabel = '—';
                     updateBtnClass = 'text-xs text-zinc-400';
+                    updateBtnDisabled = true;
+                  } else if (isUpdating) {
+                    updateBtnLabel = `Updating${'.'.repeat(dot)}`;
+                    updateBtnClass =
+                      'px-2 py-1 text-xs rounded border border-amber-300 dark:border-amber-700/50 text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20 select-none';
+                    updateBtnDisabled = true;
                   } else if (hasUpdate) {
                     updateBtnLabel = `Update to ${a.latest_version}`;
                     updateBtnClass =
@@ -162,12 +212,14 @@ export function Agents() {
                   } else if (isUpToDate) {
                     updateBtnLabel = 'Up to date';
                     updateBtnClass =
-                      'px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800/50';
+                      'px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400';
+                    updateBtnDisabled = true;
                   } else {
-                    // online but version unknown
-                    updateBtnLabel = 'Update…';
+                    // online but version unknown — can't safely target latest
+                    updateBtnLabel = 'Version unknown';
                     updateBtnClass =
-                      'px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800/50';
+                      'px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400';
+                    updateBtnDisabled = true;
                   }
 
                   return (
@@ -206,13 +258,23 @@ export function Agents() {
                       <td className="px-3 py-2 text-right whitespace-nowrap space-x-1">
                         {a.online ? (
                           <button
-                            onClick={() => setUpdateModal(a)}
+                            onClick={() => handleUpdate(a)}
+                            disabled={updateBtnDisabled}
                             className={updateBtnClass}
+                            title={updateErr ?? undefined}
                           >
                             {updateBtnLabel}
                           </button>
                         ) : (
                           <span className="text-xs text-zinc-400">—</span>
+                        )}
+                        {updateErr && (
+                          <span
+                            className="px-2 py-1 text-xs rounded bg-red-100 dark:bg-red-900/40 text-red-800 dark:text-red-200"
+                            title={updateErr}
+                          >
+                            failed
+                          </span>
                         )}
                         {a.online ? (
                           <span
@@ -302,18 +364,6 @@ export function Agents() {
           </div>
         ) : null}
       </Modal>
-
-      {updateModal !== null && (
-        <UpdateAgentModal
-          open={updateModal !== null}
-          agent={updateModal}
-          onClose={() => setUpdateModal(null)}
-          onUpdated={() => {
-            setUpdateModal(null);
-            reload();
-          }}
-        />
-      )}
 
       <Modal
         open={confirmDelete !== null}

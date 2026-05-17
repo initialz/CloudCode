@@ -1299,3 +1299,37 @@ fn tmux_socket_candidates(label: &str) -> Vec<PathBuf> {
     );
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_accept_safe_chars() {
+        assert!(validate_name("alice", "account").is_ok());
+        assert!(validate_name("test1", "workspace").is_ok());
+        assert!(validate_name("a_b-c-123", "workspace").is_ok());
+        // Single char is fine.
+        assert!(validate_name("a", "workspace").is_ok());
+        // 63 chars is the documented upper bound.
+        assert!(validate_name(&"a".repeat(63), "workspace").is_ok());
+    }
+
+    #[test]
+    fn names_reject_unsafe_chars() {
+        assert!(validate_name("", "account").is_err(), "empty");
+        assert!(validate_name(&"a".repeat(64), "workspace").is_err(), "too long");
+        assert!(validate_name("-leading-dash", "workspace").is_err());
+        assert!(validate_name(".hidden", "workspace").is_err());
+        assert!(validate_name("Has-Caps", "workspace").is_err(), "uppercase");
+        assert!(validate_name("../escape", "workspace").is_err(), "path traversal");
+        assert!(validate_name("with space", "workspace").is_err());
+        assert!(validate_name("with/slash", "workspace").is_err());
+        assert!(validate_name("with\0nul", "workspace").is_err());
+        // Reject every char outside [a-z0-9_-]; cover a sample.
+        for bad in ['/', '\\', '*', '$', '`', ';', '|', '&', '"', '\''] {
+            let n = format!("ws{}bad", bad);
+            assert!(validate_name(&n, "workspace").is_err(), "expected reject: {:?}", n);
+        }
+    }
+}

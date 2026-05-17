@@ -1968,3 +1968,38 @@ pub async fn stats_tokens_daily(
     }
     Json(out).into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_tag_accepts_canonical_forms() {
+        assert!(is_valid_version_tag("v0.0.0"));
+        assert!(is_valid_version_tag("v1.10.1"));
+        assert!(is_valid_version_tag("v1.11.0"));
+        assert!(is_valid_version_tag("v999.999.999"));
+    }
+
+    #[test]
+    fn version_tag_rejects_malformed() {
+        assert!(!is_valid_version_tag(""));
+        assert!(!is_valid_version_tag("1.10.1"), "missing v prefix");
+        assert!(!is_valid_version_tag("v1.10"), "two components");
+        assert!(!is_valid_version_tag("v1.10.1.0"), "four components");
+        assert!(!is_valid_version_tag("v1.10.1-rc1"), "no prerelease support");
+        assert!(!is_valid_version_tag("v1.10.x"));
+    }
+
+    #[test]
+    fn target_triple_mapping_covers_release_matrix() {
+        assert_eq!(map_target_to_release_os("aarch64-apple-darwin"), Some("macos-aarch64"));
+        assert_eq!(map_target_to_release_os("x86_64-unknown-linux-musl"), Some("linux-x86_64"));
+        assert_eq!(map_target_to_release_os("aarch64-unknown-linux-musl"), Some("linux-aarch64"));
+        // Targets we don't ship for surface as None so callers can
+        // emit a clear 400 instead of a 5xx.
+        assert_eq!(map_target_to_release_os("x86_64-apple-darwin"), None);
+        assert_eq!(map_target_to_release_os("unknown"), None);
+        assert_eq!(map_target_to_release_os(""), None);
+    }
+}

@@ -249,3 +249,71 @@ pub fn state_dir() -> Option<PathBuf> {
 pub fn target_triple() -> &'static str {
     env!("CLOUDCODE_TARGET")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_accepts_canonical_v_prefixed() {
+        assert!(is_valid_version("v0.0.0"));
+        assert!(is_valid_version("v1.11.0"));
+    }
+
+    #[test]
+    fn version_rejects_bad_shapes() {
+        assert!(!is_valid_version(""));
+        assert!(!is_valid_version("1.11.0"));
+        assert!(!is_valid_version("v1.11"));
+        assert!(!is_valid_version("v1.11.0.0"));
+        assert!(!is_valid_version("v1.11.0-rc1"));
+    }
+
+    /// Realistic sha256.txt: two binaries, hashes on the left, path on
+    /// the right, with the release-script's `cloudcode-vX.Y.Z-<os>/`
+    /// prefix. read_expected_hash must walk past lines that don't
+    /// match the requested binary name.
+    #[test]
+    fn expected_hash_matches_binary_inside_release_prefix() {
+        let dir = std::env::temp_dir().join(format!("cc-update-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("sha256.txt");
+        std::fs::write(
+            &manifest,
+            "abcdef1234  cloudcode-v1.11.0-macos-aarch64/cloudcode-agent\n\
+             0123456789  cloudcode-v1.11.0-macos-aarch64/cloudcode-hub\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_expected_hash(&manifest, "cloudcode-hub").as_deref(),
+            Some("0123456789")
+        );
+        assert_eq!(
+            read_expected_hash(&manifest, "cloudcode-agent").as_deref(),
+            Some("abcdef1234")
+        );
+        // Misses are None — caller surfaces "no entry in manifest" so
+        // operators don't see a silent hash mismatch.
+        assert_eq!(read_expected_hash(&manifest, "cloudcode-client"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bsd-style `*<path>` marker (asterisk = "binary file") shows
+    /// up in some sha256sum implementations. We strip it so the path
+    /// compare still works.
+    #[test]
+    fn expected_hash_strips_bsd_binary_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-update-test-bsd-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let manifest = dir.join("sha256.txt");
+        std::fs::write(&manifest, "deadbeef *cloudcode-hub\n").unwrap();
+        assert_eq!(
+            read_expected_hash(&manifest, "cloudcode-hub").as_deref(),
+            Some("deadbeef")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
