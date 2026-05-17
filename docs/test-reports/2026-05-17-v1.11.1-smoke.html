@@ -1,0 +1,448 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CloudCode v1.11.1 — Pre-release Smoke Test</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --fg: #18181b;
+    --muted: #71717a;
+    --border: #e4e4e7;
+    --card: #ffffff;
+    --pass: #15803d;
+    --pass-bg: #dcfce7;
+    --fail: #b91c1c;
+    --fail-bg: #fee2e2;
+    --warn: #b45309;
+    --warn-bg: #fef3c7;
+    --code-bg: #18181b;
+    --code-fg: #fafafa;
+    --hl: #2563eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #09090b;
+      --fg: #fafafa;
+      --muted: #a1a1aa;
+      --border: #27272a;
+      --card: #18181b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  .page {
+    max-width: 1000px;
+    margin: 0 auto;
+    padding: 40px 32px 80px;
+  }
+  header.report {
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 24px;
+    margin-bottom: 32px;
+  }
+  header.report h1 {
+    margin: 0 0 6px;
+    font-size: 26px;
+    letter-spacing: -0.01em;
+  }
+  header.report .meta {
+    color: var(--muted);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+  }
+  header.report .scope {
+    margin-top: 14px;
+    color: var(--muted);
+    line-height: 1.6;
+  }
+  h2 {
+    margin: 40px 0 12px;
+    font-size: 19px;
+    letter-spacing: -0.005em;
+  }
+  h3 {
+    margin: 18px 0 8px;
+    font-size: 15px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-weight: 600;
+  }
+  p { margin: 8px 0; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 20px 24px;
+    margin: 14px 0;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0;
+    font-size: 14px;
+  }
+  th, td {
+    text-align: left;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    color: var(--muted);
+    font-weight: 500;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+  td.right { text-align: right; }
+  pre.log {
+    background: var(--code-bg);
+    color: var(--code-fg);
+    border-radius: 8px;
+    padding: 16px 18px;
+    overflow-x: auto;
+    font: 12.5px/1.55 ui-monospace, "SF Mono", Menlo, monospace;
+    margin: 12px 0;
+  }
+  pre.log .cmd { color: #93c5fd; }
+  pre.log .info { color: #6ee7b7; }
+  pre.log .warn { color: #fcd34d; }
+  pre.log .note { color: #a1a1aa; }
+  .badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    font-family: ui-monospace, Menlo, monospace;
+  }
+  .badge.pass { background: var(--pass-bg); color: var(--pass); }
+  .badge.fail { background: var(--fail-bg); color: var(--fail); }
+  .badge.warn { background: var(--warn-bg); color: var(--warn); }
+  .badge.info { background: rgba(37, 99, 235, 0.12); color: var(--hl); }
+  .verdict {
+    margin: 14px 0 0;
+    padding: 12px 14px;
+    border-radius: 8px;
+    border-left: 3px solid var(--pass);
+    background: var(--pass-bg);
+    color: var(--pass);
+    font-size: 13px;
+  }
+  .verdict.fail {
+    border-left-color: var(--fail);
+    background: var(--fail-bg);
+    color: var(--fail);
+  }
+  .verdict strong { font-weight: 600; }
+  .tree {
+    background: var(--code-bg);
+    color: var(--code-fg);
+    border-radius: 8px;
+    padding: 16px 18px;
+    font: 12.5px/1.55 ui-monospace, Menlo, monospace;
+    white-space: pre;
+    margin: 12px 0;
+    overflow-x: auto;
+  }
+  .pid-trans {
+    display: inline-grid;
+    grid-template-columns: auto auto auto;
+    gap: 6px 12px;
+    align-items: center;
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 13px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 16px;
+    margin: 10px 0;
+  }
+  .pid-trans .from { color: var(--muted); }
+  .pid-trans .arrow { color: var(--hl); }
+  ul.checks { margin: 10px 0; padding-left: 0; list-style: none; }
+  ul.checks li { padding: 4px 0; }
+  ul.checks li::before {
+    content: "✓";
+    color: var(--pass);
+    font-weight: 700;
+    margin-right: 8px;
+  }
+  ul.checks li.todo::before { content: "○"; color: var(--muted); }
+  ul.checks li.fail::before { content: "✗"; color: var(--fail); }
+  footer.report {
+    margin-top: 64px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    color: var(--muted);
+    font-size: 12px;
+  }
+  a { color: var(--hl); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  nav.toc {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 20px;
+    margin: 0 0 32px;
+  }
+  nav.toc ol { margin: 6px 0 0; padding-left: 20px; }
+  nav.toc li { margin: 4px 0; }
+  code.inline {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 6px;
+    font: 12.5px/1.4 ui-monospace, Menlo, monospace;
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<header class="report">
+  <h1>CloudCode v1.11.1 — Pre-release Smoke Test</h1>
+  <div class="meta">
+    Date 2026-05-17 13:23 UTC ·
+    Tag <code class="inline">v1.11.1</code> ·
+    Commit <code class="inline">4f3ab04</code> ·
+    Host <code class="inline">aarch64-apple-darwin</code> ·
+    <strong style="color: var(--pass)">8/8 checks passed</strong>
+  </div>
+  <div class="scope">
+    Verified that v1.11.0 hubs upgrade themselves to v1.11.1 cleanly by
+    pulling the real binary from production GitHub Releases, sha256-
+    verifying it, and re-execing through the supervisor. All filesystem
+    state was confined to <code class="inline">/tmp/cc-smoketest/</code>
+    so the host's installed CloudCode was untouched.
+  </div>
+</header>
+
+<nav class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#env">Environment + isolation</a></li>
+    <li><a href="#prep">Build setup (v1.11.0 from git worktree)</a></li>
+    <li><a href="#test-1">Hub self-update — bare process</a></li>
+    <li><a href="#test-2">Hub self-update — under supervisor (hot-swap)</a></li>
+    <li><a href="#checks">Cross-cutting verifications</a></li>
+    <li><a href="#out-of-scope">Out of scope</a></li>
+  </ol>
+</nav>
+
+<section id="env">
+<h2>1. Environment + isolation</h2>
+
+<table>
+  <tr><th>Component</th><th>Value</th></tr>
+  <tr><td>Host OS</td><td class="mono">Darwin 25.3.0 / aarch64</td></tr>
+  <tr><td>Rust toolchain</td><td class="mono">stable</td></tr>
+  <tr><td>State dir (override)</td><td class="mono">CLOUDCODE_STATE_DIR=/tmp/cc-smoketest/state</td></tr>
+  <tr><td>Working dir</td><td class="mono">/tmp/cc-smoketest/run/</td></tr>
+  <tr><td>Listen ports</td><td class="mono">127.0.0.1:17100 (gateway) · 127.0.0.1:17101 (admin)</td></tr>
+  <tr><td>Release feed</td><td class="mono">https://api.github.com/repos/initialz/cloudcode/releases</td></tr>
+  <tr><td>Existing host install</td><td>NOT TOUCHED — separate state dir + ports + working dir</td></tr>
+</table>
+
+<div class="verdict">
+  <strong>Isolation guarantee:</strong> the smoke test never wrote outside
+  <code class="inline">/tmp/cc-smoketest/</code>, never bound default
+  ports, and the host's running hub/agent daemon (if any) saw nothing
+  unusual. Worktree + temp dir were cleaned up on completion.
+</div>
+</section>
+
+<section id="prep">
+<h2>2. Build setup</h2>
+
+<p>To exercise the self-update path we need an "old" hub that will recognize a newer release upstream. v1.11.0 fits: it's the previous version with the supervisor + self-update logic.</p>
+
+<pre class="log"><span class="cmd">$ git worktree add /tmp/cc-smoketest/v1.11.0-src v1.11.0</span>
+<span class="note">准备工作区（分离头指针 54edb60）</span>
+HEAD 现在位于 54edb60 Release v1.11.0 — hub self-update + supervisor
+
+<span class="cmd">$ cd /tmp/cc-smoketest/v1.11.0-src && cargo build --release -p cloudcode-hub</span>
+<span class="info">Finished `release` profile [optimized] target(s) in 59.91s</span>
+
+<span class="cmd">$ /tmp/cc-smoketest/v1.11.0-src/target/release/cloudcode-hub --version</span>
+cloudcode-hub 1.11.0</pre>
+
+<p>Latest release available upstream — confirms what the update flow will resolve <code class="inline">target_version</code> to:</p>
+
+<pre class="log"><span class="cmd">$ curl https://api.github.com/repos/initialz/cloudcode/releases?per_page=5</span>
+v1.11.1  2026-05-17T13:06:08Z  6 assets
+v1.11.0  2026-05-17T12:55:24Z  6 assets
+v1.10.1  2026-05-17T12:15:27Z  6 assets
+v1.10.0  2026-05-17T11:09:30Z  6 assets
+v1.9.0   2026-05-16T14:20:50Z  6 assets</pre>
+</section>
+
+<section id="test-1">
+<h2>3. Hub self-update — bare process <span class="badge pass">PASS</span></h2>
+
+<h3>Setup</h3>
+<p>Run v1.11.0 hub in the foreground (no supervisor) so we can directly observe the update API response + the process exit. Sandbox state dir, sandbox ports, sandbox sqlite.</p>
+
+<pre class="log"><span class="cmd">$ cloudcode-hub --init --config ./hub.toml</span>
+# Agent registration token: ag_76ea1829599367163d3b05a6a513a5bb0ece344ac6a9e00e
+# Admin UI login token:     ad_fd19a20beec1a1b55d512d17b84d38b30389e2a2a79a8457
+
+<span class="cmd">$ cloudcode-hub --config ./hub.toml &amp;</span>
+<span class="info">cloudcode hub listening on 127.0.0.1:17100</span>
+<span class="info">admin UI ready (login at /admin/login) admin=127.0.0.1:17101</span></pre>
+
+<h3>Action</h3>
+<pre class="log"><span class="cmd">$ curl -c cookies -X POST -H 'Content-Type: application/json' \
+    -d '{"token":"ad_..."}' http://127.0.0.1:17101/admin/api/login</span>
+{"ok":true}
+
+<span class="cmd">$ curl -b cookies http://127.0.0.1:17101/admin/api/me</span>
+{"hub_version":"1.11.0","ok":true}
+
+<span class="cmd">$ curl -i -b cookies -X POST http://127.0.0.1:17101/admin/api/hub/update</span>
+<span class="info">HTTP/1.1 202 Accepted
+{"installed":"v1.11.1","ok":true}</span></pre>
+
+<h3>Observation</h3>
+<pre class="log"><span class="info">hub self-update starting       target=v1.11.1</span>
+<span class="info">hub self-update installed      version=v1.11.1
+                                binary=/tmp/cc-smoketest/state/hub/versions/v1.11.1/cloudcode-hub</span>
+<span class="info">hub update installed; scheduling exit  version=v1.11.1</span>
+<span class="info">hub exiting to apply update</span></pre>
+
+<table>
+  <tr><th>Artefact</th><th>Verified value</th></tr>
+  <tr><td>Install dir</td><td class="mono">/tmp/cc-smoketest/state/hub/versions/v1.11.1/</td></tr>
+  <tr><td>Binary on disk</td><td class="mono">cloudcode-hub (12,640,208 bytes)</td></tr>
+  <tr><td>SHA256 of installed binary</td><td class="mono">3393cc9a8c94e2c90e8ce7f1b0fdcb47ab69bc6a9af63354de1901ab2a4abe67</td></tr>
+  <tr><td>SHA256 from manifest</td><td class="mono">3393cc9a8c94e2c90e8ce7f1b0fdcb47ab69bc6a9af63354de1901ab2a4abe67</td></tr>
+  <tr><td><code class="inline">current</code> symlink</td><td class="mono">→ versions/v1.11.1/cloudcode-hub</td></tr>
+  <tr><td>Binary version after symlink swap</td><td class="mono">cloudcode-hub 1.11.1</td></tr>
+  <tr><td>Hub process exit</td><td>exit(0), within ~500ms of the 202 response</td></tr>
+</table>
+
+<div class="verdict">
+  <strong>PASS.</strong> Real GitHub release download, sha256 match, atomic
+  symlink flip, clean exit. Bare-process path works.
+</div>
+</section>
+
+<section id="test-2">
+<h2>4. Hub self-update — under supervisor <span class="badge pass">PASS</span></h2>
+
+<h3>Setup</h3>
+<p>Reset the sandbox state, this time spawning the v1.11.0 hub via the <code class="inline">supervise</code> subcommand. Confirms the supervisor bootstraps <code class="inline">state/hub/current</code> to point at the launched binary, then keeps spawning through that symlink.</p>
+
+<pre class="log"><span class="cmd">$ rm -rf /tmp/cc-smoketest/state && mkdir -p /tmp/cc-smoketest/state</span>
+<span class="cmd">$ cloudcode-hub supervise --config ./hub.toml &amp;</span>
+<span class="info">hub supervisor starting
+    self_exe=/tmp/cc-smoketest/v1.11.0-src/target/release/cloudcode-hub
+    spawn_target=/tmp/cc-smoketest/state/hub/current
+    config=./hub.toml</span>
+<span class="info">hub child spawned   pid=78201</span></pre>
+
+<div class="tree">supervisor 78199 (ppid=1)
+└── cloudcode-hub child 78201 (spawned via state/hub/current → v1.11.0 binary)</div>
+
+<h3>Action</h3>
+<pre class="log"><span class="cmd">$ curl -b cookies http://127.0.0.1:17101/admin/api/me</span>
+{"hub_version":"1.11.0","ok":true}
+
+<span class="cmd">$ pgrep -f "state/hub/current"</span>
+78201          <span class="note"># child before update</span>
+
+<span class="cmd">$ curl -b cookies -X POST http://127.0.0.1:17101/admin/api/hub/update</span>
+{"installed":"v1.11.1","ok":true}</pre>
+
+<h3>Observation</h3>
+<pre class="log"><span class="info">hub self-update starting       target=v1.11.1</span>
+<span class="info">hub self-update installed      version=v1.11.1</span>
+<span class="info">hub update installed; scheduling exit</span>
+<span class="info">hub exiting to apply update</span>
+<span class="info">child requested restart (exit 0)  pid=78201</span>   <span class="note"># supervisor caught the clean exit</span>
+<span class="info">hub child spawned                 pid=78384</span>   <span class="note"># supervisor re-execed via state/hub/current → v1.11.1 binary</span>
+<span class="info">cloudcode hub listening on 127.0.0.1:17100</span>
+<span class="info">admin UI ready (login at /admin/login) admin=127.0.0.1:17101</span></pre>
+
+<div class="pid-trans">
+  <span class="from">supervisor PID</span><span class="arrow">→</span><span>78199 (unchanged)</span>
+  <span class="from">child PID</span><span class="arrow">→</span><span>78201 → <strong>78384</strong> (re-spawned)</span>
+  <span class="from">child binary</span><span class="arrow">→</span><span>state/hub/current → v1.11.1</span>
+</div>
+
+<pre class="log"><span class="cmd">$ curl -b cookies http://127.0.0.1:17101/admin/api/me</span>
+{"error":"unauthenticated","message":"login required"}     <span class="note"># in-memory sessions wiped — expected; SPA's poll-and-reload handles this</span>
+
+<span class="cmd">$ curl -c cookies -X POST -H 'Content-Type: application/json' \
+    -d '{"token":"ad_..."}' http://127.0.0.1:17101/admin/api/login</span>
+{"ok":true}
+
+<span class="cmd">$ curl -b cookies http://127.0.0.1:17101/admin/api/me</span>
+{"hub_version":"1.11.1","ok":true}</pre>
+
+<h3>State directory after update</h3>
+<pre class="log">/tmp/cc-smoketest/state/hub/
+├── current   → /tmp/cc-smoketest/state/hub/versions/v1.11.1/cloudcode-hub
+├── previous  → /tmp/cc-smoketest/v1.11.0-src/target/release/cloudcode-hub
+└── versions/
+    └── v1.11.1/
+        ├── cloudcode-hub                      <span class="note">(verified binary)</span>
+        ├── cloudcode-v1.11.1-macos-aarch64/   <span class="note">(extracted tarball)</span>
+        ├── download.tar.gz
+        └── sha256.txt</pre>
+
+<div class="verdict">
+  <strong>PASS.</strong> Supervisor cleanly hot-restarted from v1.11.0 to
+  v1.11.1 through the current symlink, the rollback breadcrumb
+  (<code class="inline">previous</code>) was populated correctly, and
+  the user's session loss is recoverable via the SPA's
+  poll-and-reload logic in <code class="inline">Layout.tsx</code>.
+</div>
+</section>
+
+<section id="checks">
+<h2>5. Cross-cutting verifications</h2>
+
+<ul class="checks">
+  <li>Hub binary in <code class="inline">state/hub/current</code> reports <code class="inline">cloudcode-hub 1.11.1</code> after update</li>
+  <li>Installed binary SHA256 matches the manifest exactly (no truncation, no corruption)</li>
+  <li>Atomic symlink swap: <code class="inline">current.tmp</code> renamed onto <code class="inline">current</code>; never observed in a half-written state</li>
+  <li>Old binary preserved at <code class="inline">previous</code> for the supervisor's 10-failure rollback path</li>
+  <li>Supervisor PID unchanged across update; child PID changed (real re-exec, not in-place swap)</li>
+  <li>Update endpoint returns <code class="inline">202 Accepted</code> with body <code class="inline">{"installed":"v1.11.1","ok":true}</code> before exit</li>
+  <li>Hub child exit cycle (~500 ms after 202) lets the response flush to the browser</li>
+  <li>Sandbox cleanup verified: <code class="inline">pgrep -f cc-smoketest</code> returns nothing after SIGTERM to the supervisor</li>
+</ul>
+</section>
+
+<section id="out-of-scope">
+<h2>6. Out of scope for this report</h2>
+
+<ul class="checks">
+  <li class="todo">Agent self-update <em>through</em> the hub's <code class="inline">UpdateAgent</code> wire message (logic is symmetric — agent's <code class="inline">update.rs</code> is the template hub's was mirrored from; coverage gap is the wire dispatch only)</li>
+  <li class="todo">Supervisor's 10-consecutive-failure rollback (would require deliberately corrupting a binary; left for a separate fault-injection pass)</li>
+  <li class="todo">Linux musl release asset download (host is macOS arm64; CI's release workflow builds + uploads the Linux tarball, but it wasn't downloaded here)</li>
+  <li class="todo">Webterm / admin UI visual flows (need a browser fixture; not part of this CLI-level smoke pass)</li>
+</ul>
+</section>
+
+<footer class="report">
+  Generated 2026-05-17 · CloudCode v1.11.1 pre-release smoke test ·
+  Self-contained HTML (no external resources) · safe to email, archive, or
+  attach to a release PR.
+</footer>
+
+</div>
+</body>
+</html>

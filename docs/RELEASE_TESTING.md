@@ -83,6 +83,45 @@ The release MUST cross-version with the previous release. If you touched any wir
 - [ ] Sessions page: row → SessionDetail → timeline of messages renders.
 - [ ] Audit page: filter by kind / account; pagination works.
 
+## Test reports
+
+For releases that change behaviour visibly (MAJOR / MINOR, or any
+PATCH that touches a self-update / rollback / migration path), drop
+a self-contained HTML report under `docs/test-reports/`:
+
+```
+docs/test-reports/<YYYY-MM-DD>-<tag>-smoke.html
+```
+
+The report is **inline CSS only, no external resources** so it
+emails / archives / attaches to a PR cleanly. Structure:
+
+1. **Header**: tag, commit, host, summary verdict (`N/N passed`).
+2. **Environment + isolation**: state dir override, ports, "what
+   on the host was NOT touched" guarantee.
+3. **One section per test**, each with sub-blocks:
+   - *Setup* — config knobs / process layout
+   - *Action* — exact commands run (in a `<pre class="log">`)
+   - *Observation* — log excerpts + artefact tables
+   - *Verdict* — coloured banner: PASS / FAIL / WARN
+4. **Cross-cutting checks** — invariant list with ✓ / ✗.
+5. **Out of scope** — flag what wasn't covered (so the reviewer
+   sees the gap explicitly instead of guessing).
+
+Example: [`docs/test-reports/2026-05-17-v1.11.1-smoke.html`](test-reports/2026-05-17-v1.11.1-smoke.html).
+
+**When to generate, when to skip**
+
+- MAJOR / MINOR releases: report is **required**, generated before
+  the tag push so it can ride the release commit.
+- PATCH releases that touch update / rollback / supervisor /
+  migration code: report is **required** for the touched path.
+- Pure docs / dependency bumps / UI polish PATCH: skip unless the
+  releaser explicitly asks for one.
+
+**Push gate**: after generating, hand the report URL to the
+operator. Only push the release tag once they sign off.
+
 ## When something fails
 
 1. Capture: hub log, agent log, client / browser console.
