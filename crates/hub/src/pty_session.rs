@@ -971,49 +971,6 @@ fn parse_tool_args_blob(blob: &str, tool: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn pref_args_pulls_typed_array_for_requested_tool() {
-        let blob = r#"{"tool_args":{"claude":["--model","claude-3-opus"],"codex":[]}}"#;
-        assert_eq!(
-            parse_tool_args_blob(blob, "claude"),
-            vec!["--model".to_string(), "claude-3-opus".to_string()]
-        );
-        assert_eq!(parse_tool_args_blob(blob, "codex"), Vec::<String>::new());
-    }
-
-    #[test]
-    fn pref_args_fall_back_to_empty_on_bad_shapes() {
-        // Not JSON at all
-        assert!(parse_tool_args_blob("not json", "claude").is_empty());
-        // JSON, but wrong root type
-        assert!(parse_tool_args_blob("\"oops\"", "claude").is_empty());
-        // Right root, no tool_args key
-        assert!(parse_tool_args_blob("{}", "claude").is_empty());
-        // tool_args present but not an object
-        assert!(parse_tool_args_blob(r#"{"tool_args":[]}"#, "claude").is_empty());
-        // Requested tool not in map
-        assert!(
-            parse_tool_args_blob(r#"{"tool_args":{"codex":["x"]}}"#, "claude").is_empty()
-        );
-        // Tool value not an array
-        assert!(
-            parse_tool_args_blob(r#"{"tool_args":{"claude":"--model x"}}"#, "claude").is_empty()
-        );
-        // Array contains non-strings — they're skipped, others kept.
-        assert_eq!(
-            parse_tool_args_blob(
-                r#"{"tool_args":{"claude":["--a",42,"--b",null,"--c"]}}"#,
-                "claude"
-            ),
-            vec!["--a".to_string(), "--b".to_string(), "--c".to_string()]
-        );
-    }
-}
-
 /// Same rule as the agent's `validate_name(_, "tool")` — keep them
 /// aligned so we reject early on the hub instead of round-tripping.
 fn valid_tool_name(s: &str) -> bool {
@@ -1088,4 +1045,40 @@ where
 {
     let text = serde_json::to_string(msg).map_err(|_| ())?;
     sink.send(Message::Text(text)).await.map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pref_args_pulls_typed_array_for_requested_tool() {
+        let blob = r#"{"tool_args":{"claude":["--model","claude-3-opus"],"codex":[]}}"#;
+        assert_eq!(
+            parse_tool_args_blob(blob, "claude"),
+            vec!["--model".to_string(), "claude-3-opus".to_string()]
+        );
+        assert_eq!(parse_tool_args_blob(blob, "codex"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn pref_args_fall_back_to_empty_on_bad_shapes() {
+        assert!(parse_tool_args_blob("not json", "claude").is_empty());
+        assert!(parse_tool_args_blob("\"oops\"", "claude").is_empty());
+        assert!(parse_tool_args_blob("{}", "claude").is_empty());
+        assert!(parse_tool_args_blob(r#"{"tool_args":[]}"#, "claude").is_empty());
+        assert!(
+            parse_tool_args_blob(r#"{"tool_args":{"codex":["x"]}}"#, "claude").is_empty()
+        );
+        assert!(
+            parse_tool_args_blob(r#"{"tool_args":{"claude":"--model x"}}"#, "claude").is_empty()
+        );
+        assert_eq!(
+            parse_tool_args_blob(
+                r#"{"tool_args":{"claude":["--a",42,"--b",null,"--c"]}}"#,
+                "claude"
+            ),
+            vec!["--a".to_string(), "--b".to_string(), "--c".to_string()]
+        );
+    }
 }

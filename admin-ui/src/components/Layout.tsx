@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { apiClient } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
@@ -53,40 +53,42 @@ export function Layout() {
     return () => window.clearInterval(t);
   }, [update.kind]);
 
-  // Poll /me while waiting. Track "first time it comes back online" —
-  // refresh the page so the new SPA bundle loads.
-  const sawDownRef = useRef(false);
+  // Poll the public /hub-version endpoint while waiting. We hit a
+  // dedicated unauthenticated endpoint instead of /me because the
+  // hub restart wipes the in-memory cookie session — so /me would
+  // 401 forever from this tab's POV, and the page would never know
+  // the hub came back. Wait for the version string to flip to
+  // anything strictly greater than what was shown in the header
+  // before we kicked off the update.
   useEffect(() => {
-    if (update.kind !== 'waiting') {
-      sawDownRef.current = false;
-      return;
-    }
+    if (update.kind !== 'waiting') return;
     const started = Date.now();
     const t = window.setInterval(async () => {
-      // Fail-safe: if we never see /me succeed within 60 s, surface an
-      // error instead of spinning forever.
-      if (Date.now() - started > 60_000) {
+      // Fail-safe: 90 s should be plenty for "download already on
+      // disk, supervisor exec, hub re-bind". If we exceed it,
+      // surface an error instead of spinning forever.
+      if (Date.now() - started > 90_000) {
         window.clearInterval(t);
         setUpdate({
           kind: 'failed',
-          message: 'hub did not come back online within 60s',
+          message: 'hub did not come back online within 90s',
         });
         return;
       }
       try {
-        await apiClient.me();
-        // Once we see at least one failure followed by a success, the
-        // hub has restarted with the new binary — reload to pick up
-        // the new SPA bundle too.
-        if (sawDownRef.current) {
+        const { version } = await apiClient.hub.version();
+        // New version is anything strictly newer than the
+        // pre-update header value. compareSemver tolerates the
+        // leading "v" prefix.
+        if (hubVersion && compareSemver(version, hubVersion) > 0) {
           window.location.reload();
         }
       } catch {
-        sawDownRef.current = true;
+        // Hub still restarting — keep polling.
       }
     }, 1500);
     return () => window.clearInterval(t);
-  }, [update.kind]);
+  }, [update.kind, hubVersion]);
 
   async function handleLogout() {
     try {
@@ -115,10 +117,7 @@ export function Layout() {
     }
   }
 
-  const animatedLabel =
-    update.kind === 'updating' || update.kind === 'waiting'
-      ? `Updating${'.'.repeat(dot)}`
-      : null;
+  const isAnimating = update.kind === 'updating' || update.kind === 'waiting';
 
   return (
     <div className="min-h-full flex flex-col">
@@ -144,7 +143,7 @@ export function Layout() {
                 Update → {update.latest}
               </button>
             )}
-            {animatedLabel && (
+            {isAnimating && (
               <span
                 className="font-mono text-xs font-normal px-1.5 py-0.5 rounded bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-200 select-none"
                 title={
@@ -153,7 +152,16 @@ export function Layout() {
                     : 'Hub self-update in progress'
                 }
               >
-                {animatedLabel}
+                Updating
+                {/* Fixed-width box for the dot animation so the
+                    badge doesn't reflow as the dot count changes. */}
+                <span
+                  className="inline-block text-left"
+                  style={{ width: '1.5ch' }}
+                  aria-hidden
+                >
+                  {'.'.repeat(dot)}
+                </span>
               </span>
             )}
             {update.kind === 'failed' && (

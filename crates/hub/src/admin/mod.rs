@@ -167,6 +167,10 @@ pub fn router(state: AdminState) -> Router {
             "/admin/api/hub/update",
             post(api::hub_update).route_layer(gate.clone()),
         )
+        // Public on purpose — the admin SPA needs to poll this
+        // while the hub is restarting (in-memory sessions are gone,
+        // so gated endpoints 401 forever).
+        .route("/admin/api/hub-version", get(api::hub_version))
         .route(
             "/admin/api/agents/:name",
             delete(api::agent_delete).route_layer(gate.clone()),

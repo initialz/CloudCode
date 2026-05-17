@@ -710,6 +710,24 @@ async fn fetch_releases() -> Result<ReleasesCacheEntry, String> {
     })
 }
 
+/// `GET /admin/api/hub-version`
+///
+/// Unauthenticated, returns the current hub binary version. Used by
+/// the admin SPA to poll for "hub came back after a self-update":
+/// during the restart the in-memory cookie sessions are wiped, so
+/// `/me` 401s forever from the browser's POV. This endpoint stays
+/// reachable without a session so the poll loop can actually
+/// observe the new version come up. Auth-gating it would defeat
+/// the whole purpose; the same version string is already in the
+/// hub's user-agent when it talks to GitHub Releases.
+pub async fn hub_version() -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({ "version": env!("CARGO_PKG_VERSION") })),
+    )
+        .into_response()
+}
+
 pub async fn agents_releases(State(state): State<AdminState>) -> Response {
     match state.releases.get_fresh().await {
         Ok(entry) => Json(entry.public.clone()).into_response(),

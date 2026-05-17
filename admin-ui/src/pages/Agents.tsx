@@ -59,6 +59,13 @@ export function Agents() {
       // older releases isn't a documented support path and made the
       // happy-path UX two clicks longer than necessary.
       await apiClient.agents.update(agent.name, target);
+      // The update API returns after the agent has ACK'd that it
+      // downloaded + installed; the agent then exits and the
+      // supervisor re-execs. There's a short window where the
+      // agent is offline / still booting the new binary — keep
+      // polling the registry until the target row shows
+      // `online && version == target`, or fall back after 90s.
+      await waitForAgentVersion(agent.name, target);
       await reload();
     } catch (e: unknown) {
       const msg =
@@ -73,6 +80,33 @@ export function Agents() {
         return next;
       });
     }
+  }
+
+  /// Poll agents.list() every 1.5 s until `name` reports
+  /// `online && version >= target` (semver-equal counts) or until 90 s
+  /// elapse. Rejects on timeout so the caller's catch surfaces an
+  /// inline "failed" badge instead of silently flipping back to
+  /// "Update to vX.Y.Z".
+  async function waitForAgentVersion(name: string, target: string): Promise<void> {
+    const deadline = Date.now() + 90_000;
+    while (Date.now() < deadline) {
+      try {
+        const list = await apiClient.agents.list();
+        const me = list.find((a) => a.name === name);
+        if (me && me.online && versionsEqual(me.version, target)) {
+          setAgents(list);
+          return;
+        }
+        // Mid-flight: surface the in-flight list so the UI keeps
+        // updating other fields (last_seen, etc.) without dropping
+        // back to the "Update to ..." button.
+        setAgents(list);
+      } catch {
+        // Hub flap or transient error — keep polling.
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+    }
+    throw { message: `agent did not report ${target} within 90s` };
   }
 
   async function openAccountsModal(agentName: string) {
@@ -193,7 +227,7 @@ export function Agents() {
                   const isUpdating = updating[a.name] === true;
                   const updateErr = updateErrs[a.name];
 
-                  let updateBtnLabel: string;
+                  let updateBtnLabel: React.ReactNode;
                   let updateBtnClass: string;
                   let updateBtnDisabled = false;
                   if (!a.online) {
@@ -201,7 +235,20 @@ export function Agents() {
                     updateBtnClass = 'text-xs text-zinc-400';
                     updateBtnDisabled = true;
                   } else if (isUpdating) {
-                    updateBtnLabel = `Updating${'.'.repeat(dot)}`;
+                    // Fixed-width dot box so the button doesn't reflow
+                    // each 500 ms as the dot count cycles 1 → 2 → 3.
+                    updateBtnLabel = (
+                      <>
+                        Updating
+                        <span
+                          className="inline-block text-left"
+                          style={{ width: '1.5ch' }}
+                          aria-hidden
+                        >
+                          {'.'.repeat(dot)}
+                        </span>
+                      </>
+                    );
                     updateBtnClass =
                       'px-2 py-1 text-xs rounded border border-amber-300 dark:border-amber-700/50 text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/20 select-none';
                     updateBtnDisabled = true;

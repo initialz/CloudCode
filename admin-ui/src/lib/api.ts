@@ -149,6 +149,10 @@ export const apiClient = {
     // frontend can switch to its "waiting for hub to come back" poll.
     update: () =>
       api<{ ok: true; installed: string }>('/hub/update', { method: 'POST' }),
+    // Unauthenticated. Used to poll for the hub coming back online
+    // after a self-update — /me 401s indefinitely once the in-memory
+    // cookie session is wiped during the restart.
+    version: () => api<{ version: string }>('/hub-version'),
   },
   workspaces: {
     list: () => api<WorkspaceRowDto[]>('/workspaces'),
