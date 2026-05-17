@@ -1,13 +1,13 @@
 //! User app JSON API. Backs the webterm SPA in `webterm/`. Every
-//! endpoint lives under `/app/api/`.
+//! endpoint lives under `/api/`.
 //!
 //! Response shape:
 //!   - Success: 2xx with whatever JSON the endpoint advertises.
 //!   - Error:   non-2xx with `{ "error": "code", "message": "..." }`.
 //!
-//! Cookie attributes: `Path=/` (the cookie is read on `/app/api/*`
-//! *and* on the `/v1/pty/ws` WS upgrade — both endpoints live on the
-//! main listener), `HttpOnly` (no JS access — XSS in webterm can't
+//! Cookie attributes: `Path=/` (the cookie is read on `/api/*` *and*
+//! on the `/v1/pty/ws` WS upgrade — both endpoints live on the main
+//! listener), `HttpOnly` (no JS access — XSS in webterm can't
 //! exfiltrate it), `SameSite=Strict` (no cross-origin sends — a third
 //! party can't trick the user's browser into spending the session).
 
@@ -42,7 +42,7 @@ pub struct LoginRequest {
     pub token: String,
 }
 
-/// `POST /app/api/login`
+/// `POST /api/login`
 ///
 /// Body: `{"token":"cc_..."}`. We reuse `crate::auth::authenticate`
 /// (same code path the CLI client and the pty WS Hello frame go
@@ -102,7 +102,7 @@ pub async fn login(State(state): State<Arc<AppState>>, Json(req): Json<LoginRequ
         .into_response()
 }
 
-/// `POST /app/api/logout`
+/// `POST /api/logout`
 ///
 /// Idempotent: best-effort remove the session from the store, always
 /// emit a cookie with `Max-Age=0` so the browser drops it even if the
@@ -120,7 +120,7 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     (StatusCode::NO_CONTENT, out).into_response()
 }
 
-/// `GET /app/api/me` — protected by `require_user`. Returns the
+/// `GET /api/me` — protected by `require_user`. Returns the
 /// current account name and hub build version so the webterm can show
 /// "you're logged in as X" without re-deriving from cookies.
 pub async fn me(Extension(account): Extension<AuthedAccount>) -> Response {
@@ -134,7 +134,7 @@ pub async fn me(Extension(account): Extension<AuthedAccount>) -> Response {
         .into_response()
 }
 
-/// `GET /app/api/preferences` — return the raw JSON blob the webterm
+/// `GET /api/preferences` — return the raw JSON blob the webterm
 /// last saved for this account. `preferences == null` means "never set"
 /// (webterm then falls back to its built-in defaults).
 pub async fn get_preferences(
@@ -161,7 +161,7 @@ pub async fn get_preferences(
         .into_response()
 }
 
-/// `PUT /app/api/preferences` — replace this account's preferences
+/// `PUT /api/preferences` — replace this account's preferences
 /// blob. Body must be a JSON object (we explicitly reject arrays /
 /// primitives to keep the door open for partial-update semantics
 /// later without an awkward type bump).

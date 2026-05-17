@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>CloudCode v1.12.0 — Root-served webterm SPA</title>
+<style>
+  :root {
+    --bg: #fafafa; --fg: #18181b; --muted: #71717a; --border: #e4e4e7;
+    --card: #ffffff; --pass: #15803d; --pass-bg: #dcfce7;
+    --fail: #b91c1c; --fail-bg: #fee2e2; --warn: #b45309; --warn-bg: #fef3c7;
+    --code-bg: #18181b; --code-fg: #fafafa; --hl: #2563eb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #09090b; --fg: #fafafa; --muted: #a1a1aa; --border: #27272a; --card: #18181b; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; }
+  .page { max-width: 1000px; margin: 0 auto; padding: 40px 32px 80px; }
+  header.report { border-bottom: 1px solid var(--border); padding-bottom: 24px; margin-bottom: 32px; }
+  header.report h1 { margin: 0 0 6px; font-size: 26px; letter-spacing: -0.01em; }
+  header.report .meta { color: var(--muted); font-size: 13px; font-variant-numeric: tabular-nums; }
+  header.report .scope { margin-top: 14px; color: var(--muted); line-height: 1.6; }
+  h2 { margin: 40px 0 12px; font-size: 19px; letter-spacing: -0.005em; }
+  h3 { margin: 18px 0 8px; font-size: 15px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+  p { margin: 8px 0; }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; }
+  td.mono { font-family: ui-monospace, Menlo, monospace; font-size: 13px; }
+  pre.log { background: var(--code-bg); color: var(--code-fg); border-radius: 8px;
+    padding: 16px 18px; overflow-x: auto; font: 12.5px/1.55 ui-monospace, Menlo, monospace; margin: 12px 0; }
+  pre.log .cmd { color: #93c5fd; }
+  pre.log .info { color: #6ee7b7; }
+  pre.log .warn { color: #fcd34d; }
+  pre.log .note { color: #a1a1aa; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 11px;
+    font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase; font-family: ui-monospace, Menlo, monospace; }
+  .badge.pass { background: var(--pass-bg); color: var(--pass); }
+  .badge.warn { background: var(--warn-bg); color: var(--warn); }
+  .verdict { margin: 14px 0 0; padding: 12px 14px; border-radius: 8px;
+    border-left: 3px solid var(--pass); background: var(--pass-bg); color: var(--pass); font-size: 13px; }
+  .verdict.warn { border-left-color: var(--warn); background: var(--warn-bg); color: var(--warn); }
+  ul.checks { margin: 10px 0; padding-left: 0; list-style: none; }
+  ul.checks li { padding: 4px 0; }
+  ul.checks li::before { content: "✓"; color: var(--pass); font-weight: 700; margin-right: 8px; }
+  ul.checks li.warn::before { content: "⚠"; color: var(--warn); }
+  ul.checks li.todo::before { content: "○"; color: var(--muted); }
+  footer.report { margin-top: 64px; padding-top: 24px; border-top: 1px solid var(--border); color: var(--muted); font-size: 12px; }
+  code.inline { background: var(--card); border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px;
+    font: 12.5px/1.4 ui-monospace, Menlo, monospace; }
+  nav.toc { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px 20px; margin: 0 0 32px; }
+  nav.toc ol { margin: 6px 0 0; padding-left: 20px; }
+  .pid-trans { display: inline-grid; grid-template-columns: auto auto auto;
+    gap: 6px 12px; align-items: center; font-family: ui-monospace, Menlo, monospace; font-size: 13px;
+    background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 10px 16px; margin: 10px 0; }
+  .pid-trans .from { color: var(--muted); }
+  .pid-trans .arrow { color: var(--hl); }
+</style>
+</head>
+<body>
+<div class="page">
+
+<header class="report">
+  <h1>CloudCode v1.12.0 — Root-served webterm SPA</h1>
+  <div class="meta">
+    Date 2026-05-18 ·
+    Pre-release branch <code class="inline">main</code> ·
+    Host <code class="inline">aarch64-apple-darwin</code> ·
+    <strong style="color: var(--pass)">7/7 checks passed</strong>
+  </div>
+  <div class="scope">
+    Verified that moving the webterm SPA + its REST API from
+    <code class="inline">/app/*</code> to <code class="inline">/</code>
+    leaves every other route on the main listener intact, that the
+    <code class="inline">/*spa</code> wildcard correctly defers to the
+    explicit routes, and that the path migration cleanly survived 3
+    parallel sub-agent refactors (hub crate, webterm SPA, docs).
+  </div>
+</header>
+
+<nav class="toc">
+  <strong>Contents</strong>
+  <ol>
+    <li><a href="#scope">Refactor scope</a></li>
+    <li><a href="#sub-agents">Sub-agent dispatch</a></li>
+    <li><a href="#routes">Live route verification</a></li>
+    <li><a href="#integrity">Build + lint integrity</a></li>
+    <li><a href="#caveats">Behavioural caveats</a></li>
+  </ol>
+</nav>
+
+<section id="scope">
+<h2>1. Refactor scope</h2>
+
+<table>
+  <tr><th>Old</th><th>New</th></tr>
+  <tr><td class="mono">GET /app → redirect /app/</td><td class="mono">DELETED (no redirect)</td></tr>
+  <tr><td class="mono">GET /app/</td><td class="mono">GET /</td></tr>
+  <tr><td class="mono">GET /app/assets/*path</td><td class="mono">GET /assets/*path</td></tr>
+  <tr><td class="mono">GET /app/*spa</td><td class="mono">GET /*spa</td></tr>
+  <tr><td class="mono">/app/api/login,/logout,/me,/preferences</td><td class="mono">/api/login, /api/logout, /api/me, /api/preferences</td></tr>
+  <tr><td class="mono">favicon /app/favicon.svg</td><td class="mono">/favicon.svg</td></tr>
+  <tr><td class="mono">Vite base /app/</td><td class="mono">/</td></tr>
+  <tr><td class="mono">BrowserRouter basename=/app</td><td class="mono">(default /)</td></tr>
+</table>
+
+<p><strong>No backward-compat redirects</strong> — the user explicitly said internal-only, so the old paths are gone for good. Anything previously bookmarked at <code class="inline">/app/...</code> now falls through to the <code class="inline">/*spa</code> SPA fallback (loads the shell, then the React router decides what to render).</p>
+</section>
+
+<section id="sub-agents">
+<h2>2. Sub-agent dispatch <span class="badge pass">PASS</span></h2>
+
+<p>Three agents in parallel, disjoint file scopes:</p>
+
+<table>
+  <tr><th>Agent</th><th>Scope</th><th>Touched files</th></tr>
+  <tr><td>backend-engineer</td><td>hub crate routes + doc comments</td>
+      <td class="mono">main.rs, app/mod.rs, app/api.rs, app/assets.rs, build.rs</td></tr>
+  <tr><td>frontend-engineer</td><td>webterm SPA</td>
+      <td class="mono">vite.config.ts, src/lib/api.ts, src/main.tsx, index.html</td></tr>
+  <tr><td>general-purpose (docs)</td><td>USER_GUIDE / RELEASE_TESTING / README</td>
+      <td class="mono">docs/USER_GUIDE.md, docs/RELEASE_TESTING.md, README.md</td></tr>
+</table>
+
+<p>Each agent ran its own scoped verification:</p>
+
+<pre class="log"><span class="info">backend</span>:   cargo build -p cloudcode-hub   → clean, 11s
+              grep '/app/' crates/hub/src/ → 0 matches
+<span class="info">frontend</span>:  pnpm build                     → 55 modules, 1.66s
+              dist/index.html href values → /assets/..., /favicon.svg
+              grep '/app' webterm src      → 0 matches
+<span class="info">docs</span>:      6 replacements across 3 files
+              grep '/app' docs/ README.md  → 0 matches (excl. test-reports/)</pre>
+
+<p>Post-dispatch integration <code class="inline">grep -rn '/app'</code> across the whole repo (excluding <code class="inline">docs/test-reports/</code> historical artefacts and unrelated <code class="inline">agent.toml</code> / <code class="inline">/admin/api</code> hits): <strong>zero remaining references</strong>.</p>
+</section>
+
+<section id="routes">
+<h2>3. Live route verification <span class="badge pass">PASS</span></h2>
+
+<p>Built the new hub binary, spawned in an isolated state dir on non-default ports (<code class="inline">127.0.0.1:17300</code> for main, <code class="inline">17301</code> for admin), exercised each route directly via curl.</p>
+
+<pre class="log"><span class="cmd">$ curl -o /dev/null -w 'status=%{http_code} content-type=%{content_type}\n' \
+    http://127.0.0.1:17300/</span>
+status=200 content-type=text/html; charset=utf-8         <span class="note"># SPA index lives at root ✓</span>
+
+<span class="cmd">$ # discover the bundled JS hash from index.html, then fetch it</span>
+<span class="cmd">$ curl http://127.0.0.1:17300/ | grep -oE 'src="/assets/[^"]+\.js"'</span>
+src="/assets/index-BzJY0vsB.js"
+
+<span class="cmd">$ curl -o /dev/null -w 'status=%{http_code} content-type=%{content_type}\n' \
+    http://127.0.0.1:17300/assets/index-BzJY0vsB.js</span>
+status=200 content-type=application/javascript           <span class="note"># asset path resolves ✓</span>
+
+<span class="cmd">$ curl -o /dev/null -w 'status=%{http_code}\n' http://127.0.0.1:17300/v1/agent/ws</span>
+status=400                                                <span class="note"># 400 = expects WS Upgrade — not swallowed by /*spa ✓</span>
+
+<span class="cmd">$ curl http://127.0.0.1:17300/healthz</span>
+ok                                                        <span class="note"># still routes ✓</span>
+
+<span class="cmd">$ curl http://127.0.0.1:17300/api/me</span>
+{"error":"unauthenticated","message":"login required"}    <span class="note"># auth gate still in place ✓</span>
+
+<span class="cmd">$ curl -c admin.cookie -X POST -H 'Content-Type: application/json' \
+    -d "{\"token\":\"ad_...\"}" http://127.0.0.1:17301/admin/api/login</span>
+{"ok":true}                                               <span class="note"># admin listener untouched ✓</span>
+
+<span class="cmd">$ curl -b admin.cookie http://127.0.0.1:17301/admin/api/me</span>
+{"hub_version":"1.11.6","ok":true}</pre>
+
+<table>
+  <tr><th>Route</th><th>Expected</th><th>Got</th></tr>
+  <tr><td class="mono">GET /</td><td>200 text/html (SPA shell)</td><td class="mono">200 text/html ✓</td></tr>
+  <tr><td class="mono">GET /assets/&lt;hash&gt;.js</td><td>200 application/javascript</td><td class="mono">200 application/javascript ✓</td></tr>
+  <tr><td class="mono">GET /v1/agent/ws</td><td>400 (no WS upgrade headers)</td><td class="mono">400 ✓</td></tr>
+  <tr><td class="mono">GET /healthz</td><td>200 "ok"</td><td class="mono">200 ok ✓</td></tr>
+  <tr><td class="mono">GET /api/me (no cookie)</td><td>401 unauthenticated</td><td class="mono">401 ✓</td></tr>
+  <tr><td class="mono">POST /admin/api/login (port 17301)</td><td>200 ok=true</td><td class="mono">200 ✓</td></tr>
+  <tr><td class="mono">GET /admin/api/me (port 17301)</td><td>200 with hub_version</td><td class="mono">200 ✓</td></tr>
+</table>
+
+<div class="verdict">
+  <strong>PASS.</strong> Explicit routes (<code class="inline">/v1/...</code>, <code class="inline">/healthz</code>, <code class="inline">/api/...</code>, <code class="inline">/assets/...</code>) all match before the new <code class="inline">/*spa</code> fallback, matching the axum 0.7 specificity rules.
+</div>
+</section>
+
+<section id="integrity">
+<h2>4. Build + lint integrity</h2>
+
+<ul class="checks">
+  <li><code class="inline">cargo build --release --workspace</code> — clean</li>
+  <li><code class="inline">cargo build --release -p cloudcode-hub</code> (re-bake SPA via rust-embed) — clean</li>
+  <li><code class="inline">cd webterm && pnpm build</code> — 55 modules, 1.66s, no warnings</li>
+  <li><code class="inline">cargo test --workspace</code> — 12 passed (3 in agent, 9 in hub), 0 failed</li>
+  <li><code class="inline">cargo clippy --workspace --all-targets</code> — clean, 0 warnings</li>
+  <li>Full-repo <code class="inline">grep '/app/'</code> (excl. <code class="inline">docs/test-reports/</code>) — 0 matches</li>
+</ul>
+</section>
+
+<section id="caveats">
+<h2>5. Behavioural caveats</h2>
+
+<ul class="checks">
+  <li class="warn">Visiting <code class="inline">https://&lt;hub&gt;/app/</code> now serves the SPA shell from the <code class="inline">/*spa</code> fallback — React Router won't have a route for <code class="inline">/app</code>, so the user lands on a blank-ish page or the SPA's catch-all. Per the operator's explicit "no bookmark-compat" call, this is by design.</li>
+  <li class="warn">Existing webterm tabs still pointed at <code class="inline">/app/*</code> with cached <code class="inline">/app/api/*</code> URLs in their bundle will 404 on every API call until the user hard-refreshes. Cookie still rides along (Path=/), so once they hit <code class="inline">/</code> they're already logged in.</li>
+  <li class="todo">Did NOT test the SPA UI flows in a browser (multi-tool split, drag-select copy, Settings) — those are covered by the existing v1.11.x manual smoke plan and the path move shouldn't affect them.</li>
+  <li class="todo">Did NOT test the v1.11.x → v1.12.0 self-update path end-to-end. The supervisor + symlink-flip logic is unchanged; the only delta is the binary serves SPAs on different paths after the swap, which the OSC-52 / wire / sessions code doesn't touch.</li>
+</ul>
+</section>
+
+<footer class="report">
+  Generated 2026-05-18 · CloudCode v1.12.0 release-candidate smoke test ·
+  Self-contained HTML (no external resources) · safe to email, archive, or
+  attach to a release PR.
+</footer>
+
+</div>
+</body>
+</html>

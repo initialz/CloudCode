@@ -9,9 +9,10 @@
 //! index.html so a first-time `cargo build` works before the SPA has
 //! ever been built.
 //!
-//! Routing rules mirror the admin SPA at `/admin/`:
-//! - `/app/assets/<hash>.{js,css,…}` → long-cache hashed asset
-//! - `/app/` and any other `/app/<rest>` → `index.html` so the SPA
+//! Routing rules (mirrors what the admin SPA does at `/admin/`, just
+//! mounted at the root):
+//! - `/assets/<hash>.{js,css,…}` → long-cache hashed asset
+//! - `/` and any other `/<rest>` → `index.html` so the SPA
 //!   router can resolve deep links and reloads
 
 use axum::{
@@ -26,7 +27,7 @@ use rust_embed::{EmbeddedFile, RustEmbed};
 #[folder = "../../webterm/dist/"]
 struct Asset;
 
-/// `/app/` (and any non-asset path under `/app/`) → `index.html`.
+/// `/` (and any non-asset path) → `index.html`.
 pub async fn serve_index(_uri: Uri) -> Response {
     match Asset::get("index.html") {
         Some(file) => file_response("index.html", file),
@@ -34,29 +35,29 @@ pub async fn serve_index(_uri: Uri) -> Response {
     }
 }
 
-/// `/app/assets/*path` — serve the hashed bundle file. 404s fall back
-/// to index.html so refreshing `/app/something/deep` still loads.
+/// `/assets/*path` — serve the hashed bundle file. 404s fall back
+/// to index.html so refreshing `/something/deep` still loads.
 pub async fn serve_asset(Path(path): Path<String>) -> Response {
     let key = format!("assets/{}", path);
     match Asset::get(&key) {
         Some(file) => file_response(&key, file),
-        None => serve_index(Uri::from_static("/app/")).await,
+        None => serve_index(Uri::from_static("/")).await,
     }
 }
 
-/// `/app/*spa` — first try to serve an exact file from dist root
+/// `/*spa` — first try to serve an exact file from dist root
 /// (favicon.svg, logo.svg, robots.txt, etc, anything the bundler
 /// copied from `public/`); fall back to index.html so the SPA router
 /// can resolve deep links and reloads.
 pub async fn serve_spa(Path(path): Path<String>) -> Response {
     let key = path.trim_start_matches('/');
     if key.is_empty() || key.contains("..") {
-        return serve_index(Uri::from_static("/app/")).await;
+        return serve_index(Uri::from_static("/")).await;
     }
     if let Some(file) = Asset::get(key) {
         return file_response(key, file);
     }
-    serve_index(Uri::from_static("/app/")).await
+    serve_index(Uri::from_static("/")).await
 }
 
 fn file_response(path: &str, file: EmbeddedFile) -> Response {

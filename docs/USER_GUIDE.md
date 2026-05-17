@@ -48,7 +48,7 @@ CloudCode lets you drive `claude` (and other terminal AI tools) running on one h
 | **hub** | A public-facing host (cloud VM, home server with port-forwarding, …) | The gateway. Accepts WS connections from agents (they dial out, NAT-friendly) and from clients (browser SPA + CLI). Multiplexes PTY bytes across agents on a per-session uuid. Ships the admin SPA + the user webterm SPA bundled in the binary. |
 | **agent** | The host where you ran `claude /login` | Holds the OAuth credentials. Spawns `tmux + claude` per workspace, streams the PTY back. Workspaces persist across disconnects. |
 | **client** (CLI) | Your laptop / any SSH terminal | Raw-mode PTY pump. Picks an agent + workspace via a TUI menu, then hands stdin/stdout straight through to the agent's PTY. |
-| **webterm** (SPA) | Your browser | Same experience as the CLI client, plus multi-tool split panes, drag-select-to-clipboard, mouse scrollback, per-user defaults. Lives at `/app/` on the hub. |
+| **webterm** (SPA) | Your browser | Same experience as the CLI client, plus multi-tool split panes, drag-select-to-clipboard, mouse scrollback, per-user defaults. Lives at `/` on the hub. |
 
 The agent **dials out** to the hub over WSS. The hub never reaches in to agents — that's what makes the hub deployable on a public IP while agents stay on workstations behind NAT.
 
@@ -184,7 +184,7 @@ account_token = "cc_..."                          # your personal account token
 
 ## Web UI (webterm)
 
-Open `https://<hub>/app/`, paste your account token, you're in.
+Open `https://<hub>/`, paste your account token, you're in.
 
 ### Layout
 
@@ -235,7 +235,7 @@ Behind the scenes:
 
 ### Settings → Default args per tool
 
-Stored server-side per account (sqlite blob, `PUT /app/api/preferences`). Edits commit on focus-out from each input.
+Stored server-side per account (sqlite blob, `PUT /api/preferences`). Edits commit on focus-out from each input.
 
 ```
 Default args

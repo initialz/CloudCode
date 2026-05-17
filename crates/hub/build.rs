@@ -25,7 +25,7 @@ fn main() {
         "cloudcode webterm",
         "user-facing web terminal",
         "cd webterm &amp;&amp; pnpm install &amp;&amp; pnpm build",
-        "/app/api/*",
+        "/api/*",
     );
 
     println!("cargo:rerun-if-changed=../../admin-ui/dist/index.html");

@@ -1,11 +1,12 @@
 //! User-facing web app — JSON API + SPA shell for `webterm/`.
 //!
-//! Mounted on the main hub listener (alongside `/v1/pty/ws`) rather
-//! than the admin listener: end-users hit this from the public
-//! internet. `POST /app/api/login` exchanges an account token (the
-//! same one the CLI client uses) for a short-lived session id; the id
-//! rides in an HttpOnly cookie and authenticates `/app/api/me` and
-//! the `/v1/pty/ws` WebSocket upgrade. SPA assets live under `/app/`.
+//! Mounted at the root of the main hub listener (alongside
+//! `/v1/pty/ws`) rather than the admin listener: end-users hit this
+//! from the public internet. `POST /api/login` exchanges an account
+//! token (the same one the CLI client uses) for a short-lived
+//! session id; the id rides in an HttpOnly cookie and authenticates
+//! `/api/me` and the `/v1/pty/ws` WebSocket upgrade. SPA assets are
+//! served from `/`.
 //!
 //! Sessions live in the `user_sessions` SQLite table (TTL = 12 h),
 //! so they survive hub restarts: a logged-in webterm tab keeps
@@ -19,10 +20,10 @@
 //! disjoint cookie names so that can't happen.
 //!
 //! Browsers send cookies for *any* request to the origin, so the WS
-//! upgrade for `/v1/pty/ws` is the only place where cookie auth bleeds
-//! out of `/app/*`. That bleed is the whole point — without it the
-//! webterm couldn't reach the existing pty endpoint without redoing
-//! the protocol's Hello token exchange.
+//! upgrade for `/v1/pty/ws` picks up the same cookie set by `/api/login`.
+//! That sharing is the whole point — without it the webterm couldn't
+//! reach the existing pty endpoint without redoing the protocol's
+//! Hello token exchange.
 
 pub mod api;
 pub mod assets;
@@ -80,7 +81,7 @@ impl UserAuth {
 
 /// Parse a named cookie value out of a raw `Cookie:` header. Returns
 /// `None` if the header is absent, malformed, or doesn't contain the
-/// requested name. Shared between the `/app/api/*` middleware and the
+/// requested name. Shared between the `/api/*` middleware and the
 /// `/v1/pty/ws` upgrade path.
 pub fn parse_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     let raw = headers.get(COOKIE).and_then(|v| v.to_str().ok())?;

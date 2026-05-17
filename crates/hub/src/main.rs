@@ -15,7 +15,6 @@ mod ws_handler;
 use anyhow::{anyhow, Context};
 use axum::{
     middleware,
-    response::Redirect,
     routing::{get, post},
     Router,
 };
@@ -42,7 +41,7 @@ pub struct AppState {
     /// separate namespaces.
     pub workspaces: DashMap<(String, String, String), Uuid>,
     /// User-facing webterm SPA session store. Maps an HttpOnly cookie
-    /// session id to the logged-in account name. Backs `/app/api/*`
+    /// session id to the logged-in account name. Backs `/api/*`
     /// and the cookie-auth path through `/v1/pty/ws`.
     pub user_auth: Arc<UserAuth>,
 }
@@ -151,27 +150,27 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         user_auth,
     });
 
-    // /app/* — user-facing webterm SPA + its JSON API. Lives on the
+    // Root — user-facing webterm SPA + its JSON API. Lives on the
     // same listener as /v1/pty/ws so cookie auth carries through to
-    // the WebSocket upgrade.
+    // the WebSocket upgrade. Explicit routes (/v1/*, /healthz, /api/*,
+    // /assets/*) resolve before the `/*spa` wildcard fallback.
     let user_gate = middleware::from_fn_with_state(state.clone(), app::require_user);
     let app_router = Router::new()
-        .route("/app/api/login", post(app::api::login))
-        .route("/app/api/logout", post(app::api::logout))
+        .route("/api/login", post(app::api::login))
+        .route("/api/logout", post(app::api::logout))
         .route(
-            "/app/api/me",
+            "/api/me",
             get(app::api::me).route_layer(user_gate.clone()),
         )
         .route(
-            "/app/api/preferences",
+            "/api/preferences",
             get(app::api::get_preferences)
                 .put(app::api::put_preferences)
                 .route_layer(user_gate.clone()),
         )
-        .route("/app", get(|| async { Redirect::permanent("/app/") }))
-        .route("/app/", get(app::assets::serve_index))
-        .route("/app/assets/*path", get(app::assets::serve_asset))
-        .route("/app/*spa", get(app::assets::serve_spa));
+        .route("/", get(app::assets::serve_index))
+        .route("/assets/*path", get(app::assets::serve_asset))
+        .route("/*spa", get(app::assets::serve_spa));
 
     let app = Router::new()
         .route("/v1/pty/ws", get(pty_session::upgrade))

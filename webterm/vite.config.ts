@@ -3,31 +3,15 @@ import react from '@vitejs/plugin-react';
 import path from 'node:path';
 
 export default defineConfig({
-  base: '/app/',
-  plugins: [
-    react(),
-    {
-      name: 'redirect-app-trailing-slash',
-      configureServer(server) {
-        server.middlewares.use((req, res, next) => {
-          if (req.url === '/app') {
-            res.statusCode = 301;
-            res.setHeader('Location', '/app/');
-            res.end();
-            return;
-          }
-          next();
-        });
-      },
-    },
-  ],
+  base: '/',
+  plugins: [react()],
   resolve: {
     alias: { '@': path.resolve(__dirname, './src') },
   },
   server: {
     port: 5174,
     proxy: {
-      '/app/api': {
+      '/api': {
         target: 'http://127.0.0.1:7101',
         changeOrigin: false,
       },

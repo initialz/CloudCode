@@ -1,4 +1,4 @@
-// Tiny fetch wrapper for /app/api/*. Sends cookies automatically.
+// Tiny fetch wrapper for /api/*. Sends cookies automatically.
 // Throws ApiError on non-2xx.
 
 export type ApiError = {
@@ -7,7 +7,7 @@ export type ApiError = {
   message: string;
 };
 
-const BASE = '/app/api';
+const BASE = '/api';
 
 export async function api<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(BASE + path, {

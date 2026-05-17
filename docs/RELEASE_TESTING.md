@@ -57,7 +57,7 @@ The release MUST cross-version with the previous release. If you touched any wir
 - [ ] **Mouse scroll** Wheel up scrolls into chat history (tmux scrollback). Wheel down past current returns to live.
 - [ ] **Drag-select + Cmd+C** Drag a chunk of text; selection highlight stays after release. `Cmd+C` copies. Paste somewhere — full text including CJK round-trips with no mojibake.
 - [ ] **Click cancels selection** After a drag, click anywhere in the pane → selection clears, copy mode exits.
-- [ ] **Settings → default args** Open Settings, set claude args, blur the input. `GET /app/api/preferences` returns the saved blob. Reset the workspace, open — claude starts with the new args (verify via `--version` for an instant exit).
+- [ ] **Settings → default args** Open Settings, set claude args, blur the input. `GET /api/preferences` returns the saved blob. Reset the workspace, open — claude starts with the new args (verify via `--version` for an instant exit).
 - [ ] **Cookie auth survives reload** Hard-refresh the page; webterm goes straight to the workspace tree, not the login screen.
 
 ### 4. Agent
