@@ -7,8 +7,10 @@
 //! rides in an HttpOnly cookie and authenticates `/app/api/me` and
 //! the `/v1/pty/ws` WebSocket upgrade. SPA assets live under `/app/`.
 //!
-//! Sessions don't survive a hub restart (in-memory `DashMap`); the
-//! webterm SPA detects the 401 and prompts re-login.
+//! Sessions live in the `user_sessions` SQLite table (TTL = 12 h),
+//! so they survive hub restarts: a logged-in webterm tab keeps
+//! working straight through a self-update without prompting the
+//! user to re-authenticate.
 //!
 //! Lifecycle vs admin: deliberately separate state — the admin token
 //! is a single shared operator credential, the user sessions are one
@@ -33,48 +35,46 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use dashmap::DashMap;
 use serde_json::json;
 use std::sync::Arc;
 
 pub const USER_SESSION_COOKIE: &str = "cc_user_session";
 
-/// In-memory session store. Maps the opaque session id (URL-safe
-/// random) → account name. Cleared on hub restart.
+/// Session TTL applied to both the cookie's Max-Age and the
+/// `user_sessions` row. Matches the admin side (12 h).
+pub const USER_SESSION_TTL_SECS: i64 = 12 * 60 * 60;
+
+/// DB-backed session store. Cookies survive hub restarts because
+/// the `user_sessions` table is the source of truth.
 pub struct UserAuth {
-    sessions: DashMap<String, String>,
+    db: crate::db::Db,
 }
 
 impl UserAuth {
-    pub fn new() -> Self {
-        Self {
-            sessions: DashMap::new(),
-        }
+    pub fn new(db: crate::db::Db) -> Self {
+        Self { db }
     }
 
     /// Mint a fresh session id for the given account. The caller has
     /// already verified the account's token — we don't double-check
     /// here.
-    pub fn login(&self, account: String) -> String {
+    pub async fn login(&self, account: String) -> String {
         let sid = crate::auth::generate_session_id();
-        self.sessions.insert(sid.clone(), account);
+        let expires_at = chrono::Utc::now().timestamp() + USER_SESSION_TTL_SECS;
+        if let Err(e) = self.db.insert_user_session(&sid, &account, expires_at).await {
+            tracing::warn!(error = %e, "could not persist user session; cookie won't survive a hub restart");
+        }
         sid
     }
 
-    /// Resolve a session id back to its account. None if expired /
+    /// Resolve a session id back to its account. `None` if expired /
     /// unknown / logged out.
-    pub fn lookup(&self, sid: &str) -> Option<String> {
-        self.sessions.get(sid).map(|r| r.value().clone())
+    pub async fn lookup(&self, sid: &str) -> Option<String> {
+        self.db.user_session_account(sid).await.unwrap_or(None)
     }
 
-    pub fn logout(&self, sid: &str) {
-        self.sessions.remove(sid);
-    }
-}
-
-impl Default for UserAuth {
-    fn default() -> Self {
-        Self::new()
+    pub async fn logout(&self, sid: &str) {
+        let _ = self.db.delete_user_session(sid).await;
     }
 }
 
@@ -96,7 +96,7 @@ pub fn parse_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 
 /// Pull the user session id out of cookies, look it up, and on a hit
 /// stash the account name in the request extensions so handlers (like
-/// `me`) can read it without going back to the DashMap. Unauthenticated
+/// `me`) can read it without re-hitting the session table. Unauthenticated
 /// requests get a 401 JSON envelope (`{"error":"unauthenticated",...}`)
 /// rather than a redirect — the SPA is in charge of routing.
 pub async fn require_user(
@@ -105,7 +105,7 @@ pub async fn require_user(
     next: Next,
 ) -> Response {
     if let Some(sid) = parse_cookie(req.headers(), USER_SESSION_COOKIE) {
-        if let Some(account) = state.user_auth.lookup(&sid) {
+        if let Some(account) = state.user_auth.lookup(&sid).await {
             req.extensions_mut().insert(AuthedAccount(account));
             return next.run(req).await;
         }

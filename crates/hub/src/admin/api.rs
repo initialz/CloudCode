@@ -92,7 +92,7 @@ pub async fn login(
     State(state): State<AdminState>,
     Json(req): Json<LoginRequest>,
 ) -> Response {
-    let Some(sid) = state.auth.login(req.token.trim()) else {
+    let Some(sid) = state.auth.login(req.token.trim()).await else {
         return err(StatusCode::UNAUTHORIZED, "invalid_token", "invalid admin token");
     };
     let cookie = format!(
@@ -108,7 +108,7 @@ pub async fn login(
 
 pub async fn logout(State(state): State<AdminState>, headers: HeaderMap) -> Response {
     if let Some(sid) = super::session_cookie(&headers) {
-        state.auth.logout(&sid);
+        state.auth.logout(&sid).await;
     }
     let cookie = format!(
         "{name}=; HttpOnly; SameSite=Strict; Path=/admin; Max-Age=0",

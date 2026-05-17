@@ -153,6 +153,22 @@ impl Db {
                 data       TEXT NOT NULL,
                 updated_at INTEGER NOT NULL
             )",
+            // Persistent admin / webterm session stores. Previously
+            // both sat in in-process DashMaps and got wiped on every
+            // hub restart, forcing operators + webterm users to log
+            // back in after each upgrade. Now the only thing
+            // restart-sensitive is the cookie's expiration timestamp.
+            "CREATE TABLE IF NOT EXISTS admin_sessions (
+                sid        TEXT PRIMARY KEY,
+                expires_at INTEGER NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires ON admin_sessions(expires_at)",
+            "CREATE TABLE IF NOT EXISTS user_sessions (
+                sid        TEXT PRIMARY KEY,
+                account    TEXT NOT NULL,
+                expires_at INTEGER NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_user_sessions_expires ON user_sessions(expires_at)",
             // Compat for deployments that already ran the unguarded
             // seed (pre-v1.8.x): if the ACL table is non-empty, assume
             // the seed has logically happened and lock the marker in,
@@ -834,6 +850,94 @@ impl Db {
         if let Err(e) = res {
             tracing::debug!(error = %e, "session end update failed");
         }
+    }
+
+    // ---- sessions (admin + webterm; survive hub restart) --------------
+
+    pub async fn insert_admin_session(&self, sid: &str, expires_at: i64) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO admin_sessions (sid, expires_at) VALUES (?1, ?2)",
+        )
+        .bind(sid)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn valid_admin_session(&self, sid: &str) -> Result<bool> {
+        let now = chrono::Utc::now().timestamp();
+        let row = sqlx::query(
+            "SELECT 1 FROM admin_sessions WHERE sid = ?1 AND expires_at > ?2",
+        )
+        .bind(sid)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.is_some())
+    }
+
+    pub async fn delete_admin_session(&self, sid: &str) -> Result<()> {
+        sqlx::query("DELETE FROM admin_sessions WHERE sid = ?1")
+            .bind(sid)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn insert_user_session(
+        &self,
+        sid: &str,
+        account: &str,
+        expires_at: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO user_sessions (sid, account, expires_at) VALUES (?1, ?2, ?3)",
+        )
+        .bind(sid)
+        .bind(account)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn user_session_account(&self, sid: &str) -> Result<Option<String>> {
+        let now = chrono::Utc::now().timestamp();
+        let row = sqlx::query(
+            "SELECT account FROM user_sessions WHERE sid = ?1 AND expires_at > ?2",
+        )
+        .bind(sid)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.get::<String, _>("account")))
+    }
+
+    pub async fn delete_user_session(&self, sid: &str) -> Result<()> {
+        sqlx::query("DELETE FROM user_sessions WHERE sid = ?1")
+            .bind(sid)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Drop sessions whose expiry has elapsed. Called once on hub
+    /// startup so the tables don't grow unboundedly across long
+    /// uptimes / many cookie cycles.
+    pub async fn cleanup_expired_sessions(&self) -> Result<u64> {
+        let now = chrono::Utc::now().timestamp();
+        let a = sqlx::query("DELETE FROM admin_sessions WHERE expires_at <= ?1")
+            .bind(now)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        let u = sqlx::query("DELETE FROM user_sessions WHERE expires_at <= ?1")
+            .bind(now)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(a + u)
     }
 
     // ---- user preferences (opaque JSON blob per account) --------------

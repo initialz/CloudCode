@@ -47,8 +47,11 @@ pub async fn upgrade(
     // open we no longer have access to the original request headers.
     // `None` means "fall back to in-protocol Hello token auth", which
     // is what the CLI client uses.
-    let pre_auth = app::parse_cookie(&headers, USER_SESSION_COOKIE)
-        .and_then(|sid| state.user_auth.lookup(&sid));
+    let pre_auth = if let Some(sid) = app::parse_cookie(&headers, USER_SESSION_COOKIE) {
+        state.user_auth.lookup(&sid).await
+    } else {
+        None
+    };
     ws.on_upgrade(move |socket| handle_socket(socket, state, pre_auth))
 }
 

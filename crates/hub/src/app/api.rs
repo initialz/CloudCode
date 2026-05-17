@@ -80,7 +80,7 @@ pub async fn login(State(state): State<Arc<AppState>>, Json(req): Json<LoginRequ
         }
     };
 
-    let sid = state.user_auth.login(account.name.clone());
+    let sid = state.user_auth.login(account.name.clone()).await;
     let cookie = format!(
         "{name}={sid}; HttpOnly; SameSite=Strict; Path=/; Max-Age={ttl}",
         name = USER_SESSION_COOKIE,
@@ -109,7 +109,7 @@ pub async fn login(State(state): State<Arc<AppState>>, Json(req): Json<LoginRequ
 /// id was already gone (e.g. after a hub restart).
 pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     if let Some(sid) = super::parse_cookie(&headers, USER_SESSION_COOKIE) {
-        state.user_auth.logout(&sid);
+        state.user_auth.logout(&sid).await;
     }
     let cookie = format!(
         "{name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0",

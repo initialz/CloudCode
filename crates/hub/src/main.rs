@@ -128,16 +128,27 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "orphan session cleanup failed"),
     }
+    // Sweep stale admin / webterm cookies whose TTL has lapsed. Keeps
+    // the new persistent-session tables from growing unboundedly
+    // across long uptimes + frequent re-logins.
+    match db.cleanup_expired_sessions().await {
+        Ok(n) if n > 0 => {
+            tracing::info!(n, "swept expired admin/webterm sessions");
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "expired-session cleanup failed"),
+    }
     let audit = AuditLog::open(&config.server.audit_log, db.clone())?;
     let listen = config.server.listen.clone();
 
+    let user_auth = Arc::new(UserAuth::new(db.clone()));
     let state = Arc::new(AppState {
         config,
         audit,
         db,
         registry: Arc::new(AgentRegistry::new()),
         workspaces: DashMap::new(),
-        user_auth: Arc::new(UserAuth::new()),
+        user_auth,
     });
 
     // /app/* — user-facing webterm SPA + its JSON API. Lives on the
@@ -181,7 +192,7 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         let admin_listen = state.config.admin.listen.clone();
         let admin_state = admin::AdminState {
             app: state.clone(),
-            auth: Arc::new(admin::AdminAuth::new(token_hash)),
+            auth: Arc::new(admin::AdminAuth::new(state.db.clone(), token_hash)),
             releases: Arc::new(admin::ReleasesCache::new()),
         };
         let admin_app = admin::router(admin_state);

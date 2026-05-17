@@ -25,7 +25,6 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use dashmap::DashMap;
 use serde_json::json;
 use std::sync::Arc;
 
@@ -42,35 +41,44 @@ pub struct AdminState {
     pub releases: Arc<api::ReleasesCache>,
 }
 
+/// Session TTL applied both to the cookie's Max-Age and the DB row.
+/// Operator workday-friendly, short enough that a stolen cookie
+/// doesn't grant indefinite access.
+pub const ADMIN_SESSION_TTL_SECS: i64 = 12 * 60 * 60;
+
 pub struct AdminAuth {
-    sessions: DashMap<String, ()>,
+    db: crate::db::Db,
     token_hash: String,
 }
 
 impl AdminAuth {
-    pub fn new(token_hash: String) -> Self {
-        Self {
-            sessions: DashMap::new(),
-            token_hash,
+    pub fn new(db: crate::db::Db, token_hash: String) -> Self {
+        Self { db, token_hash }
+    }
+
+    /// Verify the supplied plaintext token against the stored hash;
+    /// on success mint a fresh sid, persist it in `admin_sessions`,
+    /// and hand it back to the caller (who then sets the cookie).
+    /// Returns `None` on token-mismatch or DB error.
+    pub async fn login(&self, plaintext: &str) -> Option<String> {
+        if !auth::verify_token(plaintext, &self.token_hash) {
+            return None;
         }
-    }
-
-    pub fn login(&self, plaintext: &str) -> Option<String> {
-        if auth::verify_token(plaintext, &self.token_hash) {
-            let sid = auth::generate_session_id();
-            self.sessions.insert(sid.clone(), ());
-            Some(sid)
-        } else {
-            None
+        let sid = auth::generate_session_id();
+        let expires_at = chrono::Utc::now().timestamp() + ADMIN_SESSION_TTL_SECS;
+        if let Err(e) = self.db.insert_admin_session(&sid, expires_at).await {
+            tracing::warn!(error = %e, "could not persist admin session; user must re-login");
+            return None;
         }
+        Some(sid)
     }
 
-    pub fn is_valid(&self, sid: &str) -> bool {
-        self.sessions.contains_key(sid)
+    pub async fn is_valid(&self, sid: &str) -> bool {
+        self.db.valid_admin_session(sid).await.unwrap_or(false)
     }
 
-    pub fn logout(&self, sid: &str) {
-        self.sessions.remove(sid);
+    pub async fn logout(&self, sid: &str) {
+        let _ = self.db.delete_admin_session(sid).await;
     }
 }
 
@@ -89,7 +97,7 @@ pub fn session_cookie(headers: &HeaderMap) -> Option<String> {
 /// instead of redirecting (SPA handles redirect itself).
 async fn require_admin(State(state): State<AdminState>, req: Request, next: Next) -> Response {
     if let Some(sid) = session_cookie(req.headers()) {
-        if state.auth.is_valid(&sid) {
+        if state.auth.is_valid(&sid).await {
             return next.run(req).await;
         }
     }
