@@ -128,6 +128,44 @@ operator. Only push the release tag once they sign off.
 2. File against the PR / release in GitHub Issues.
 3. Decide hold-vs-ship: if the regression is in a code path the release explicitly touched, hold. Otherwise note it and ship.
 
+## v1.13 hub-managed workspace smoke
+
+v1.13 moves canonical workspace bytes from the agent to the hub
+(see the architecture note in `crates/hub/src/workspaces.rs`). The
+new pull / push / lock-takeover paths are tricky to walk by hand —
+they live across hub + two agents + the agent sync engine — so the
+release ships a scripted end-to-end smoke that exercises all five
+scenarios in one shot:
+
+```bash
+scripts/v1.13-smoke.sh                # build release + run all 5 CASEs
+scripts/v1.13-smoke.sh --no-build     # reuse existing release artifacts
+scripts/v1.13-smoke.sh --keep-temp    # leave the temp $CLOUDCODE_STATE_DIR for triage
+scripts/v1.13-smoke.sh --rebuild-ui   # also rebuild webterm + admin-ui (rare)
+```
+
+What it covers:
+
+1. **CASE 1 — create workspace + seed**: `CreateWorkspace` over `/v1/pty/ws`, then a direct write of `README.md` under `<hub-state>/hub/workspaces/alice/demo/`. Confirms `ListWorkspaces` sees it.
+2. **CASE 2 — initial pull**: agent-A `OpenSession`. Asserts that `<agent-A>/workspaces/alice/demo/README.md` materialises with the canonical content.
+3. **CASE 3 — real-time push**: agent-side append + new file + delete. Asserts the hub canonical copy mirrors each change within ~2 s (`COALESCE_WINDOW = 100ms` + `SCAN_INTERVAL = 500ms` backstop).
+4. **CASE 4 — live force-take**: agent-B `OpenSession force=true` against agent-A's lock. Asserts (a) lock moves to B in `workspaces.locked_by_agent`, (b) agent-A's local copy gets rm-rf'd via the live `WorkspaceCleanup` the hub pushes (not just the queued one).
+5. **CASE 5 — offline force-take + Welcome drain**: SIGSTOP agent-B (so the hub still sees it as the lock holder), agent-C force-takes (queues a pending cleanup in `pending_workspace_cleanups`), kill agent-B, restart agent-B with a pre-seeded stale local copy. Asserts the agent drains the cleanup on its Welcome frame and the row is gone afterwards.
+
+When to run:
+
+- **MAJOR / MINOR releases** that touch any file under `crates/hub/src/{workspaces,pty_session,ws_handler}.rs`, `crates/agent/src/sync/`, or the v1.13 wire variants in `tunnel.rs` — required.
+- **PATCH releases** whose surface area doesn't touch sync — skip.
+- After bumping `tokio-tungstenite`, `notify`, or the sqlx feature set — run, since these underpin the pull / watcher / push-queue plumbing.
+
+The script writes its HTML report to `docs/test-reports/<date>-v<tag>-hub-managed-workspace.html`. Push the tag only after that report has a PASS banner.
+
+Implementation notes worth knowing:
+
+- The smoke uses `cloudcode-smoke-ws` (new in v1.13 — `crates/smoke-ws/`), a single-shot WS helper that speaks the user-facing PTY protocol. It's intentionally not on the release manifest; it's a test artifact only.
+- macOS's `/var → /private/var` symlink trips up `notify::RecommendedWatcher` (the watcher canonicalises the root and then `strip_prefix` mis-matches against `/var/...` event paths). The script canonicalises `$TMP` via `cd … && pwd -P` so agent.toml's `workspace_root` is in the same form FSEvents emits.
+- The script SIGSTOPs an agent in CASE 5 rather than SIGKILLing it, because the hub auto-releases workspace locks on TCP disconnect (`release_all_workspace_locks_for_agent` in `ws_handler.rs`). Without the freeze the force-take path would see the workspace as unlocked and skip the pending-cleanup queue.
+
 ## Notes specific to v1.11.0
 
 This release adds hub self-update. The first upgrade from v1.10.x → v1.11.0 must be done **manually** (the still-running v1.10.x daemon isn't yet a supervisor). Subsequent hub upgrades go through the admin UI button. Confirm this caveat is in the release notes.

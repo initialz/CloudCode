@@ -190,11 +190,36 @@ where
                     });
                 }
                 Ok(frame) => {
-                    let mgr = state.manager.clone();
-                    let send = tx.clone();
-                    tokio::spawn(async move {
-                        mgr.handle(frame, send).await;
-                    });
+                    // v1.13 pull frames must be processed in arrival order
+                    // for the pull-state bookkeeping inside
+                    // `workspace_pull_start` / `workspace_file` to be sound:
+                    // `WorkspaceFile` consults the `pulls` map that
+                    // `WorkspacePullStart` inserts into, and they arrive
+                    // back-to-back on the wire. `tokio::spawn` here would
+                    // let the runtime schedule them in either order, so
+                    // a single-frame pull (file_count == 1, is_last=true
+                    // on the very next frame) can race the `pulls.insert`
+                    // and silently drop the file. Handle these inline;
+                    // they're brief and run on the same task as the read
+                    // loop, which only ever has one pull in flight per
+                    // session at a time. Everything else still spawns so
+                    // PtyOpen-and-friends can't head-of-line block each
+                    // other.
+                    match &frame {
+                        crate::tunnel::ServerMsg::WorkspacePullStart { .. }
+                        | crate::tunnel::ServerMsg::WorkspaceFile { .. }
+                        | crate::tunnel::ServerMsg::WorkspaceFileAck { .. }
+                        | crate::tunnel::ServerMsg::WorkspaceCleanup { .. } => {
+                            state.manager.clone().handle(frame, tx.clone()).await;
+                        }
+                        _ => {
+                            let mgr = state.manager.clone();
+                            let send = tx.clone();
+                            tokio::spawn(async move {
+                                mgr.handle(frame, send).await;
+                            });
+                        }
+                    }
                 }
                 Err(e) => tracing::warn!(error = %e, "bad text frame from hub"),
             },

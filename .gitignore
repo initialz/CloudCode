@@ -6,3 +6,6 @@ Cargo.lock.bak
 hub.toml
 config.toml
 audit.jsonl
+
+# Claude Code 本地 agent 定义、scheduled tasks 锁等用户机状态
+.claude/

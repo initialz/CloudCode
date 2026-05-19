@@ -1,0 +1,26 @@
+[package]
+name = "cloudcode-smoke-ws"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Test-only helper used by scripts/v1.13-smoke.sh. Not shipped to users.
+# Speaks both the user-facing PTY WS protocol (/v1/pty/ws) and the
+# /api/login HTTP login flow so a shell script can drive end-to-end
+# scenarios without depending on websocat / wscat being installed.
+
+[[bin]]
+name = "cloudcode-smoke-ws"
+path = "src/main.rs"
+
+[dependencies]
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+futures.workspace = true
+rustls.workspace = true
+url.workspace = true

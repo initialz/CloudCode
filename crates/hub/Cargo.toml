@@ -42,3 +42,21 @@ sha2 = "0.10"
 signal-hook = "0.3"
 rust-embed = { version = "8", features = ["debug-embed"] }
 cloudcode-daemon = { path = "../daemon" }
+
+[dev-dependencies]
+# Integration tests under `tests/` need WS + a scratch dir + the same
+# serde stack the hub already uses. Versions match the workspace deps
+# (or what the lockfile already has transitively) so we don't pull in
+# anything new.
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_bytes.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+argon2.workspace = true
+rand.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+tempfile = "3"

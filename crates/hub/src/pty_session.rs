@@ -788,6 +788,40 @@ where
             {
                 tracing::warn!(error = %e, "queue_pending_cleanup failed");
             }
+            // If the old holder is currently online, push the cleanup
+            // through its live WS as well. Otherwise the rm-rf only
+            // happens on the agent's next reconnect — fine for a dead
+            // agent, but for a still-online agent the cleanup would
+            // race against any sync pushes the agent is still trying
+            // to send for the lost workspace. The queue + live-send
+            // are complementary: the live send is best-effort (the WS
+            // may have died between this check and our send) and the
+            // db row covers the dropped-frame case via Welcome drain.
+            if let Some(holder_conn) = ctx.state.registry.get(holder) {
+                let items = vec![(ctx.account_name.clone(), workspace.clone())];
+                if let Err(e) = holder_conn
+                    .send(ServerMsg::WorkspaceCleanup { items })
+                    .await
+                {
+                    tracing::warn!(
+                        agent = %holder,
+                        error = %e,
+                        "live WorkspaceCleanup send failed; will retry on agent reconnect via pending row"
+                    );
+                } else {
+                    // Live delivery confirmed at the channel layer.
+                    // The pending row stays in place until the agent
+                    // actually drains it on its next Welcome — defence
+                    // against the WS dying between `send().await`
+                    // succeeding and the agent applying the cleanup.
+                    tracing::info!(
+                        agent = %holder,
+                        account = %ctx.account_name,
+                        workspace = %workspace,
+                        "pushed live WorkspaceCleanup to online previous holder"
+                    );
+                }
+            }
             ctx.state.audit.write(AuditEvent {
                 account: Some(ctx.account_name.clone()),
                 agent: Some(agent.clone()),

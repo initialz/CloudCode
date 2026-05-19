@@ -353,7 +353,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cloudcode-agent"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "cloudcode-client"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -414,7 +414,7 @@ dependencies = [
 
 [[package]]
 name = "cloudcode-daemon"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -424,7 +424,7 @@ dependencies = [
 
 [[package]]
 name = "cloudcode-hub"
-version = "1.12.0"
+version = "1.13.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -449,8 +449,10 @@ dependencies = [
  "signal-hook",
  "sqlx",
  "tar",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-tungstenite",
  "toml",
  "toml_edit",
  "tower",
@@ -458,6 +460,21 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "cloudcode-smoke-ws"
+version = "1.13.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "futures",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-tungstenite",
+ "url",
 ]
 
 [[package]]

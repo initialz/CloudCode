@@ -90,6 +90,15 @@ impl WorkspaceWatcher {
         filter: IgnoreFilter,
         event_tx: mpsc::Sender<WatchEvent>,
     ) -> Result<Self> {
+        // Canonicalize the watch root before handing it to notify. On
+        // macOS `/var` is a symlink to `/private/var`, and `tmp` /
+        // `etc` follow the same pattern; FSEvents emits paths in
+        // canonical form (`/private/var/...`) while the caller may
+        // pass us the symlink-side form. The bridge task's
+        // `strip_prefix(root)` only works when both sides agree, so
+        // canonicalize once here and use that throughout.
+        let root = std::fs::canonicalize(&root)
+            .with_context(|| format!("canonicalize workspace dir {}", root.display()))?;
         // Bridge: notify -> sync mpsc -> tokio task -> filtered mpsc.
         let (raw_tx, raw_rx) = std::sync::mpsc::channel::<(PathBuf, RawKind, bool)>();
 
