@@ -53,6 +53,13 @@ pub enum ClientMsg {
         /// Used by the hub to pick the right release asset on self-update.
         #[serde(default)]
         target_triple: Option<String>,
+        /// Names of the tools this agent is configured to spawn
+        /// (auto-detected from PATH unless explicitly disabled in
+        /// `agent.toml`). Hub forwards this list to clients so the
+        /// "Open with X" / Split menus only offer tools the agent
+        /// will actually launch. Empty for pre-v1.13 agents.
+        #[serde(default)]
+        tools: Vec<String>,
     },
     Pong,
 

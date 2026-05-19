@@ -226,8 +226,11 @@ export type AgentRowDto = {
   name: string;
   online: boolean;
   allowed_account_count: number;
-  version: string | null;
-  latest_version: string | null;
+  version?: string | null;
+  latest_version?: string | null;
+  /** Tools the agent reports as available. Empty for offline or
+   *  pre-v1.13 agents. */
+  tools: string[];
 };
 
 export type ReleaseDto = { tag: string; date: string };

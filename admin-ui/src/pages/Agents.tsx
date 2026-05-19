@@ -212,6 +212,7 @@ export function Agents() {
                 <th className="px-3 py-2 text-left">Name</th>
                 <th className="px-3 py-2 text-left">Status</th>
                 <th className="px-3 py-2 text-left">Version</th>
+                <th className="px-3 py-2 text-left">Tools</th>
                 <th className="px-3 py-2 text-left">Accounts</th>
                 <th className="px-3 py-2 text-right">Actions</th>
               </tr>
@@ -219,7 +220,7 @@ export function Agents() {
             <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800 bg-white dark:bg-zinc-900">
               {agents.length === 0 ? (
                 <tr>
-                  <td colSpan={5} className="px-3 py-6 text-center text-zinc-500">
+                  <td colSpan={6} className="px-3 py-6 text-center text-zinc-500">
                     No agents have ever connected to this hub yet.
                   </td>
                 </tr>
@@ -292,6 +293,22 @@ export function Agents() {
                       </td>
                       <td className="px-3 py-2">
                         <span className="font-mono text-xs">{a.version ?? '—'}</span>
+                      </td>
+                      <td className="px-3 py-2">
+                        {a.tools && a.tools.length > 0 ? (
+                          <div className="flex flex-wrap gap-1">
+                            {a.tools.map((tool) => (
+                              <span
+                                key={tool}
+                                className="font-mono text-xs bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 px-1.5 py-0.5 rounded"
+                              >
+                                {tool}
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="text-zinc-400">—</span>
+                        )}
                       </td>
                       <td className="px-3 py-2">
                         <button

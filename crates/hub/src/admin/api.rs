@@ -498,6 +498,11 @@ struct AgentRowDto {
     /// call. Used by the admin UI to surface an "update available" badge.
     #[serde(skip_serializing_if = "Option::is_none")]
     latest_version: Option<String>,
+    /// Tools this agent reported in its hello frame (after auto-detect
+    /// and `[tools.<name>] disabled` filtering). Empty for offline
+    /// agents or pre-v1.13 builds that don't carry the field.
+    #[serde(default)]
+    tools: Vec<String>,
 }
 
 pub async fn agents_list(State(state): State<AdminState>) -> Response {
@@ -528,21 +533,16 @@ pub async fn agents_list(State(state): State<AdminState>) -> Response {
         .map(|n| {
             let allowed_account_count = count_map.get(&n).copied().unwrap_or(0);
             let is_online = online.contains(&n);
-            let version = if is_online {
-                state
-                    .app
-                    .registry
-                    .get(&n)
-                    .and_then(|c| c.agent_version.clone())
-            } else {
-                None
-            };
+            let conn = if is_online { state.app.registry.get(&n) } else { None };
+            let version = conn.as_ref().and_then(|c| c.agent_version.clone());
+            let tools = conn.as_ref().map(|c| c.tools.clone()).unwrap_or_default();
             AgentRowDto {
                 name: n,
                 online: is_online,
                 allowed_account_count,
                 version,
                 latest_version: latest_version.clone(),
+                tools,
             }
         })
         .collect();

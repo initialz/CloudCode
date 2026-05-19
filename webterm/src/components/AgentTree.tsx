@@ -3,7 +3,8 @@
 
 import { useState, useEffect } from 'react';
 import type { AgentItem, WorkspaceItem } from '@/lib/wire';
-import { KNOWN_TOOLS } from '@/lib/tools';
+import { toolsForAgent } from '@/lib/tools';
+import type { Tool } from '@/lib/tools';
 
 type WorkspaceState =
   | { status: 'idle' }
@@ -129,50 +130,70 @@ export default function AgentTree({
       )}
 
       {/* Workspace right-click context menu */}
-      {wsMenu && (
-        <div
-          className="fixed z-50 min-w-[10rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
-          style={{ left: wsMenu.x, top: wsMenu.y }}
-        >
-          {KNOWN_TOOLS.map((tool) => (
+      {wsMenu && (() => {
+        const wsMenuAgent = agents.find((a) => a.name === wsMenu.agent);
+        const wsMenuTools = toolsForAgent(wsMenuAgent?.tools);
+        const wsMenuFirstTool: Tool | undefined = wsMenuTools[0];
+        return (
+          <div
+            className="fixed z-50 min-w-[10rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
+            style={{ left: wsMenu.x, top: wsMenu.y }}
+          >
+            {wsMenuTools.length > 0 ? (
+              wsMenuTools.map((tool) => (
+                <button
+                  key={tool}
+                  type="button"
+                  onClick={() => {
+                    const { agent, workspace } = wsMenu;
+                    closeAllMenus();
+                    onOpenWorkspace(agent, workspace, tool);
+                  }}
+                  className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
+                >
+                  Open with {tool}
+                </button>
+              ))
+            ) : (
+              <button
+                type="button"
+                onClick={() => {
+                  const { agent, workspace } = wsMenu;
+                  closeAllMenus();
+                  onOpenWorkspace(agent, workspace);
+                }}
+                className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
+                title={wsMenuFirstTool ? `Will run ${wsMenuFirstTool}` : undefined}
+              >
+                Open
+              </button>
+            )}
+            <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
             <button
-              key={tool}
               type="button"
               onClick={() => {
                 const { agent, workspace } = wsMenu;
                 closeAllMenus();
-                onOpenWorkspace(agent, workspace, tool);
+                onResetWorkspace(agent, workspace);
               }}
               className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
             >
-              Open with {tool}
+              Reset
             </button>
-          ))}
-          <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
-          <button
-            type="button"
-            onClick={() => {
-              const { agent, workspace } = wsMenu;
-              closeAllMenus();
-              onResetWorkspace(agent, workspace);
-            }}
-            className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
-          >
-            Reset
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              const { agent, workspace } = wsMenu;
-              closeAllMenus();
-              onDeleteWorkspace(agent, workspace);
-            }}
-            className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-red-600 dark:text-red-400"
-          >
-            Delete
-          </button>
-        </div>
-      )}
+            <button
+              type="button"
+              onClick={() => {
+                const { agent, workspace } = wsMenu;
+                closeAllMenus();
+                onDeleteWorkspace(agent, workspace);
+              }}
+              className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-red-600 dark:text-red-400"
+            >
+              Delete
+            </button>
+          </div>
+        );
+      })()}
 
       {agents.map((agent) => {
         const isExpanded = expanded.has(agent.name);
@@ -225,10 +246,12 @@ export default function AgentTree({
                 {wsState.status === 'loaded' &&
                   wsState.items.map((ws) => {
                     const key = `${agent.name}::${ws.name}`;
+                    const agentTools = toolsForAgent(agent.tools);
                     return (
                       <WorkspaceRow
                         key={ws.name}
                         workspace={ws}
+                        agentTools={agentTools}
                         isLive={openTabKeys.has(key)}
                         isActive={activeTabKey === key}
                         onOpen={() => onOpenWorkspace(agent.name, ws.name)}
@@ -281,6 +304,7 @@ function WorkspaceBadge({ ws, isLive }: { ws: WorkspaceItem; isLive: boolean }) 
 
 function WorkspaceRow({
   workspace,
+  agentTools,
   isLive,
   isActive,
   onOpen,
@@ -290,6 +314,8 @@ function WorkspaceRow({
   onContextMenu,
 }: {
   workspace: WorkspaceItem;
+  /** Tools available on the agent that owns this workspace. */
+  agentTools: Tool[];
   /** This workspace has an open tab somewhere (= "live"). */
   isLive: boolean;
   /** This workspace's tab is the one currently in the right pane. */
@@ -302,6 +328,11 @@ function WorkspaceRow({
 }) {
   const [dropdownOpen, setDropdownOpen] = useState(false);
   const [dropdownPos, setDropdownPos] = useState<{ x: number; y: number } | null>(null);
+
+  // Only show the tool-picker chevron when there are 2+ tools to choose from.
+  // With a single tool (or zero, which falls back to the first KNOWN_TOOL) the
+  // "Open" click already does the right thing — no picker needed.
+  const showChevron = agentTools.length > 1;
 
   function handleChevronClick(e: React.MouseEvent) {
     e.stopPropagation();
@@ -316,8 +347,8 @@ function WorkspaceRow({
 
   return (
     <>
-      {/* Inline dropdown (hover chevron) */}
-      {dropdownOpen && dropdownPos && (
+      {/* Inline dropdown (hover chevron) — only rendered when multiple tools */}
+      {showChevron && dropdownOpen && dropdownPos && (
         <>
           <div
             className="fixed inset-0 z-40"
@@ -328,7 +359,7 @@ function WorkspaceRow({
             className="fixed z-50 min-w-[10rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
             style={{ left: dropdownPos.x, top: dropdownPos.y }}
           >
-            {KNOWN_TOOLS.map((tool) => (
+            {agentTools.map((tool) => (
               <button
                 key={tool}
                 type="button"
@@ -362,19 +393,26 @@ function WorkspaceRow({
         <span className="w-3 text-center shrink-0">
           <WorkspaceBadge ws={workspace} isLive={isLive} />
         </span>
-        <span className="flex-1 truncate">{workspace.name}</span>
+        <span
+          className="flex-1 truncate"
+          title={agentTools.length === 1 ? `Will run ${agentTools[0]}` : undefined}
+        >
+          {workspace.name}
+        </span>
 
         {/* Action buttons — hover-visible */}
         <span className="shrink-0 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-          {/* Tool selector chevron */}
-          <button
-            onClick={handleChevronClick}
-            className="p-0.5 rounded text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
-            title="Open with tool..."
-            aria-label={`Open ${workspace.name} with specific tool`}
-          >
-            <ChevronDownIcon />
-          </button>
+          {/* Tool selector chevron — only shown when multiple tools are available */}
+          {showChevron && (
+            <button
+              onClick={handleChevronClick}
+              className="p-0.5 rounded text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
+              title="Open with tool..."
+              aria-label={`Open ${workspace.name} with specific tool`}
+            >
+              <ChevronDownIcon />
+            </button>
+          )}
           <button
             onClick={(e) => {
               e.stopPropagation();

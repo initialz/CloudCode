@@ -52,12 +52,18 @@ async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
         .map_err(|e| RunError::Transient(format!("connect: {}", e)))?;
     let (mut sink, mut stream) = ws.split();
 
+    // Report which tools we'll actually be able to spawn — so the
+    // hub can tell clients to only offer those options. Sorted for a
+    // stable wire shape; pre-v1.13 agents simply didn't send this.
+    let mut tools: Vec<String> = state.config.tools.tools.keys().cloned().collect();
+    tools.sort();
     let hello = ClientMsg::Hello {
         name: state.name.clone(),
         secret: state.config.auth.registration_token.clone(),
         version: PROTOCOL_VERSION.into(),
         agent_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         target_triple: Some(crate::update::target_triple().to_string()),
+        tools,
     };
     let hello_json = serde_json::to_string(&hello)
         .map_err(|e| RunError::Transient(format!("encode hello: {}", e)))?;

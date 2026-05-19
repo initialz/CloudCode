@@ -112,6 +112,12 @@ pub struct ToolConfig {
     /// Extra args appended after `executable` on every spawn.
     #[serde(default)]
     pub extra_args: Vec<String>,
+    /// Opt out of this tool even if it's discoverable on PATH. Lets
+    /// an operator say "I have codex installed for unrelated reasons
+    /// but I don't want cloudcode to expose it". Off (= keep the
+    /// tool) by default.
+    #[serde(default)]
+    pub disabled: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -203,29 +209,199 @@ impl Default for RecordingConfig {
     }
 }
 
+/// Tools the agent will probe for on PATH at startup when there's no
+/// explicit `[tools.<name>]` block configured for them. Hardcoded
+/// short-list — extend here when adding a new tool to cloudcode's
+/// supported surface, and update webterm's `KNOWN_TOOLS` to match.
+pub const KNOWN_TOOL_NAMES: &[(&str, &str)] = &[
+    // (executable / tool name, default resume command)
+    ("claude", "claude --continue"),
+    // codex doesn't have a resume flag yet; leave empty so the wrapper
+    // always relaunches fresh.
+    ("codex", ""),
+];
+
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let s = std::fs::read_to_string(path)?;
         let mut cfg: Config = toml::from_str(&s)?;
-        // Back-compat: pre-v1.10 agent.toml had only [claude] and no
-        // [tools] block. Synthesise a default `claude` tool from the
-        // legacy section so the rest of the agent can speak the new
-        // shape uniformly.
-        if cfg.tools.tools.is_empty() {
-            cfg.tools.tools.insert(
+        cfg.resolve_tools(|name| which::which(name).is_ok());
+        Ok(cfg)
+    }
+
+    /// Two-phase tool resolution, split out so unit tests can pass a
+    /// fake `which`-style probe in:
+    ///
+    /// 1. Back-compat: pre-v1.10 agent.toml had only `[claude]` and no
+    ///    `[tools]` block. Synthesise a `claude` tool from the legacy
+    ///    section so the rest of the agent speaks the new shape
+    ///    uniformly.
+    /// 2. Auto-detect: for each tool in `KNOWN_TOOL_NAMES` that isn't
+    ///    already configured, probe PATH via `probe(name)`. Found =>
+    ///    synthesise a sane default entry.
+    /// 3. Drop any tool whose config (explicit or auto) has
+    ///    `disabled = true` so a single boolean flips a tool off
+    ///    without re-running the install.
+    /// 4. Resolve the default tool: keep an explicit setting if it
+    ///    points at a still-live tool, else prefer "claude", else
+    ///    the first remaining tool alphabetically.
+    pub fn resolve_tools<F: FnMut(&str) -> bool>(&mut self, mut probe: F) {
+        if self.tools.tools.is_empty() {
+            self.tools.tools.insert(
                 "claude".to_string(),
                 ToolConfig {
-                    executable: cfg.claude.executable.clone(),
-                    // Match the previous hard-coded wrapper behaviour
-                    // (which always ran `claude --continue` when a saved
-                    // jsonl existed).
+                    executable: self.claude.executable.clone(),
                     resume_command: "claude --continue".into(),
-                    extra_args: cfg.claude.extra_args.clone(),
+                    extra_args: self.claude.extra_args.clone(),
+                    disabled: false,
                 },
             );
-            // If `[tools].default` wasn't set we already defaulted to
-            // "claude" via default_tool, so nothing to do here.
         }
-        Ok(cfg)
+        for (name, default_resume) in KNOWN_TOOL_NAMES {
+            if self.tools.tools.contains_key(*name) {
+                continue;
+            }
+            if probe(name) {
+                self.tools.tools.insert(
+                    (*name).to_string(),
+                    ToolConfig {
+                        executable: (*name).to_string(),
+                        resume_command: (*default_resume).to_string(),
+                        extra_args: Vec::new(),
+                        disabled: false,
+                    },
+                );
+            }
+        }
+        self.tools.tools.retain(|_, t| !t.disabled);
+        let explicit_ok = !self.tools.default.is_empty()
+            && self.tools.tools.contains_key(&self.tools.default);
+        if !explicit_ok {
+            self.tools.default = if self.tools.tools.contains_key("claude") {
+                "claude".to_string()
+            } else {
+                let mut names: Vec<&String> = self.tools.tools.keys().collect();
+                names.sort();
+                names.first().map(|s| (*s).clone()).unwrap_or_default()
+            };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn cfg_from(toml_str: &str) -> Config {
+        toml::from_str(toml_str).expect("parse")
+    }
+
+    /// Probe factory: returns a closure that says "yes" for tool names
+    /// in `available`, "no" otherwise — mimicking `which::which`.
+    fn probe_with(available: &[&str]) -> impl FnMut(&str) -> bool {
+        let set: HashSet<String> = available.iter().map(|s| s.to_string()).collect();
+        move |name: &str| set.contains(name)
+    }
+
+    const MIN_CONFIG: &str = r#"
+[hub]
+url = "wss://example.com/v1/agent/ws"
+
+[auth]
+registration_token = "ag_test"
+"#;
+
+    #[test]
+    fn auto_detects_codex_when_on_path_and_no_tools_block() {
+        let mut cfg = cfg_from(MIN_CONFIG);
+        cfg.resolve_tools(probe_with(&["claude", "codex"]));
+        let mut names: Vec<&String> = cfg.tools.tools.keys().collect();
+        names.sort();
+        assert_eq!(names, vec!["claude", "codex"]);
+        assert_eq!(cfg.tools.tools["codex"].executable, "codex");
+        assert_eq!(cfg.tools.tools["codex"].resume_command, "");
+        assert_eq!(cfg.tools.default, "claude");
+    }
+
+    #[test]
+    fn codex_only_when_claude_disabled() {
+        let mut cfg = cfg_from(MIN_CONFIG);
+        cfg.tools.tools.insert(
+            "claude".to_string(),
+            ToolConfig {
+                executable: "claude".into(),
+                resume_command: String::new(),
+                extra_args: Vec::new(),
+                disabled: true,
+            },
+        );
+        cfg.resolve_tools(probe_with(&["codex"]));
+        assert!(!cfg.tools.tools.contains_key("claude"));
+        assert!(cfg.tools.tools.contains_key("codex"));
+        assert_eq!(cfg.tools.default, "codex");
+    }
+
+    #[test]
+    fn explicit_tool_config_wins_over_autodetect() {
+        let cfg_text = r#"
+[hub]
+url = "wss://example.com/v1/agent/ws"
+
+[auth]
+registration_token = "ag_test"
+
+[tools]
+default = "claude"
+
+[tools.codex]
+executable = "/opt/custom/codex"
+resume_command = ""
+extra_args = ["--verbose"]
+"#;
+        let mut cfg = cfg_from(cfg_text);
+        cfg.resolve_tools(probe_with(&["claude", "codex"]));
+        assert_eq!(cfg.tools.tools["codex"].executable, "/opt/custom/codex");
+        assert_eq!(cfg.tools.tools["codex"].extra_args, vec!["--verbose"]);
+    }
+
+    #[test]
+    fn disabled_flag_filters_tool_even_when_on_path() {
+        let cfg_text = r#"
+[hub]
+url = "wss://example.com/v1/agent/ws"
+
+[auth]
+registration_token = "ag_test"
+
+[tools.codex]
+executable = "codex"
+disabled = true
+"#;
+        let mut cfg = cfg_from(cfg_text);
+        cfg.resolve_tools(probe_with(&["claude", "codex"]));
+        assert!(!cfg.tools.tools.contains_key("codex"));
+        assert!(cfg.tools.tools.contains_key("claude"));
+    }
+
+    #[test]
+    fn explicit_default_pointing_at_filtered_tool_falls_back() {
+        let cfg_text = r#"
+[hub]
+url = "wss://example.com/v1/agent/ws"
+
+[auth]
+registration_token = "ag_test"
+
+[tools]
+default = "codex"
+
+[tools.codex]
+executable = "codex"
+disabled = true
+"#;
+        let mut cfg = cfg_from(cfg_text);
+        cfg.resolve_tools(probe_with(&["claude", "codex"]));
+        assert_eq!(cfg.tools.default, "claude");
     }
 }

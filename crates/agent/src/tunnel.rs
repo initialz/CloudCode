@@ -53,6 +53,14 @@ pub enum ClientMsg {
         /// Used by the hub to pick the right release asset on self-update.
         #[serde(default)]
         target_triple: Option<String>,
+        /// Names of the tools this agent is configured to spawn
+        /// (after auto-detect + `[tools.<name>] disabled` filtering).
+        /// Clients use this to hide unavailable choices from the
+        /// "Open with X" / Split menus. Empty for pre-v1.13 agents;
+        /// hub treats that as "unknown, fall back to client's
+        /// hard-coded list".
+        #[serde(default)]
+        tools: Vec<String>,
     },
     Pong,
 

@@ -42,6 +42,7 @@ impl AgentRegistry {
         name: String,
         agent_version: Option<String>,
         target_triple: Option<String>,
+        tools: Vec<String>,
         send: mpsc::Sender<OutgoingFrame>,
     ) -> Option<Arc<AgentConn>> {
         match self.agents.entry(name.clone()) {
@@ -51,6 +52,7 @@ impl AgentRegistry {
                     name,
                     agent_version,
                     target_triple,
+                    tools,
                     id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
                     send,
                     sessions: DashMap::new(),
@@ -112,6 +114,11 @@ pub struct AgentConn {
     /// Rust target triple of the agent binary, used to pick the right
     /// release asset on self-update.
     pub target_triple: Option<String>,
+    /// Tools this agent reported as available (after its own
+    /// auto-detect + disabled filtering). Empty for pre-v1.13 agents
+    /// that don't carry the field — callers should treat empty as
+    /// "unknown, don't filter the SPA's menu".
+    pub tools: Vec<String>,
     id: u64,
     send: mpsc::Sender<OutgoingFrame>,
     /// Active PTY sessions hosted by this agent, keyed by session_id.

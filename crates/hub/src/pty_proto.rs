@@ -159,6 +159,13 @@ pub struct AgentInfo {
     pub name: String,
     #[serde(default)]
     pub current: bool,
+    /// Tools this agent can actually launch (auto-detected from PATH
+    /// on the agent host, minus anything `agent.toml [tools.<name>]
+    /// disabled = true` opted out of). Empty if the agent is
+    /// pre-v1.13 — clients should treat that as "unknown" and fall
+    /// back to their built-in tool list.
+    #[serde(default)]
+    pub tools: Vec<String>,
 }
 
 /// Workspace status row carried in HubToClient::WorkspaceList.

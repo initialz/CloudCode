@@ -7,3 +7,12 @@ export const KNOWN_TOOLS = ['claude', 'codex'] as const;
 export type Tool = (typeof KNOWN_TOOLS)[number];
 
 export const DEFAULT_TOOL: Tool = 'claude';
+
+/** Tools to show for a given agent. If the agent reported a list,
+ *  use it (intersected with KNOWN_TOOLS so we only render tools
+ *  the SPA knows how to label / pass through). Empty/missing list
+ *  = pre-v1.13 agent, fall back to KNOWN_TOOLS. */
+export function toolsForAgent(reported: readonly string[] | undefined): Tool[] {
+  if (!reported || reported.length === 0) return [...KNOWN_TOOLS];
+  return KNOWN_TOOLS.filter((t) => reported.includes(t));
+}

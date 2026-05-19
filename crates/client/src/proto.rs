@@ -118,6 +118,10 @@ pub struct AgentInfo {
     pub name: String,
     #[serde(default)]
     pub current: bool,
+    /// Tools the agent will spawn, reported via its Hello frame.
+    /// Mirror of `pty_proto::AgentInfo::tools` — see that doc.
+    #[serde(default)]
+    pub tools: Vec<String>,
 }
 
 /// Per-workspace status badge data, returned alongside the workspace

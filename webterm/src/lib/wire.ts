@@ -32,7 +32,15 @@ export type ClientMsg =
 
 // ── Hub → Client ────────────────────────────────────────────────────────────
 
-export type AgentItem = { name: string; current: boolean };
+export type AgentItem = {
+  name: string;
+  current: boolean;
+  /** Tools this agent reports as available. Empty when the agent
+   *  is pre-v1.13 and didn't send the field; callers should treat
+   *  that as "unknown, fall back to KNOWN_TOOLS" so we don't lock
+   *  old agents out of every tool option. */
+  tools: string[];
+};
 export type WorkspaceItem = { name: string; tmux_alive: boolean; has_client: boolean };
 
 export type HubMsg =

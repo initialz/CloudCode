@@ -33,7 +33,7 @@ import {
   type Preferences,
 } from '@/lib/preferences';
 import type { Tool } from '@/lib/tools';
-import { DEFAULT_TOOL, KNOWN_TOOLS } from '@/lib/tools';
+import { DEFAULT_TOOL, KNOWN_TOOLS, toolsForAgent } from '@/lib/tools';
 import Sidebar from '@/components/Sidebar';
 import TabBar from '@/components/TabBar';
 import SettingsDialog from '@/components/SettingsDialog';
@@ -817,6 +817,16 @@ export default function Workbench() {
   const activeTab = tabs.find((t) => t.id === activeTabId) ?? null;
   const activeTabKey = activeTab ? tabKey(activeTab.agent, activeTab.workspace) : null;
 
+  // Tools available for the active tab's agent. If the agent is offline or
+  // not yet in the list we fall back to KNOWN_TOOLS — safest option so the
+  // Split button stays available on pre-v1.13 agents that don't send tools.
+  const activeTabAgentItem = activeTab
+    ? agents.find((a) => a.name === activeTab.agent)
+    : undefined;
+  const toolsForActiveTab: Tool[] = activeTabAgentItem
+    ? toolsForAgent(activeTabAgentItem.tools)
+    : [...KNOWN_TOOLS];
+
   // ── Render ────────────────────────────────────────────────────────────────
 
   if (authLoading) {
@@ -858,6 +868,7 @@ export default function Workbench() {
           onClose={closeTab}
           onSplit={handleSplit}
           onChangeLayout={handleChangeLayout}
+          toolsForActiveTab={toolsForActiveTab}
         />
 
         {/* Terminal containers — all rendered, visibility toggled via class */}

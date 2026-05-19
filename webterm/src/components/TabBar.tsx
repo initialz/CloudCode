@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import type { Tab } from '@/lib/tabs';
 import { tabLabel } from '@/lib/tabs';
-import { KNOWN_TOOLS } from '@/lib/tools';
+import type { Tool } from '@/lib/tools';
 import type { PaneLayout, SplitDirection } from '@/lib/wire';
 
 type Props = {
@@ -13,6 +13,9 @@ type Props = {
   onClose: (id: string) => void;
   onSplit: (tabId: string, tool: string, direction: SplitDirection) => void;
   onChangeLayout: (tabId: string, layout: PaneLayout) => void;
+  /** Tools available for the active tab's agent. When empty, the Split
+   *  button is hidden — there is nothing meaningful to split into. */
+  toolsForActiveTab: Tool[];
 };
 
 // Each direction in the secondary flyout. Keeping these as data instead
@@ -35,6 +38,7 @@ export default function TabBar({
   onClose,
   onSplit,
   onChangeLayout,
+  toolsForActiveTab,
 }: Props) {
   const [splitDropdownTabId, setSplitDropdownTabId] = useState<string | null>(null);
   const [splitDropdownPos, setSplitDropdownPos] = useState<{ x: number; y: number } | null>(null);
@@ -99,7 +103,7 @@ export default function TabBar({
             style={{ left: splitDropdownPos.x, top: splitDropdownPos.y }}
             onMouseLeave={() => setHoveredTool(null)}
           >
-            {KNOWN_TOOLS.map((tool) => (
+            {toolsForActiveTab.map((tool) => (
               <div
                 key={tool}
                 className="relative"
@@ -203,16 +207,19 @@ export default function TabBar({
               {/* Split + Layout buttons — only on active tab, left of close */}
               {isActive && (
                 <>
-                  <button
-                    className="shrink-0 rounded p-0.5 opacity-60 hover:opacity-100 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
-                    onClick={(e) => handleSplitClick(e, tab.id)}
-                    aria-label={`Split ${tabLabel(tab)}`}
-                    title="Split pane"
-                  >
-                    <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-                      <path d="M5 1v8M1 5h8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-                    </svg>
-                  </button>
+                  {/* Split button is hidden when the agent has no known tools */}
+                  {toolsForActiveTab.length > 0 && (
+                    <button
+                      className="shrink-0 rounded p-0.5 opacity-60 hover:opacity-100 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
+                      onClick={(e) => handleSplitClick(e, tab.id)}
+                      aria-label={`Split ${tabLabel(tab)}`}
+                      title="Split pane"
+                    >
+                      <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+                        <path d="M5 1v8M1 5h8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+                      </svg>
+                    </button>
+                  )}
                   <button
                     className="shrink-0 rounded p-0.5 opacity-60 hover:opacity-100 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
                     onClick={(e) => handleLayoutClick(e, tab.id)}

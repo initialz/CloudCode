@@ -385,9 +385,16 @@ where
                 if !allowed {
                     continue;
                 }
+                let tools = ctx
+                    .state
+                    .registry
+                    .get(&n)
+                    .map(|c| c.tools.clone())
+                    .unwrap_or_default();
                 items.push(AgentInfo {
                     current: current.as_deref() == Some(&n),
                     name: n,
+                    tools,
                 });
             }
             let _ = send_client(sink, &HubToClient::AgentList { items }).await;

@@ -28,7 +28,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 version,
                 agent_version,
                 target_triple,
-            }) => (name, secret, version, agent_version, target_triple),
+                tools,
+            }) => (name, secret, version, agent_version, target_triple, tools),
             _ => {
                 let _ = send_rejected(&mut sink, RejectReason::AuthFailed).await;
                 return;
@@ -37,7 +38,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         _ => return,
     };
 
-    let (name, secret, version, agent_version, target_triple) = hello;
+    let (name, secret, version, agent_version, target_triple, tools) = hello;
 
     if version != PROTOCOL_VERSION {
         let _ = send_rejected(&mut sink, RejectReason::VersionMismatch).await;
@@ -52,7 +53,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     let (tx, mut rx) = mpsc::channel::<OutgoingFrame>(SEND_QUEUE);
     let Some(conn) = state
         .registry
-        .try_register(name.clone(), agent_version, target_triple, tx)
+        .try_register(name.clone(), agent_version, target_triple, tools, tx)
     else {
         let _ = send_rejected(&mut sink, RejectReason::NameTaken).await;
         return;
