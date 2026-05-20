@@ -85,15 +85,44 @@ fn norm(v: &Option<String>) -> Option<String> {
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
+    pub username: String,
     pub token: String,
+}
+
+/// `GET /admin/api/login-info` (unauthenticated)
+///
+/// Hands the SPA the configured admin username so the Login page can
+/// render it as a read-only field (the UI doesn't let the operator
+/// edit it — `[admin].username` in hub.toml is the source of truth).
+/// Deliberately a tiny info leak in exchange for not having to type
+/// the username; if the operator wants the username to actually be a
+/// secret, they should leave it as the default and treat the token
+/// as the only credential.
+pub async fn login_info(State(state): State<AdminState>) -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "username": state.auth.username(),
+        })),
+    )
+        .into_response()
 }
 
 pub async fn login(
     State(state): State<AdminState>,
     Json(req): Json<LoginRequest>,
 ) -> Response {
-    let Some(sid) = state.auth.login(req.token.trim()).await else {
-        return err(StatusCode::UNAUTHORIZED, "invalid_token", "invalid admin token");
+    let Some(sid) = state
+        .auth
+        .login(req.username.trim(), req.token.trim())
+        .await
+    else {
+        // Single generic error — don't leak which axis failed.
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "invalid username or token",
+        );
     };
     let cookie = format!(
         "{name}={sid}; HttpOnly; SameSite=Strict; Path=/admin; Max-Age={ttl}",

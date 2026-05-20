@@ -37,6 +37,16 @@ pub const SCHEMA: &[SchemaEntry] = &[
         example: r#"listen = "0.0.0.0:7101""#,
     },
     SchemaEntry {
+        key: "admin.username",
+        section: "admin",
+        doc: &[
+            "Username required to log into the admin UI. The login form",
+            "checks both username and token — a leaked token without the",
+            "right username is still useless. Default: \"admin\"",
+        ],
+        example: r#"username = "admin""#,
+    },
+    SchemaEntry {
         key: "workspaces.root",
         section: "workspaces",
         doc: &[

@@ -154,13 +154,26 @@ impl PushQueue {
     /// Return the oldest `limit` operations, ascending by id. Does
     /// **not** remove them — the worker calls [`ack`] once the hub has
     /// confirmed receipt.
-    pub async fn peek_oldest(&self, limit: usize) -> Result<Vec<(u64, QueueOp)>> {
+    /// Peek the oldest queued rows for a given (account, workspace).
+    /// Scoped at the SQL level rather than in the caller because the
+    /// queue is shared across all sessions on this agent — without the
+    /// filter, an orphan row from a previous session sitting at the
+    /// head silently starves every subsequent scan.
+    pub async fn peek_oldest(
+        &self,
+        account: &str,
+        workspace: &str,
+        limit: usize,
+    ) -> Result<Vec<(u64, QueueOp)>> {
         let rows = sqlx::query(
             "SELECT id, account, workspace, path, op, content
                FROM push_queue
+              WHERE account = ?1 AND workspace = ?2
               ORDER BY id ASC
-              LIMIT ?1",
+              LIMIT ?3",
         )
+        .bind(account)
+        .bind(workspace)
         .bind(limit as i64)
         .fetch_all(&self.db)
         .await
@@ -284,7 +297,7 @@ mod tests {
 
         assert_eq!(q.len().await.unwrap(), 2);
 
-        let head = q.peek_oldest(10).await.unwrap();
+        let head = q.peek_oldest("alice", "ws1", 10).await.unwrap();
         assert_eq!(head.len(), 2);
         assert_eq!(head[0].0, id1);
         assert_eq!(head[1].0, id2);
@@ -299,7 +312,7 @@ mod tests {
 
         q.ack(id1).await.unwrap();
         assert_eq!(q.len().await.unwrap(), 1);
-        let head = q.peek_oldest(10).await.unwrap();
+        let head = q.peek_oldest("alice", "ws1", 10).await.unwrap();
         assert_eq!(head.len(), 1);
         assert_eq!(head[0].0, id2);
     }
@@ -324,7 +337,7 @@ mod tests {
         assert_eq!(deleted, 2);
         assert_eq!(q.len().await.unwrap(), 2);
 
-        let head = q.peek_oldest(10).await.unwrap();
+        let head = q.peek_oldest("alice", "ws1", 10).await.unwrap();
         // Surviving rows: the newest "a.rs" (id3) and "b.rs" (id_other).
         let ids: Vec<u64> = head.iter().map(|(i, _)| *i).collect();
         assert!(ids.contains(&id3));
@@ -361,7 +374,7 @@ mod tests {
             let path = format!("file{i}.txt");
             ids.push(q.enqueue(push("a", "ws", &path, &[i as u8])).await.unwrap());
         }
-        let head = q.peek_oldest(10).await.unwrap();
+        let head = q.peek_oldest("a", "ws", 10).await.unwrap();
         let got: Vec<u64> = head.iter().map(|(i, _)| *i).collect();
         assert_eq!(got, ids);
     }
@@ -380,7 +393,7 @@ mod tests {
         // Drop pool, reopen.
         let q2 = PushQueue::open(&db_path).await.unwrap();
         assert_eq!(q2.len().await.unwrap(), 2);
-        let head = q2.peek_oldest(10).await.unwrap();
+        let head = q2.peek_oldest("alice", "ws1", 10).await.unwrap();
         assert_eq!(head.len(), 2);
         match &head[0].1 {
             QueueOp::PushFile { path, content, .. } => {
@@ -391,13 +404,42 @@ mod tests {
         }
     }
 
+    /// Regression: the queue is shared across all sessions on an
+    /// agent, so peek_oldest MUST filter by (account, workspace) in
+    /// SQL. The previous global-ORDER-BY behaviour meant an orphan
+    /// row at the head from a different session would be returned
+    /// every scan, the caller would skip it, and rows for the
+    /// current session would never be peeked — silent starvation.
+    #[tokio::test]
+    async fn peek_oldest_skips_other_sessions_rows() {
+        let (_d, q) = fresh_queue().await;
+        // Lay down an orphan row first so it has the lowest id.
+        let orphan_id = q
+            .enqueue(push("bob", "wsX", "stale.rs", b"old"))
+            .await
+            .unwrap();
+        // Then enqueue something for the session we're peeking on.
+        let mine_id = q
+            .enqueue(push("alice", "ws1", "mine.rs", b"new"))
+            .await
+            .unwrap();
+        // Peek as alice/ws1 — orphan must not appear, mine must.
+        let head = q.peek_oldest("alice", "ws1", 10).await.unwrap();
+        assert_eq!(head.len(), 1);
+        assert_eq!(head[0].0, mine_id);
+        // Sanity: peek as bob/wsX sees only its own orphan.
+        let other = q.peek_oldest("bob", "wsX", 10).await.unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].0, orphan_id);
+    }
+
     #[tokio::test]
     async fn peek_respects_limit() {
         let (_d, q) = fresh_queue().await;
         for i in 0..10 {
             q.enqueue(push("a", "ws", &format!("f{i}"), b"x")).await.unwrap();
         }
-        let head = q.peek_oldest(3).await.unwrap();
+        let head = q.peek_oldest("a", "ws", 3).await.unwrap();
         assert_eq!(head.len(), 3);
     }
 }

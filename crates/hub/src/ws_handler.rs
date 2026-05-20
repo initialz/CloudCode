@@ -21,6 +21,16 @@ const SEND_QUEUE: usize = 256;
 const SYNC_META_DEBOUNCE: Duration = Duration::from_secs(5);
 
 pub async fn upgrade(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
+    // Bump the WS frame / message ceilings. Tungstenite's default
+    // `max_frame_size` is 16 MiB; once a single `WorkspacePushFile`
+    // serializes the file content via `serde_bytes` into JSON (each
+    // byte → 1-3 chars + comma) we can easily blow past that on
+    // multi-MB JSON / data files and the kernel hands us a RST
+    // instead of a proper close. 64 MiB gives plenty of headroom
+    // without making it trivial for a misbehaving agent to OOM us.
+    let ws = ws
+        .max_frame_size(256 * 1024 * 1024)
+        .max_message_size(256 * 1024 * 1024);
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
@@ -254,12 +264,25 @@ async fn handle_workspace_push(
         return;
     };
 
-    let (ok, error) = match state
-        .workspaces
-        .write_file(&account, &workspace, &path, &content)
+    // Push the sync filesystem write off the axum runtime — under a
+    // 5000-file burst (git clone of an angr-sized repo) this used to
+    // block enough worker threads that the WS writer task couldn't
+    // drain its outbound buffer, no acks came back, the agent
+    // accumulated 50 in-flight pending paths and stalled, OS-level
+    // TCP buffers filled both directions and tungstenite eventually
+    // RST'd.
+    let storage = state.workspaces.clone();
+    let acct = account.clone();
+    let ws = workspace.clone();
+    let p = path.clone();
+    let (ok, error) = match tokio::task::spawn_blocking(move || {
+        storage.write_file(&acct, &ws, &p, &content)
+    })
+    .await
     {
-        Ok(()) => (true, None),
-        Err(e) => (false, Some(e.to_string())),
+        Ok(Ok(())) => (true, None),
+        Ok(Err(e)) => (false, Some(e.to_string())),
+        Err(e) => (false, Some(format!("join blocking write: {e}"))),
     };
     if ok {
         maybe_refresh_sync_meta(state, &account, &workspace, last_meta_refresh).await;
@@ -303,9 +326,18 @@ async fn handle_workspace_delete(
         return;
     };
 
-    let (ok, error) = match state.workspaces.delete_file(&account, &workspace, &path) {
-        Ok(()) => (true, None),
-        Err(e) => (false, Some(e.to_string())),
+    let storage = state.workspaces.clone();
+    let acct = account.clone();
+    let ws = workspace.clone();
+    let p = path.clone();
+    let (ok, error) = match tokio::task::spawn_blocking(move || {
+        storage.delete_file(&acct, &ws, &p)
+    })
+    .await
+    {
+        Ok(Ok(())) => (true, None),
+        Ok(Err(e)) => (false, Some(e.to_string())),
+        Err(e) => (false, Some(format!("join blocking delete: {e}"))),
     };
     if ok {
         maybe_refresh_sync_meta(state, &account, &workspace, last_meta_refresh).await;

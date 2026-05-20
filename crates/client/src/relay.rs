@@ -78,7 +78,7 @@ async fn relay_loop(wire: &mut Wire, bytes: &mut ByteRx) -> Result<()> {
                         let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
                     }
                     HubToClient::SessionClosed { .. } => return Ok(()),
-                    HubToClient::SessionError { message } => {
+                    HubToClient::SessionError { message, .. } => {
                         tracing::warn!(%message, "session error during relay");
                     }
                     _ => {}

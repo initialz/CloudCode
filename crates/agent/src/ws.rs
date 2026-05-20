@@ -47,9 +47,24 @@ async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
     let url = state.config.hub.url.clone();
     tracing::info!(url = %url, name = %state.name, "connecting to hub");
 
-    let (ws, _) = tokio_tungstenite::connect_async(&url)
-        .await
-        .map_err(|e| RunError::Transient(format!("connect: {}", e)))?;
+    // Match the hub's bumped frame / message ceilings (64 MiB).
+    // Without this the agent's tungstenite client would default to
+    // ~16 MiB max_frame_size, and a pull stream containing a single
+    // multi-MB file (json-encoded via serde_bytes, so a 5 MiB file
+    // turns into ~15+ MiB on the wire) would silently RST.
+    // 256 MiB upper bound — handles fat git pack files / vendored
+    // binaries / etc that user explicitly asked to be unrestricted.
+    // Each frame still has to fit in memory; if you bump this, also
+    // make sure the hub's matching `max_frame_size` keeps up.
+    let ws_cfg = tokio_tungstenite::tungstenite::protocol::WebSocketConfig {
+        max_frame_size: Some(256 * 1024 * 1024),
+        max_message_size: Some(256 * 1024 * 1024),
+        ..Default::default()
+    };
+    let (ws, _) =
+        tokio_tungstenite::connect_async_with_config(url.as_str(), Some(ws_cfg), false)
+            .await
+            .map_err(|e| RunError::Transient(format!("connect: {}", e)))?;
     let (mut sink, mut stream) = ws.split();
 
     // Report which tools we'll actually be able to spawn — so the
@@ -114,7 +129,14 @@ async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
         let _ = sink.close().await;
     });
 
+    // Publish this connection's tx to the PtyManager slot so already-
+    // running session loops (PTY reader, push worker, jsonl watcher)
+    // can pick it up across a reconnect. Cleared right before we
+    // return so a transient WS reset doesn't black-hole writes — the
+    // next iteration of `supervise::run` rebinds.
+    state.manager.bind_ws_tx(tx.clone());
     let read_result = read_loop(state.clone(), tx.clone(), &mut stream).await;
+    state.manager.clear_ws_tx();
     drop(tx);
     let _ = writer.await;
     read_result

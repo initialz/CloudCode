@@ -170,17 +170,16 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     let listen = config.server.listen.clone();
 
     let user_auth = Arc::new(UserAuth::new(db.clone()));
-    // Hub-managed workspaces default to `./hub/workspaces` (relative
-    // to the hub's cwd, same convention as `./audit.jsonl` /
-    // `./cloudcode-hub.db`). User can override via
-    // `[workspaces].root` in hub.toml — set it to an absolute path
-    // when workspaces want a separate volume from the rest of hub
-    // state.
+    // Hub-managed workspace store. `Config::load` resolves
+    // `workspaces.root` to an absolute path (anchored to the config
+    // file's parent), defaulting to `<config_dir>/hub/workspaces`
+    // when the user hasn't set anything. Either way it's guaranteed
+    // Some + absolute by the time we get here.
     let ws_root = config
         .workspaces
         .root
         .clone()
-        .unwrap_or_else(|| PathBuf::from("./hub/workspaces"));
+        .expect("Config::load populates workspaces.root");
     let workspaces = WorkspaceStorage::new(ws_root.clone())
         .with_context(|| format!("initialising workspace storage at {}", ws_root.display()))?;
     let state = Arc::new(AppState {
@@ -233,9 +232,14 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     // least once on a v0.7+ hub).
     if let Some(token_hash) = state.config.admin.token_hash.clone() {
         let admin_listen = state.config.admin.listen.clone();
+        let admin_username = state.config.admin.username.clone();
         let admin_state = admin::AdminState {
             app: state.clone(),
-            auth: Arc::new(admin::AdminAuth::new(state.db.clone(), token_hash)),
+            auth: Arc::new(admin::AdminAuth::new(
+                state.db.clone(),
+                admin_username,
+                token_hash,
+            )),
             releases: Arc::new(admin::ReleasesCache::new()),
         };
         let admin_app = admin::router(admin_state);

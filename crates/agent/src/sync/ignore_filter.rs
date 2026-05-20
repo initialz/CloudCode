@@ -26,7 +26,11 @@ use std::path::Path;
 pub const DEFAULT_IGNORES: &[&str] = &[
     "node_modules/",
     "target/",
-    ".git/",
+    // NOTE: `.git/` is intentionally NOT in this list. We sync it so
+    // the hub-canonical copy has the full git history (branches,
+    // stashes, recent commits) the user expects when they open the
+    // workspace from a different agent. Users who don't want it
+    // synced can add `.git/` to `.cloudcodeignore`.
     "dist/",
     "build/",
     ".venv/",

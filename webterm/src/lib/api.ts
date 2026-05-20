@@ -49,10 +49,10 @@ export type MeDto = {
 };
 
 export const apiClient = {
-  login: (token: string) =>
+  login: (username: string, token: string) =>
     api<{ ok: true; account: string }>('/login', {
       method: 'POST',
-      body: JSON.stringify({ token }),
+      body: JSON.stringify({ username, token }),
     }),
   logout: () => api<void>('/logout', { method: 'POST' }),
   me: () => api<MeDto>('/me'),

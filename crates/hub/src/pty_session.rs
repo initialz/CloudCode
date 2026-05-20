@@ -52,6 +52,13 @@ pub async fn upgrade(
     } else {
         None
     };
+    // Same WS ceilings as the agent endpoint — the user-side path
+    // doesn't push files itself, but keeping the two upgrades
+    // symmetric avoids surprise when binary terminal output gets big
+    // (paste of a huge buffer / cat of a large file).
+    let ws = ws
+        .max_frame_size(256 * 1024 * 1024)
+        .max_message_size(256 * 1024 * 1024);
     ws.on_upgrade(move |socket| handle_socket(socket, state, pre_auth))
 }
 
@@ -313,9 +320,7 @@ where
             let Some(name) = target_name else {
                 let _ = send_client(
                     sink,
-                    &HubToClient::SessionError {
-                        message: "agent not online".into(),
-                    },
+                    &HubToClient::session_error("agent not online"),
                 )
                 .await;
                 return true;
@@ -332,12 +337,10 @@ where
                     });
                     let _ = send_client(
                         sink,
-                        &HubToClient::SessionError {
-                            message: format!(
-                                "account '{}' is not allowed to use agent '{}'",
-                                ctx.account_name, name
-                            ),
-                        },
+                        &HubToClient::session_error(format!(
+                            "account '{}' is not allowed to use agent '{}'",
+                            ctx.account_name, name
+                        )),
                     )
                     .await;
                     return true;
@@ -346,9 +349,7 @@ where
                     tracing::warn!(error = %e, "allowlist lookup failed");
                     let _ = send_client(
                         sink,
-                        &HubToClient::SessionError {
-                            message: "internal error".into(),
-                        },
+                        &HubToClient::session_error("internal error"),
                     )
                     .await;
                     return true;
@@ -357,9 +358,7 @@ where
             let Some(conn) = ctx.state.registry.get(&name) else {
                 let _ = send_client(
                     sink,
-                    &HubToClient::SessionError {
-                        message: "agent not online".into(),
-                    },
+                    &HubToClient::session_error("agent not online"),
                 )
                 .await;
                 return true;
@@ -411,9 +410,7 @@ where
                     tracing::warn!(error = %e, "list_workspaces failed");
                     let _ = send_client(
                         sink,
-                        &HubToClient::SessionError {
-                            message: "could not list workspaces".into(),
-                        },
+                        &HubToClient::session_error("could not list workspaces"),
                     )
                     .await;
                     return true;
@@ -448,7 +445,7 @@ where
                 } else {
                     format!("could not create workspace: {msg}")
                 };
-                let _ = send_client(sink, &HubToClient::SessionError { message: display }).await;
+                let _ = send_client(sink, &HubToClient::session_error(display)).await;
                 return true;
             }
             if let Err(e) = ctx
@@ -465,9 +462,9 @@ where
                     .await;
                 let _ = send_client(
                     sink,
-                    &HubToClient::SessionError {
-                        message: format!("could not allocate workspace dir: {e}"),
-                    },
+                    &HubToClient::session_error(format!(
+                        "could not allocate workspace dir: {e}"
+                    )),
                 )
                 .await;
                 return true;
@@ -493,9 +490,10 @@ where
             if actively_used {
                 let _ = send_client(
                     sink,
-                    &HubToClient::SessionError {
-                        message: format!("workspace '{}' is currently in use", name),
-                    },
+                    &HubToClient::session_error(format!(
+                        "workspace '{}' is currently in use",
+                        name
+                    )),
                 )
                 .await;
                 return true;
@@ -539,9 +537,9 @@ where
             {
                 let _ = send_client(
                     sink,
-                    &HubToClient::SessionError {
-                        message: format!("could not delete workspace: {e}"),
-                    },
+                    &HubToClient::session_error(format!(
+                        "could not delete workspace: {e}"
+                    )),
                 )
                 .await;
                 return true;
@@ -553,9 +551,7 @@ where
             let Some(conn) = ctx.selected_agent.clone() else {
                 let _ = send_client(
                     sink,
-                    &HubToClient::SessionError {
-                        message: "no agent selected".into(),
-                    },
+                    &HubToClient::session_error("no agent selected"),
                 )
                 .await;
                 return true;
@@ -567,9 +563,10 @@ where
             )) {
                 let _ = send_client(
                     sink,
-                    &HubToClient::SessionError {
-                        message: format!("workspace '{}' is currently in use", name),
-                    },
+                    &HubToClient::session_error(format!(
+                        "workspace '{}' is currently in use",
+                        name
+                    )),
                 )
                 .await;
                 return true;
@@ -588,9 +585,7 @@ where
             {
                 let _ = send_client(
                     sink,
-                    &HubToClient::SessionError {
-                        message: "agent disconnected".into(),
-                    },
+                    &HubToClient::session_error("agent disconnected"),
                 )
                 .await;
                 return true;
@@ -598,7 +593,7 @@ where
             match tokio::time::timeout(WORKSPACE_REQUEST_TIMEOUT, rx).await {
                 Ok(Ok(ClientMsg::WorkspaceResetResult { error, .. })) => match error {
                     Some(e) => {
-                        let _ = send_client(sink, &HubToClient::SessionError { message: e }).await;
+                        let _ = send_client(sink, &HubToClient::session_error(e)).await;
                     }
                     None => {
                         let _ = send_client(sink, &HubToClient::WorkspaceReset { name }).await;
@@ -607,9 +602,7 @@ where
                 _ => {
                     let _ = send_client(
                         sink,
-                        &HubToClient::SessionError {
-                            message: "workspace reset timed out".into(),
-                        },
+                        &HubToClient::session_error("workspace reset timed out"),
                     )
                     .await;
                 }
@@ -677,9 +670,7 @@ where
     if ctx.active.is_some() {
         let _ = send_client(
             sink,
-            &HubToClient::SessionError {
-                message: "session already open".into(),
-            },
+            &HubToClient::session_error("session already open"),
         )
         .await;
         return true;
@@ -692,9 +683,7 @@ where
             tracing::warn!(error = %e, "list_workspaces failed during OpenSession");
             let _ = send_client(
                 sink,
-                &HubToClient::SessionError {
-                    message: "could not look up workspace".into(),
-                },
+                &HubToClient::session_error("could not look up workspace"),
             )
             .await;
             return true;
@@ -703,9 +692,10 @@ where
     if !exists {
         let _ = send_client(
             sink,
-            &HubToClient::SessionError {
-                message: format!("workspace '{}' does not exist", workspace),
-            },
+            &HubToClient::session_error(format!(
+                "workspace '{}' does not exist",
+                workspace
+            )),
         )
         .await;
         return true;
@@ -724,12 +714,10 @@ where
             });
             let _ = send_client(
                 sink,
-                &HubToClient::SessionError {
-                    message: format!(
-                        "account '{}' is not allowed to use agent '{}'",
-                        ctx.account_name, agent
-                    ),
-                },
+                &HubToClient::session_error(format!(
+                    "account '{}' is not allowed to use agent '{}'",
+                    ctx.account_name, agent
+                )),
             )
             .await;
             return true;
@@ -738,9 +726,7 @@ where
             tracing::warn!(error = %e, "is_agent_allowed lookup failed");
             let _ = send_client(
                 sink,
-                &HubToClient::SessionError {
-                    message: "internal error".into(),
-                },
+                &HubToClient::session_error("internal error"),
             )
             .await;
             return true;
@@ -749,9 +735,7 @@ where
     let Some(conn) = ctx.state.registry.get(&agent) else {
         let _ = send_client(
             sink,
-            &HubToClient::SessionError {
-                message: format!("agent '{}' is not online", agent),
-            },
+            &HubToClient::session_error(format!("agent '{}' is not online", agent)),
         )
         .await;
         return true;
@@ -772,9 +756,7 @@ where
             tracing::warn!(error = %e, "get_workspace_lock failed");
             let _ = send_client(
                 sink,
-                &HubToClient::SessionError {
-                    message: "could not read workspace lock".into(),
-                },
+                &HubToClient::session_error("could not read workspace lock"),
             )
             .await;
             return true;
@@ -785,9 +767,10 @@ where
             if !force {
                 let _ = send_client(
                     sink,
-                    &HubToClient::SessionError {
-                        message: format!("workspace is in use by agent '{}'", holder),
-                    },
+                    &HubToClient::workspace_locked(
+                        format!("workspace is in use by agent '{}'", holder),
+                        holder,
+                    ),
                 )
                 .await;
                 return true;
@@ -858,9 +841,7 @@ where
         tracing::warn!(error = %e, "set_workspace_lock failed");
         let _ = send_client(
             sink,
-            &HubToClient::SessionError {
-                message: format!("could not lock workspace: {e}"),
-            },
+            &HubToClient::session_error(format!("could not lock workspace: {e}")),
         )
         .await;
         return true;
@@ -911,9 +892,7 @@ where
             release_session(ctx, &conn, session_id, &session_key).await;
             let _ = send_client(
                 sink,
-                &HubToClient::SessionError {
-                    message: format!("could not enumerate workspace: {e}"),
-                },
+                &HubToClient::session_error(format!("could not enumerate workspace: {e}")),
             )
             .await;
             return true;
@@ -932,9 +911,7 @@ where
         release_session(ctx, &conn, session_id, &session_key).await;
         let _ = send_client(
             sink,
-            &HubToClient::SessionError {
-                message: "agent disconnected".into(),
-            },
+            &HubToClient::session_error("agent disconnected"),
         )
         .await;
         return true;
@@ -955,9 +932,7 @@ where
             release_session(ctx, &conn, session_id, &session_key).await;
             let _ = send_client(
                 sink,
-                &HubToClient::SessionError {
-                    message: "agent disconnected".into(),
-                },
+                &HubToClient::session_error("agent disconnected"),
             )
             .await;
             return true;
@@ -976,9 +951,10 @@ where
                     release_session(ctx, &conn, session_id, &session_key).await;
                     let _ = send_client(
                         sink,
-                        &HubToClient::SessionError {
-                            message: format!("could not read workspace file '{}': {e}", path),
-                        },
+                        &HubToClient::session_error(format!(
+                            "could not read workspace file '{}': {e}",
+                            path
+                        )),
                     )
                     .await;
                     return true;
@@ -997,9 +973,7 @@ where
                 release_session(ctx, &conn, session_id, &session_key).await;
                 let _ = send_client(
                     sink,
-                    &HubToClient::SessionError {
-                        message: "agent disconnected mid-pull".into(),
-                    },
+                    &HubToClient::session_error("agent disconnected mid-pull"),
                 )
                 .await;
                 return true;
@@ -1013,23 +987,21 @@ where
             if !ok {
                 let msg = error.unwrap_or_else(|| "agent rejected workspace pull".into());
                 release_session(ctx, &conn, session_id, &session_key).await;
-                let _ = send_client(sink, &HubToClient::SessionError { message: msg }).await;
+                let _ = send_client(sink, &HubToClient::session_error(msg)).await;
                 return true;
             }
             true
         }
         Ok(Some(PtyEventOut::Frame(ClientMsg::PtyError { message, .. }))) => {
             release_session(ctx, &conn, session_id, &session_key).await;
-            let _ = send_client(sink, &HubToClient::SessionError { message }).await;
+            let _ = send_client(sink, &HubToClient::session_error(message)).await;
             return true;
         }
         _ => {
             release_session(ctx, &conn, session_id, &session_key).await;
             let _ = send_client(
                 sink,
-                &HubToClient::SessionError {
-                    message: "workspace pull timed out".into(),
-                },
+                &HubToClient::session_error("workspace pull timed out"),
             )
             .await;
             return true;
@@ -1070,9 +1042,7 @@ where
         release_session(ctx, &conn, session_id, &session_key).await;
         let _ = send_client(
             sink,
-            &HubToClient::SessionError {
-                message: "agent disconnected".into(),
-            },
+            &HubToClient::session_error("agent disconnected"),
         )
         .await;
         return true;
@@ -1081,16 +1051,14 @@ where
         Ok(Some(PtyEventOut::Frame(ClientMsg::PtyOpened { cwd, .. }))) => cwd,
         Ok(Some(PtyEventOut::Frame(ClientMsg::PtyError { message, .. }))) => {
             release_session(ctx, &conn, session_id, &session_key).await;
-            let _ = send_client(sink, &HubToClient::SessionError { message }).await;
+            let _ = send_client(sink, &HubToClient::session_error(message)).await;
             return true;
         }
         _ => {
             release_session(ctx, &conn, session_id, &session_key).await;
             let _ = send_client(
                 sink,
-                &HubToClient::SessionError {
-                    message: "pty open timeout".into(),
-                },
+                &HubToClient::session_error("pty open timeout"),
             )
             .await;
             return true;
@@ -1248,7 +1216,7 @@ where
             true
         }
         PtyEventOut::Frame(ClientMsg::PtyError { message, .. }) => {
-            let _ = send_client(sink, &HubToClient::SessionError { message }).await;
+            let _ = send_client(sink, &HubToClient::session_error(message)).await;
             true
         }
         PtyEventOut::Frame(_) => true,

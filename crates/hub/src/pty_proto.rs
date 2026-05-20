@@ -124,8 +124,18 @@ pub enum HubToClient {
         reason: Option<String>,
     },
     /// Non-fatal error (failed op, busy, ...). Connection stays up.
+    /// `code` and `workspace_lock_holder` are populated for the
+    /// specific "workspace is in use" case so the CLI can offer a
+    /// force-take confirmation instead of bouncing back to the menu.
+    /// Older clients ignore the extra fields and just show `message`.
+    /// Use `HubToClient::session_error(...)` /
+    /// `HubToClient::workspace_locked(...)` to construct.
     SessionError {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_lock_holder: Option<String>,
     },
     Ping,
 }
@@ -167,4 +177,27 @@ pub struct WorkspaceInfo {
     /// empty workspaces.
     #[serde(default)]
     pub size_bytes: u64,
+}
+
+impl HubToClient {
+    /// Plain SessionError with just a message. Use for the common
+    /// "something went wrong" case.
+    pub fn session_error(message: impl Into<String>) -> Self {
+        Self::SessionError {
+            message: message.into(),
+            code: None,
+            workspace_lock_holder: None,
+        }
+    }
+
+    /// SessionError specifically for the workspace-lock conflict.
+    /// The CLI uses `code == "workspace_locked"` to recognize this
+    /// path and offer a force-take confirmation prompt.
+    pub fn workspace_locked(message: impl Into<String>, holder: impl Into<String>) -> Self {
+        Self::SessionError {
+            message: message.into(),
+            code: Some("workspace_locked".into()),
+            workspace_lock_holder: Some(holder.into()),
+        }
+    }
 }

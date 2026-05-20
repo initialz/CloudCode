@@ -48,19 +48,34 @@ pub const ADMIN_SESSION_TTL_SECS: i64 = 12 * 60 * 60;
 
 pub struct AdminAuth {
     db: crate::db::Db,
+    /// Username the caller must type at login. Compared as a plain
+    /// (constant-time) string against the configured value — no
+    /// hashing because there's no token / secret on this axis, just
+    /// a knowledge factor that has to match.
+    username: String,
     token_hash: String,
 }
 
 impl AdminAuth {
-    pub fn new(db: crate::db::Db, token_hash: String) -> Self {
-        Self { db, token_hash }
+    pub fn new(db: crate::db::Db, username: String, token_hash: String) -> Self {
+        Self {
+            db,
+            username,
+            token_hash,
+        }
     }
 
-    /// Verify the supplied plaintext token against the stored hash;
-    /// on success mint a fresh sid, persist it in `admin_sessions`,
-    /// and hand it back to the caller (who then sets the cookie).
-    /// Returns `None` on token-mismatch or DB error.
-    pub async fn login(&self, plaintext: &str) -> Option<String> {
+    /// Verify the supplied (username, token) pair against the
+    /// configured values; on success mint a fresh sid, persist it
+    /// in `admin_sessions`, and hand it back to the caller (who
+    /// then sets the cookie). Returns `None` on a mismatch on
+    /// either axis or a DB error. Username comparison uses
+    /// constant-time bytes_eq so a timing side channel can't be
+    /// used to learn the configured username one byte at a time.
+    pub async fn login(&self, username: &str, plaintext: &str) -> Option<String> {
+        if !constant_time_eq(username.as_bytes(), self.username.as_bytes()) {
+            return None;
+        }
         if !auth::verify_token(plaintext, &self.token_hash) {
             return None;
         }
@@ -79,6 +94,12 @@ impl AdminAuth {
 
     pub async fn logout(&self, sid: &str) {
         let _ = self.db.delete_admin_session(sid).await;
+    }
+
+    /// Configured username, exposed to the login page so the SPA can
+    /// render it read-only. Not a secret; see `api::login_info`.
+    pub fn username(&self) -> &str {
+        &self.username
     }
 }
 
@@ -114,6 +135,7 @@ pub fn router(state: AdminState) -> Router {
     Router::new()
         // -- auth (unauthenticated) --
         .route("/admin/api/login", post(api::login))
+        .route("/admin/api/login-info", get(api::login_info))
         .route("/admin/api/logout", post(api::logout))
         // -- protected api --
         .route("/admin/api/me", get(api::me).route_layer(gate.clone()))
@@ -241,4 +263,19 @@ pub fn router(state: AdminState) -> Router {
         .route("/admin/", get(assets::serve_index))
         .route("/admin/*spa", get(assets::serve_spa))
         .with_state(state)
+}
+
+/// Length-checked byte-wise equality with no early exit on the first
+/// mismatch — keeps a network attacker from learning the configured
+/// admin username one byte at a time via response timing. Same
+/// pattern argon2 uses internally for password verification.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }

@@ -56,6 +56,14 @@ pub struct PtyManager {
     /// Routes inbound `WorkspaceFileAck` frames to the right session's
     /// push worker. Cleared when the session closes.
     ack_routes: Arc<DashMap<Uuid, mpsc::Sender<AckMsg>>>,
+    /// Live outbound WS sender, swapped in by `ws.rs::run_once` on each
+    /// successful connect and cleared when the WS goes away. Long-
+    /// lived consumers (PTY reader thread, push worker, JSONL
+    /// watcher) snapshot this on every send instead of holding the
+    /// sender by value — otherwise a transient WS reset would tear
+    /// down every active session as soon as the tied-off sender's
+    /// receiver gets dropped.
+    ws_tx: Arc<std::sync::RwLock<Option<mpsc::Sender<OutFrame>>>>,
 }
 
 struct PtyHandle {
@@ -238,8 +246,35 @@ impl PtyManager {
             pulls: Arc::new(DashMap::new()),
             push_queue: Arc::new(OnceCell::new()),
             ack_routes: Arc::new(DashMap::new()),
+            ws_tx: Arc::new(std::sync::RwLock::new(None)),
         })
     }
+
+    /// Called by `ws.rs::run_once` right after a successful connect
+    /// (the writer task's `Sender<OutFrame>` is still alive). Existing
+    /// reader threads / push workers / jsonl watchers will pick this
+    /// up on their next send.
+    pub fn bind_ws_tx(&self, tx: mpsc::Sender<OutFrame>) {
+        if let Ok(mut g) = self.ws_tx.write() {
+            *g = Some(tx);
+        }
+    }
+
+    /// Called when the WS connection has died. Subsequent sends from
+    /// long-lived consumers see `None`, drop the frame, and wait for
+    /// the next `bind_ws_tx` from a reconnect.
+    pub fn clear_ws_tx(&self) {
+        if let Ok(mut g) = self.ws_tx.write() {
+            *g = None;
+        }
+    }
+
+    /// Snapshot accessor so spawn paths can hand the slot to threads
+    /// / tasks without pulling in the full `PtyManager` Arc.
+    fn ws_tx_slot(&self) -> Arc<std::sync::RwLock<Option<mpsc::Sender<OutFrame>>>> {
+        self.ws_tx.clone()
+    }
+
 
     /// Test-only constructor that skips the tmux probe and FS dir
     /// setup. The pull / cleanup / ack paths only consult
@@ -266,6 +301,7 @@ impl PtyManager {
             pulls: Arc::new(DashMap::new()),
             push_queue: Arc::new(OnceCell::new()),
             ack_routes: Arc::new(DashMap::new()),
+            ws_tx: Arc::new(std::sync::RwLock::new(None)),
         }
     }
 
@@ -678,7 +714,7 @@ impl PtyManager {
         // sync (any local edits won't reach the hub). We log a warning
         // and skip — better than refusing the open entirely.
         let sync = self
-            .start_session_sync(session_id, &account, &workspace, tx.clone())
+            .start_session_sync(session_id, &account, &workspace)
             .await;
         if let Err(e) = sync.as_ref() {
             tracing::warn!(
@@ -725,14 +761,18 @@ impl PtyManager {
         // binary frames; tee into the cast file. `handle` goes into the thread
         // so the reader can ptr_eq itself against `sessions[session_id]` and
         // skip emitting PtyClosed on a workspace-swap (where the entry has
-        // already been replaced by a fresh handle).
+        // already been replaced by a fresh handle). The thread holds the
+        // shared `ws_tx` slot — NOT the per-WS sender by value — so a
+        // transient WS reconnect doesn't kill the session: failed sends
+        // just drop the frame and the next byte tries the freshly-bound
+        // sender.
         let sessions = self.sessions.clone();
-        let tx_out = tx.clone();
+        let ws_tx_slot = self.ws_tx_slot();
         let _ = std::thread::Builder::new()
             .name(format!("pty-reader-{}", session_id))
             .spawn(move || {
                 pty_reader_loop(
-                    handle, reader, session_id, sessions, tx_out, recorder, child,
+                    handle, reader, session_id, sessions, ws_tx_slot, recorder, child,
                 )
             });
     }
@@ -1213,11 +1253,19 @@ impl PtyManager {
         session_id: Uuid,
         account: &str,
         workspace: &str,
-        tx: mpsc::Sender<OutFrame>,
     ) -> Result<SessionSync> {
         let queue = self.push_queue().await?;
         let cwd = self.workspace_root().join(account).join(workspace);
-        let filter = IgnoreFilter::new(&cwd).context("build ignore filter")?;
+        // Build the ignore filter once and share it between the watcher
+        // (which filters per-event) and the push worker (which uses the
+        // same filter inside `enqueue_subtree` for directory fan-outs).
+        let filter = Arc::new(IgnoreFilter::new(&cwd).context("build ignore filter")?);
+        tracing::info!(
+            session = %session_id,
+            account, workspace,
+            watch_dir = %cwd.display(),
+            "starting workspace sync engine"
+        );
 
         // Channels: watcher -> worker, ws read loop -> worker (acks),
         // PtyHandle::Drop -> worker (shutdown).
@@ -1225,8 +1273,9 @@ impl PtyManager {
         let (ack_tx, ack_rx) = mpsc::channel(64);
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
-        let watcher = WorkspaceWatcher::start(cwd.clone(), filter, watch_tx)
+        let watcher = WorkspaceWatcher::start(cwd.clone(), filter.clone(), watch_tx)
             .context("start workspace watcher")?;
+        tracing::info!(session = %session_id, "workspace watcher running");
 
         self.ack_routes.insert(session_id, ack_tx);
 
@@ -1235,11 +1284,12 @@ impl PtyManager {
             account: account.to_string(),
             workspace: workspace.to_string(),
             workspace_root: self.workspace_root(),
+            ignore_filter: filter,
             queue,
             watch_rx,
             ack_rx,
             shutdown_rx,
-            tx,
+            ws_tx_slot: self.ws_tx_slot(),
         };
         tokio::spawn(async move {
             run_push_worker(worker).await;
@@ -1354,7 +1404,7 @@ fn pty_reader_loop(
     mut reader: Box<dyn Read + Send>,
     session_id: Uuid,
     sessions: Arc<DashMap<Uuid, Arc<PtyHandle>>>,
-    tx_out: mpsc::Sender<OutFrame>,
+    ws_tx_slot: Arc<std::sync::RwLock<Option<mpsc::Sender<OutFrame>>>>,
     mut recorder: Option<Recorder>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
 ) {
@@ -1365,8 +1415,16 @@ fn pty_reader_loop(
             Ok(n) => {
                 let chunk = &buf[..n];
                 let frame = pack_pty_frame(TAG_PTY_OUTPUT, session_id, chunk);
-                if tx_out.blocking_send(OutFrame::Binary(frame)).is_err() {
-                    break;
+                // Snapshot the current ws tx each loop iteration.
+                // None / send-failure just drops the frame and keeps
+                // reading — the session must survive across a WS
+                // reconnect (which arrives as: writer task closes →
+                // tx_out's receiver dropped → blocking_send Err).
+                // Always record locally regardless of WS state so the
+                // asciicast captures everything.
+                let snapshot = ws_tx_slot.read().ok().and_then(|g| g.clone());
+                if let Some(tx) = snapshot {
+                    let _ = tx.blocking_send(OutFrame::Binary(frame));
                 }
                 if let Some(r) = recorder.as_mut() {
                     r.write_chunk(chunk);
@@ -1388,10 +1446,17 @@ fn pty_reader_loop(
     if still_us {
         sessions.remove(&session_id);
         let _ = child.try_wait();
-        let _ = tx_out.blocking_send(OutFrame::Text(ClientMsg::PtyClosed {
-            session_id,
-            reason: Some("pty closed".into()),
-        }));
+        // Best-effort PtyClosed via whichever ws is bound right now;
+        // if the WS is mid-reconnect we just drop the frame — the
+        // hub will infer "session gone" from the agent disconnect
+        // anyway on the next handshake.
+        let snapshot = ws_tx_slot.read().ok().and_then(|g| g.clone());
+        if let Some(tx) = snapshot {
+            let _ = tx.blocking_send(OutFrame::Text(ClientMsg::PtyClosed {
+                session_id,
+                reason: Some("pty closed".into()),
+            }));
+        }
     } else {
         let _ = child.try_wait();
     }
@@ -1884,16 +1949,18 @@ mod tests {
         let (_shutdown_tx, shutdown_rx) = mpsc::channel(1);
         let sid = Uuid::new_v4();
 
+        let ws_slot = Arc::new(std::sync::RwLock::new(Some(tx.clone())));
         let worker = PushWorker {
             session_id: sid,
             account: "alice".into(),
             workspace: "ws1".into(),
             workspace_root: wsdir.path().to_path_buf(),
+            ignore_filter: Arc::new(IgnoreFilter::new(wsdir.path()).unwrap()),
             queue: queue.clone(),
             watch_rx,
             ack_rx,
             shutdown_rx,
-            tx: tx.clone(),
+            ws_tx_slot: ws_slot,
         };
         let handle = tokio::spawn(async move { run_push_worker(worker).await });
 

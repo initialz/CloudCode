@@ -20,7 +20,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Terminal;
 use std::io::stdout;
 
@@ -39,6 +39,33 @@ pub enum MenuOutcome {
 pub enum MenuStart {
     WorkspacePicker,
     AgentPicker { workspace: String },
+}
+
+/// Standalone confirm dialog used when the hub rejects an OpenSession
+/// with `workspace_locked`. Returns true if the user wants to retry
+/// with force=true (i.e. take the workspace away from `holder`).
+/// Sets up its own TUI scope, mirroring `menu::run`.
+pub async fn confirm_force_take(
+    bytes: &mut ByteRx,
+    workspace: &str,
+    holder: &str,
+) -> Result<bool> {
+    enable_raw_mode()?;
+    let mut out = stdout();
+    execute!(out, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(out);
+    let mut term = Terminal::new(backend)?;
+    let mut keys = MenuKeyQueue::default();
+    let msg = format!(
+        "Workspace '{}' is held by agent '{}'. Take it over? \
+        Any local edits there that haven't pushed will be lost.",
+        workspace, holder
+    );
+    let result = prompt_confirm(&mut term, bytes, &mut keys, &msg).await;
+    disable_raw_mode().ok();
+    execute!(term.backend_mut(), LeaveAlternateScreen).ok();
+    term.show_cursor().ok();
+    result
 }
 
 pub async fn run(
@@ -118,11 +145,25 @@ async fn run_inner<B: ratatui::backend::Backend>(
                 show_message(term, "no agents online", bytes, keys).await?;
                 continue 'outer;
             }
+            // Re-fetch the workspace list so the green-dot "currently
+            // holds this workspace" badge stays accurate even when
+            // another client force-takes between two renders. Cheap
+            // — one extra round-trip per agent-picker entry, not per
+            // keypress.
+            let lock_holder = list_workspaces(wire)
+                .await?
+                .into_iter()
+                .find(|w| w.name == workspace)
+                .and_then(|w| w.locked_by_agent);
             let agent_rows: Vec<PickerRow> = agents
                 .iter()
                 .map(|n| PickerRow {
                     name: n.clone(),
-                    badge: None,
+                    badge: if lock_holder.as_deref() == Some(n.as_str()) {
+                        Some(Badge::current_holder())
+                    } else {
+                        None
+                    },
                 })
                 .collect();
             if a_state.selected().is_none() {
@@ -652,6 +693,17 @@ impl Badge {
         }
     }
 
+    /// In the agent picker, marks the agent that currently holds the
+    /// lock for the workspace the user is opening — a green dot with
+    /// no extra label so a screenful of agents stays scannable.
+    pub fn current_holder() -> Self {
+        Badge {
+            glyph: "●",
+            label: String::new(),
+            color: Color::Green,
+        }
+    }
+
     fn width(&self) -> usize {
         self.glyph.chars().count() + self.label.chars().count()
     }
@@ -781,14 +833,42 @@ async fn show_message<B: ratatui::backend::Backend>(
     bytes: &mut ByteRx,
     keys: &mut MenuKeyQueue,
 ) -> Result<()> {
+    // Vertical budget (same accounting as prompt_confirm, minus the
+    // buttons row): N + 6.
+    let dialog_w: u16 = 72;
+    let h_pad: u16 = 2;
+    let wrap_w = dialog_w.saturating_sub(2 + 2 * h_pad).max(1);
+    let visible = msg.chars().count() as u16;
+    let msg_rows = visible.div_ceil(wrap_w).clamp(1, 8);
+    let dialog_h: u16 = msg_rows + 6;
     let msg_owned = msg.to_string();
     term.draw(|f| {
-        let body = draw_titled_dialog(f, "cloudcode", 50, 7);
+        let body = draw_titled_dialog(f, "cloudcode", dialog_w, dialog_h);
+        let body_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),        // top pad
+                Constraint::Length(msg_rows), // wrapped message
+                Constraint::Min(0),           // bottom pad
+            ])
+            .split(body);
+        let msg_h = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(h_pad),
+                Constraint::Min(1),
+                Constraint::Length(h_pad),
+            ])
+            .split(body_chunks[1]);
         f.render_widget(
-            Paragraph::new(Line::from(Span::raw(msg_owned)))
+            Paragraph::new(msg_owned)
+                .wrap(Wrap { trim: false })
                 .style(Style::default().bg(DIALOG_BG).fg(DIALOG_FG)),
-            body,
+            msg_h[1],
         );
+        for col in [msg_h[0], msg_h[2]] {
+            f.render_widget(Block::default().style(Style::default().bg(DIALOG_BG)), col);
+        }
         hint_bar(f, "Any key to continue");
     })?;
     let _ = keys.next(bytes).await;
@@ -854,24 +934,64 @@ async fn prompt_confirm<B: ratatui::backend::Backend>(
     keys: &mut MenuKeyQueue,
     msg: &str,
 ) -> Result<bool> {
+    // Dialog sizing. Host-derived agent names are easily 30+ chars,
+    // so we widen the box and word-wrap the message.
+    //
+    // Vertical budget (dialog_h must add up to all of these):
+    //   1  top border
+    //   1  title row              ← draw_titled_dialog
+    //   1  separator row          ← draw_titled_dialog
+    //   1  top padding (gap)      ← our Layout below
+    //   N  wrapped message rows
+    //   1  gap before buttons
+    //   1  buttons row
+    //   1  bottom padding (gap)
+    //   1  bottom border
+    //   = N + 8
+    //
+    // Horizontal budget: body chunk width = dialog_w - 2 (borders).
+    // We carve 2 columns of horizontal padding off each side so text
+    // doesn't hug the border, leaving (dialog_w - 6) for the actual
+    // wrap width.
+    let dialog_w: u16 = 72;
+    let h_pad: u16 = 2;
+    let wrap_w = dialog_w.saturating_sub(2 + 2 * h_pad).max(1);
+    let visible = msg.chars().count() as u16;
+    let msg_rows = visible.div_ceil(wrap_w).clamp(1, 8);
+    let dialog_h: u16 = msg_rows + 8;
     let draw = |term: &mut Terminal<B>, pressed_yes: bool| -> Result<()> {
         let msg_owned = msg.to_string();
         term.draw(move |f| {
-            let body = draw_titled_dialog(f, "Confirm", 56, 8);
+            let body = draw_titled_dialog(f, "Confirm", dialog_w, dialog_h);
             let body_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Min(0),
+                    Constraint::Length(1),         // top pad
+                    Constraint::Length(msg_rows),  // wrapped message
+                    Constraint::Length(1),         // gap before buttons
+                    Constraint::Length(1),         // buttons
+                    Constraint::Min(0),            // bottom pad / overflow
                 ])
                 .split(body);
+            let msg_h_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Length(h_pad), // left pad
+                    Constraint::Min(1),        // wrapped message
+                    Constraint::Length(h_pad), // right pad
+                ])
+                .split(body_chunks[1]);
             f.render_widget(
-                Paragraph::new(Line::from(Span::raw(format!("  {}", msg_owned))))
+                Paragraph::new(msg_owned)
+                    .wrap(Wrap { trim: false })
                     .style(Style::default().bg(DIALOG_BG).fg(DIALOG_FG)),
-                body_chunks[0],
+                msg_h_chunks[1],
             );
+            // Paint the left/right pad cells too, otherwise they show
+            // through with the desktop background.
+            for col in [msg_h_chunks[0], msg_h_chunks[2]] {
+                f.render_widget(Block::default().style(Style::default().bg(DIALOG_BG)), col);
+            }
             let yes = ok_button("Yes", pressed_yes);
             let no = Span::styled("  < No >  ", Style::default().bg(DIALOG_BG).fg(DIALOG_FG));
             f.render_widget(
@@ -879,7 +999,7 @@ async fn prompt_confirm<B: ratatui::backend::Backend>(
                     Line::from(vec![yes, Span::raw("    "), no]).alignment(Alignment::Center),
                 )
                 .style(Style::default().bg(DIALOG_BG)),
-                body_chunks[2],
+                body_chunks[3],
             );
             hint_bar(f, "y/Enter yes · n/Esc no");
         })?;
@@ -917,7 +1037,7 @@ async fn list_agents(wire: &mut Wire) -> Result<Vec<String>> {
             HubToClient::AgentList { items } => {
                 return Ok(items.into_iter().map(|a| a.name).collect())
             }
-            HubToClient::SessionError { message } => {
+            HubToClient::SessionError { message, .. } => {
                 return Err(anyhow!("list agents: {}", message))
             }
             HubToClient::Ping => {

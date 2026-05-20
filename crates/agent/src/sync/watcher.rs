@@ -84,10 +84,12 @@ enum RawKind {
 impl WorkspaceWatcher {
     /// Start watching `root` recursively. Events that pass `filter`
     /// (and the coalescing window) are sent on `event_tx` as
-    /// workspace-relative paths.
+    /// workspace-relative paths. `filter` is `Arc`-wrapped so the
+    /// caller can share the same instance with downstream consumers
+    /// like the push worker's subtree fan-out walker.
     pub fn start(
         root: PathBuf,
-        filter: IgnoreFilter,
+        filter: Arc<IgnoreFilter>,
         event_tx: mpsc::Sender<WatchEvent>,
     ) -> Result<Self> {
         // Canonicalize the watch root before handing it to notify. On
@@ -126,7 +128,6 @@ impl WorkspaceWatcher {
             .with_context(|| format!("watch workspace dir {}", root.display()))?;
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-        let filter = Arc::new(filter);
         let root = Arc::new(root);
 
         // Bridge task: pulls from the sync channel, applies filter +
@@ -265,7 +266,7 @@ mod tests {
     async fn smoke_creates_file_emits_changed() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_path_buf();
-        let filter = IgnoreFilter::new(&root).unwrap();
+        let filter = Arc::new(IgnoreFilter::new(&root).unwrap());
         let (tx, mut rx) = mpsc::channel(16);
         let _w = WorkspaceWatcher::start(root.clone(), filter, tx).unwrap();
 

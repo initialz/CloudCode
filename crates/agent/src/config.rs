@@ -216,6 +216,25 @@ impl Default for RecordingConfig {
 ///
 /// As of v1.13 this is `claude`-only. Tools that need to run next to
 /// claude should be invoked from inside it via plugins / MCP.
+/// Resolve a possibly-relative path against the config file's
+/// directory. Returns absolute paths unchanged. Used to keep
+/// `workspace_root = "./agent/workspaces"` stable across daemon
+/// restarts that may have a different process cwd than the original
+/// start.
+fn anchor_to_config_dir(config_path: &Path, p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    let Some(parent) = config_path.parent() else {
+        return p.to_path_buf();
+    };
+    // Best-effort canonicalize so the resolved path has all symlinks
+    // expanded (matches what other parts of the agent — notably the
+    // workspace watcher — canonicalize for FSEvents path matching).
+    let base = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    base.join(p)
+}
+
 pub const KNOWN_TOOL_NAMES: &[(&str, &str)] = &[
     // (executable / tool name, default resume command)
     ("claude", "claude --continue"),
@@ -226,6 +245,15 @@ impl Config {
         let s = std::fs::read_to_string(path)?;
         let mut cfg: Config = toml::from_str(&s)?;
         cfg.resolve_tools(|name| which::which(name).is_ok());
+        // Anchor a relative `workspace_root` against the config
+        // file's directory. Otherwise `daemon restart` from a
+        // different cwd would resolve `./agent/workspaces` to a
+        // different place than the original start — and the tmux
+        // session's cwd would silently drift away from where claude
+        // expects its files to live (which manifests as "claude
+        // popped up in $HOME" if the resolved path happens to not
+        // exist and the kernel rejects the chdir).
+        cfg.claude.workspace_root = anchor_to_config_dir(path, &cfg.claude.workspace_root);
         Ok(cfg)
     }
 
@@ -345,6 +373,54 @@ disabled = true
         // No tools left -> default falls back to the first remaining
         // key alphabetically, which is empty here.
         assert!(cfg.tools.default.is_empty());
+    }
+
+    #[test]
+    fn anchor_resolves_relative_against_config_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("agent.toml");
+        let anchored = anchor_to_config_dir(&cfg_path, Path::new("./agent/workspaces"));
+        // Canonicalized parent of the config path (resolves /var
+        // ↔ /private/var on macOS) joined with the relative tail.
+        let expected = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("agent/workspaces");
+        assert_eq!(anchored, expected);
+    }
+
+    #[test]
+    fn anchor_passes_absolute_paths_through() {
+        let cfg_path = PathBuf::from("/whatever/agent.toml");
+        let abs = PathBuf::from("/srv/cloudcode/workspaces");
+        let anchored = anchor_to_config_dir(&cfg_path, &abs);
+        assert_eq!(anchored, abs);
+    }
+
+    #[test]
+    fn config_load_anchors_workspace_root_to_config_dir() {
+        // Lay a minimal agent.toml down in a tempdir and load it.
+        // The default workspace_root is `./agent/workspaces`, which
+        // must end up rooted at the tempdir — NOT at the test
+        // process's cwd. This is the regression that the daemon-
+        // restart-from-a-different-cwd bug hinged on.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("agent.toml");
+        std::fs::write(
+            &cfg_path,
+            r#"
+[hub]
+url = "wss://example.com/v1/agent/ws"
+
+[auth]
+registration_token = "ag_test"
+"#,
+        )
+        .unwrap();
+        let cfg = Config::load(&cfg_path).unwrap();
+        let expected = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("agent/workspaces");
+        assert_eq!(cfg.claude.workspace_root, expected);
     }
 
     #[test]

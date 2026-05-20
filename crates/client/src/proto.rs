@@ -109,8 +109,16 @@ pub enum HubToClient {
         reason: Option<String>,
     },
     /// Non-fatal error (failed op, busy, ...). Connection stays up.
+    /// `code = "workspace_locked"` + `workspace_lock_holder = "<agent>"`
+    /// signal a lock conflict the CLI can offer to force-take. Both
+    /// stay None for everything else; an older hub omits them and the
+    /// client falls back to a plain message-only error path.
     SessionError {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_lock_holder: Option<String>,
     },
     Ping,
 }

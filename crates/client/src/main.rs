@@ -351,39 +351,86 @@ async fn run_chat(
         match outcome {
             menu::MenuOutcome::OpenWorkspace { workspace, agent } => {
                 let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-                wire.out_tx
-                    .send(OutFrame::Text(ClientToHub::OpenSession {
-                        workspace: workspace.clone(),
-                        agent: agent.clone(),
-                        force: false,
-                        cols,
-                        rows,
-                        claude_args: claude_args.clone(),
-                    }))
-                    .await
-                    .map_err(|_| anyhow!("hub disconnected"))?;
-                let mut opened = false;
-                loop {
-                    match wire.in_text_rx.recv().await {
-                        Some(HubToClient::SessionOpened { .. }) => {
-                            opened = true;
-                            break;
+                // Inner retry loop so a `workspace_locked` rejection
+                // can be converted into a force-take without bouncing
+                // through the menu (which would re-pull the workspace
+                // list and lose the user's place).
+                let mut force = false;
+                let opened = loop {
+                    wire.out_tx
+                        .send(OutFrame::Text(ClientToHub::OpenSession {
+                            workspace: workspace.clone(),
+                            agent: agent.clone(),
+                            force,
+                            cols,
+                            rows,
+                            claude_args: claude_args.clone(),
+                        }))
+                        .await
+                        .map_err(|_| anyhow!("hub disconnected"))?;
+                    let mut got_ok = false;
+                    let mut lock_holder: Option<String> = None;
+                    let mut error_msg: Option<String> = None;
+                    loop {
+                        match wire.in_text_rx.recv().await {
+                            Some(HubToClient::SessionOpened { .. }) => {
+                                got_ok = true;
+                                break;
+                            }
+                            Some(HubToClient::SessionError {
+                                message,
+                                code,
+                                workspace_lock_holder,
+                            }) => {
+                                if code.as_deref() == Some("workspace_locked") {
+                                    lock_holder = workspace_lock_holder;
+                                } else {
+                                    error_msg = Some(message);
+                                }
+                                break;
+                            }
+                            Some(HubToClient::Ping) => {
+                                let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
+                            }
+                            Some(_) => continue,
+                            None => return Err(anyhow!("hub closed connection")),
                         }
-                        Some(HubToClient::SessionError { message }) => {
-                            // Stash for the next menu invocation —
-                            // the alt screen has just been torn down,
-                            // so a plain stderr print would flash and
-                            // disappear when the menu re-enters.
-                            pending_error = Some(format!("Open failed: {}", message));
-                            break;
-                        }
-                        Some(HubToClient::Ping) => {
-                            let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
-                        }
-                        Some(_) => continue,
-                        None => return Err(anyhow!("hub closed connection")),
                     }
-                }
+                    if got_ok {
+                        break true;
+                    }
+                    // Lock conflict and we haven't tried force yet:
+                    // ask the user. Yes → retry the outer loop with
+                    // force=true. No / other failure → propagate the
+                    // error back to the menu.
+                    if let Some(holder) = lock_holder {
+                        if !force {
+                            match menu::confirm_force_take(&mut bytes, &workspace, &holder).await {
+                                Ok(true) => {
+                                    force = true;
+                                    continue;
+                                }
+                                _ => {
+                                    pending_error = Some(format!(
+                                        "Open cancelled — '{}' is still held by '{}'.",
+                                        workspace, holder
+                                    ));
+                                    break false;
+                                }
+                            }
+                        }
+                        // Already retried with force=true and still
+                        // failed — shouldn't happen, but surface it.
+                        pending_error =
+                            Some(format!("Force-take of '{}' rejected by hub.", workspace));
+                        break false;
+                    }
+                    pending_error = Some(format!(
+                        "Open failed: {}",
+                        error_msg.unwrap_or_else(|| "unknown error".into())
+                    ));
+                    break false;
+                };
                 if !opened {
                     // Land on the agent picker so the user can retry
                     // (or Esc back to the workspace picker) without

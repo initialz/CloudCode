@@ -49,6 +49,13 @@ pub struct AdminConfig {
     /// records used by the admin UI.
     #[serde(default = "default_db_path")]
     pub db_path: PathBuf,
+    /// Username the admin must type at login. The token alone isn't
+    /// enough — both fields are compared. Default "admin"; override
+    /// in hub.toml to anything non-obvious as a small defence-in-
+    /// depth measure (a leaked token without the right username is
+    /// still useless).
+    #[serde(default = "default_admin_username")]
+    pub username: String,
     /// argon2id hash of the admin UI login token. If absent the admin
     /// HTTP server is not started. The plaintext is printed once by
     /// `cloudcode-hub --init`.
@@ -67,10 +74,15 @@ impl Default for AdminConfig {
     fn default() -> Self {
         Self {
             db_path: default_db_path(),
+            username: default_admin_username(),
             token_hash: None,
             listen: default_admin_listen(),
         }
     }
+}
+
+fn default_admin_username() -> String {
+    "admin".into()
 }
 
 fn default_db_path() -> PathBuf {
@@ -94,6 +106,93 @@ pub struct WorkspacesConfig {
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let s = std::fs::read_to_string(path)?;
-        Ok(toml::from_str(&s)?)
+        let mut cfg: Config = toml::from_str(&s)?;
+        // Resolve workspaces.root to an absolute path here, so
+        // callers (notably main.rs) can use it directly without
+        // worrying about cwd. Unset => bake in the default
+        // `./hub/workspaces` and anchor it; explicit relative =>
+        // anchor; explicit absolute => pass through. Anchor uses
+        // the config file's directory so a daemon restart from a
+        // different cwd doesn't silently relocate the canonical
+        // workspace store.
+        let root = cfg
+            .workspaces
+            .root
+            .take()
+            .unwrap_or_else(|| PathBuf::from("./hub/workspaces"));
+        cfg.workspaces.root = Some(anchor_to_config_dir(path, &root));
+        Ok(cfg)
+    }
+}
+
+/// Resolve a possibly-relative path against the config file's
+/// directory. Absolute paths pass through. Mirrors the helper in
+/// `crates/agent/src/config.rs`.
+fn anchor_to_config_dir(config_path: &Path, p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    let Some(parent) = config_path.parent() else {
+        return p.to_path_buf();
+    };
+    let base = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
+    base.join(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn minimal_toml() -> &'static str {
+        r#"
+[server]
+listen = "0.0.0.0:7100"
+
+[agents]
+registration_token_hash = "$argon2id$dummy"
+"#
+    }
+
+    #[test]
+    fn workspaces_root_defaults_to_anchored_subdir() {
+        // No [workspaces].root in the file → Config::load fills in
+        // `<config_dir>/hub/workspaces` and that's what main.rs sees.
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("hub.toml");
+        std::fs::write(&cfg_path, minimal_toml()).unwrap();
+        let cfg = Config::load(&cfg_path).unwrap();
+        let expected = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("hub/workspaces");
+        assert_eq!(cfg.workspaces.root, Some(expected));
+    }
+
+    #[test]
+    fn workspaces_root_explicit_relative_is_anchored() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("hub.toml");
+        let body = format!(
+            "{}\n[workspaces]\nroot = \"./elsewhere/ws\"\n",
+            minimal_toml()
+        );
+        std::fs::write(&cfg_path, body).unwrap();
+        let cfg = Config::load(&cfg_path).unwrap();
+        let expected = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .join("elsewhere/ws");
+        assert_eq!(cfg.workspaces.root, Some(expected));
+    }
+
+    #[test]
+    fn workspaces_root_absolute_passes_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("hub.toml");
+        let body = format!(
+            "{}\n[workspaces]\nroot = \"/srv/cloudcode/ws\"\n",
+            minimal_toml()
+        );
+        std::fs::write(&cfg_path, body).unwrap();
+        let cfg = Config::load(&cfg_path).unwrap();
+        assert_eq!(cfg.workspaces.root, Some(PathBuf::from("/srv/cloudcode/ws")));
     }
 }

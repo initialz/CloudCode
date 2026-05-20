@@ -21,6 +21,7 @@ use std::path::{Component, Path, PathBuf};
 /// Filesystem-backed store for workspace contents. Every operation is
 /// scoped under `<root>/<account>/<name>/`; callers cannot escape that
 /// subtree even if they hand-craft `path` (see [`Self::validate_rel`]).
+#[derive(Clone)]
 pub struct WorkspaceStorage {
     root: PathBuf,
 }
@@ -102,15 +103,39 @@ impl WorkspaceStorage {
         std::fs::read(&target).with_context(|| format!("reading {}", target.display()))
     }
 
-    /// Remove a single file inside the workspace. Missing file is not
-    /// an error (delete is idempotent — useful for sync-engine catchup
-    /// where the local copy may already have the deletion applied).
+    /// Remove a file or directory inside the workspace. Missing path
+    /// is not an error (delete is idempotent). Directories get the
+    /// recursive treatment because the agent's watcher emits one
+    /// `Remove` event for a folder rather than per-child events when
+    /// the whole tree is rm-rf'd at once.
     pub fn delete_file(&self, account: &str, name: &str, path: &str) -> Result<()> {
         let target = self.resolve_for_write(account, name, path)?;
-        match std::fs::remove_file(&target) {
+        let meta = match std::fs::symlink_metadata(&target) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("stat-ing {} for delete", target.display()))
+            }
+        };
+        let r = if meta.is_dir() {
+            std::fs::remove_dir_all(&target)
+        } else {
+            std::fs::remove_file(&target)
+        };
+        match r {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("deleting {}", target.display())),
+            Err(e) => {
+                // Include the io error reason in the message so the
+                // agent's ack log shows e.g. "Permission denied" /
+                // "IsADirectory" rather than just the path.
+                Err(anyhow::anyhow!(
+                    "deleting {}: {}",
+                    target.display(),
+                    e
+                ))
+            }
         }
     }
 
@@ -401,6 +426,30 @@ mod tests {
         std::fs::create_dir_all(s.workspace_dir("alice", "demo").join("empty-subdir"))
             .unwrap();
         assert_eq!(s.total_size("alice", "demo").unwrap(), 4 + 5);
+    }
+
+    #[test]
+    fn delete_file_handles_directory_target() {
+        // Regression: agent's watcher emits a single `Remove(Folder)`
+        // event when an entire subtree gets rm-rf'd; we send
+        // WorkspaceDeleteFile for that path. The hub used to call
+        // `remove_file` on it, which fails with `IsADirectory`, and
+        // the agent retry-loops forever. delete_file must handle
+        // both files and directories.
+        let s = fresh();
+        s.create_empty("alice", "demo").unwrap();
+        // Lay out a nested dir with content.
+        s.write_file("alice", "demo", "sub/dir/file.txt", b"x").unwrap();
+        assert!(s.workspace_dir("alice", "demo").join("sub/dir/file.txt").exists());
+        // Delete the parent directory by relative path.
+        s.delete_file("alice", "demo", "sub/dir").unwrap();
+        assert!(!s.workspace_dir("alice", "demo").join("sub/dir").exists());
+        // Idempotent: deleting again is a no-op.
+        s.delete_file("alice", "demo", "sub/dir").unwrap();
+        // Deleting a regular file still works.
+        s.write_file("alice", "demo", "lone.txt", b"y").unwrap();
+        s.delete_file("alice", "demo", "lone.txt").unwrap();
+        assert!(!s.workspace_dir("alice", "demo").join("lone.txt").exists());
     }
 
     #[test]

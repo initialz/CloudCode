@@ -16,10 +16,7 @@ use crate::auth;
 use crate::AppState;
 use axum::{
     extract::{Extension, State},
-    http::{
-        header::{AUTHORIZATION, SET_COOKIE},
-        HeaderMap, HeaderValue, StatusCode,
-    },
+    http::{header::SET_COOKIE, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -39,46 +36,65 @@ fn err(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
+    pub username: String,
     pub token: String,
 }
 
 /// `POST /api/login`
 ///
-/// Body: `{"token":"cc_..."}`. We reuse `crate::auth::authenticate`
-/// (same code path the CLI client and the pty WS Hello frame go
-/// through), packing the body token into an Authorization header so
-/// the helper sees it.
+/// Body: `{"username":"alice","token":"cc_..."}`. Looks up the
+/// account row by name, then verifies the token against that row's
+/// hash. Both must match — a leaked token without the right account
+/// name is useless, and an unknown username can't be probed for
+/// existence (single generic 401).
+///
+/// CLI client + agent paths are unchanged: they still come in via
+/// `auth::authenticate` (Bearer header / WS Hello frame) which is
+/// O(N) over accounts — fine for small N and unaffected by this
+/// endpoint.
 ///
 /// On success: set the session cookie and return the account name +
 /// hub version (cuts a follow-up `/me` round-trip on first paint).
 pub async fn login(State(state): State<Arc<AppState>>, Json(req): Json<LoginRequest>) -> Response {
+    let username = req.username.trim().to_string();
     let token = req.token.trim().to_string();
-    if token.is_empty() {
+    if username.is_empty() || token.is_empty() {
         return err(
             StatusCode::BAD_REQUEST,
             "invalid_input",
-            "token is required",
+            "username and token are required",
         );
     }
-    let mut headers = HeaderMap::new();
-    let bearer = match HeaderValue::from_str(&format!("Bearer {}", token)) {
-        Ok(v) => v,
-        Err(_) => {
+
+    let accounts = match state.db.list_accounts().await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(error = %e, "list_accounts failed during user login");
             return err(
-                StatusCode::BAD_REQUEST,
-                "invalid_input",
-                "token contains invalid characters",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db_error",
+                "could not look up account",
             );
         }
     };
-    headers.insert(AUTHORIZATION, bearer);
-
-    let account = match auth::authenticate(&state.db, &headers).await {
-        Ok(a) => a,
-        Err(reason) => {
-            return err(StatusCode::UNAUTHORIZED, "invalid_token", reason);
+    let account = match accounts.into_iter().find(|a| a.name == username) {
+        Some(a) if !a.disabled => a,
+        // Disabled OR missing: same generic error — don't leak which.
+        _ => {
+            return err(
+                StatusCode::UNAUTHORIZED,
+                "invalid_credentials",
+                "invalid username or token",
+            );
         }
     };
+    if !auth::verify_token(&token, &account.token_hash) {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "invalid username or token",
+        );
+    }
 
     let sid = state.user_auth.login(account.name.clone()).await;
     let cookie = format!(

@@ -91,8 +91,9 @@ export type AuditEventDto = {
 export type HourlyBucket = { ts: number; count: number };
 
 export const apiClient = {
-  login: (token: string) =>
-    api<{ ok: true }>('/login', { method: 'POST', body: JSON.stringify({ token }) }),
+  loginInfo: () => api<{ username: string }>('/login-info'),
+  login: (username: string, token: string) =>
+    api<{ ok: true }>('/login', { method: 'POST', body: JSON.stringify({ username, token }) }),
   logout: () => api<void>('/logout', { method: 'POST' }),
   me: () => api<{ ok: true; hub_version?: string }>('/me'),
   dashboard: () => api<DashboardDto>('/dashboard'),
