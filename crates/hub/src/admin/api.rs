@@ -1487,6 +1487,315 @@ pub async fn audit_kinds(State(state): State<AdminState>) -> Response {
     }
 }
 
+/// Union of distinct kinds from both backing tables of the activity
+/// view. Populates the multi-select in the admin SPA so the operator
+/// doesn't have to remember kind strings.
+pub async fn activity_kinds(State(state): State<AdminState>) -> Response {
+    match state.app.db.distinct_activity_kinds().await {
+        Ok(k) => Json(k).into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+// ---------------------------------------------------------------------
+// User interactions (captured claude prompts; content hidden by default)
+// ---------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+pub struct InteractionsQuery {
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Milliseconds since epoch — matches the wire format the agent
+    /// already ships, so the admin UI can round-trip values from a
+    /// row's `ts_ms` directly into a filter.
+    #[serde(default)]
+    pub since_ms: Option<i64>,
+    #[serde(default)]
+    pub until_ms: Option<i64>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct InteractionListItem {
+    id: i64,
+    account: String,
+    agent: String,
+    workspace: String,
+    claude_session_id: String,
+    prompt_id: Option<String>,
+    parent_uuid: Option<String>,
+    cwd: Option<String>,
+    git_branch: Option<String>,
+    ts_ms: i64,
+    kind: String,
+    /// Full prompt text, surfaced inline. (Earlier revision masked
+    /// this to `[hidden]` and required a separate `/reveal` call;
+    /// operator decided the masking wasn't worth the extra click
+    /// since the interactions table is admin-gated already. The
+    /// `/reveal` endpoint stays in place for callers that want the
+    /// audit-write side effect.)
+    content: String,
+}
+
+#[derive(Serialize)]
+struct InteractionPage {
+    items: Vec<InteractionListItem>,
+    total: i64,
+}
+
+pub async fn interactions_list(
+    State(state): State<AdminState>,
+    Query(q): Query<InteractionsQuery>,
+) -> Response {
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let filter = crate::db::UserInteractionFilter {
+        account: norm(&q.account),
+        workspace: norm(&q.workspace),
+        kind: norm(&q.kind),
+        since_ms: q.since_ms,
+        until_ms: q.until_ms,
+    };
+    let rows = match state.app.db.list_user_interactions(&filter, limit, offset).await {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+    let total = state
+        .app
+        .db
+        .count_user_interactions(&filter)
+        .await
+        .unwrap_or(rows.len() as i64);
+    let items = rows
+        .into_iter()
+        .map(|r| InteractionListItem {
+            id: r.id,
+            account: r.account,
+            agent: r.agent,
+            workspace: r.workspace,
+            claude_session_id: r.claude_session_id,
+            prompt_id: r.prompt_id,
+            parent_uuid: r.parent_uuid,
+            cwd: r.cwd,
+            git_branch: r.git_branch,
+            ts_ms: r.ts_ms,
+            kind: r.kind,
+            content: r.content,
+        })
+        .collect();
+    Json(InteractionPage { items, total }).into_response()
+}
+
+#[derive(Serialize)]
+struct InteractionReveal {
+    id: i64,
+    content: String,
+}
+
+pub async fn interactions_reveal(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Response {
+    let row = match state.app.db.get_user_interaction(id).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return err(StatusCode::NOT_FOUND, "not_found", "no such interaction")
+        }
+        Err(e) => return internal(e),
+    };
+
+    // Forensic trail: who pulled which row's plaintext, when. The sid
+    // is the admin session cookie — opaque, but the audit log + admin
+    // session table together let an operator narrow down to a login.
+    let admin_sid = super::session_cookie(&headers);
+    let mut detail = serde_json::Map::new();
+    detail.insert("interaction_id".into(), serde_json::Value::from(id));
+    if let Some(sid) = admin_sid.as_deref() {
+        detail.insert("admin_sid".into(), serde_json::Value::from(sid));
+    }
+    state.app.audit.write(crate::audit::AuditEvent {
+        account: Some(row.account.clone()),
+        agent: Some(row.agent.clone()),
+        workspace: Some(row.workspace.clone()),
+        reason: serde_json::to_string(&detail).ok(),
+        ..crate::audit::AuditEvent::new("interaction_revealed")
+    });
+
+    Json(InteractionReveal {
+        id: row.id,
+        content: row.content,
+    })
+    .into_response()
+}
+
+// ---------------------------------------------------------------------
+// Unified activity view (audit_events ∪ user_interactions)
+// ---------------------------------------------------------------------
+//
+// Single feed for the admin "activity" page. Both source tables are
+// projected to a common shape inside the DB layer (see
+// `db::build_activity_select`); here we just normalise the query
+// string, clamp paging, parse `detail` from text → JSON value, and
+// keep the older `audit_list` / `interactions_list` endpoints
+// untouched so existing pages don't regress.
+
+#[derive(Deserialize, Default)]
+pub struct ActivityQuery {
+    /// "audit" | "interaction" | "all" (default). Anything else
+    /// normalises to "all" — surfacing a 400 here is more annoying
+    /// than helpful for a viewer endpoint.
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<String>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// Millisecond epoch; inclusive lower bound.
+    #[serde(default)]
+    pub since_ms: Option<i64>,
+    /// Millisecond epoch; inclusive upper bound.
+    #[serde(default)]
+    pub until_ms: Option<i64>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub offset: Option<i64>,
+}
+
+#[derive(Serialize)]
+struct ActivityItem {
+    id: i64,
+    source: String,
+    ts_ms: i64,
+    kind: String,
+    account: Option<String>,
+    agent: Option<String>,
+    workspace: Option<String>,
+    session_id: Option<String>,
+    /// Parsed JSON object for both branches:
+    /// - audit row: the raw `audit_events.detail` text parsed (null
+    ///   if absent or unparseable — we log a warn but do not fail
+    ///   the whole list).
+    /// - interaction row: SQLite's `json_object(...)` text we built
+    ///   in the union, parsed back into a `Value` so the wire is
+    ///   uniform.
+    detail: Option<serde_json::Value>,
+}
+
+#[derive(Serialize)]
+struct ActivityPage {
+    items: Vec<ActivityItem>,
+    total: i64,
+}
+
+/// Parse the comma-separated `kind` query param into a Vec.
+/// Empty / whitespace-only / missing → None (no filter). Values
+/// are trimmed; empty tokens between commas are skipped so a
+/// trailing/duplicate comma doesn't break the filter.
+fn parse_kinds(raw: &Option<String>) -> Option<Vec<String>> {
+    let s = raw.as_deref()?.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let kinds: Vec<String> = s
+        .split(',')
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    if kinds.is_empty() { None } else { Some(kinds) }
+}
+
+/// Normalise the `source` query param. Anything outside the known
+/// set collapses to `"all"`. We keep a lowercase canonical form so
+/// the DB layer can compare with a single literal.
+fn norm_source(raw: &Option<String>) -> Option<String> {
+    match raw.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+        Some(ref s) if s == "audit" || s == "interaction" => Some(s.clone()),
+        Some(ref s) if s == "all" || s.is_empty() => None,
+        // Unknown source string → treat as "all" (None). Logged at
+        // debug so curious operators can tell why their filter
+        // didn't take effect.
+        Some(other) => {
+            tracing::debug!(source = %other, "activity: unknown source value, falling back to 'all'");
+            None
+        }
+        None => None,
+    }
+}
+
+pub async fn activity_list(
+    State(state): State<AdminState>,
+    Query(q): Query<ActivityQuery>,
+) -> Response {
+    let limit = q.limit.unwrap_or(50).clamp(1, 500);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let filter = crate::db::ActivityFilter {
+        source: norm_source(&q.source),
+        account: norm(&q.account),
+        agent: norm(&q.agent),
+        workspace: norm(&q.workspace),
+        kind: parse_kinds(&q.kind),
+        since_ms: q.since_ms,
+        until_ms: q.until_ms,
+    };
+    let rows = match state.app.db.list_activity(&filter, limit, offset).await {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+    // count fallbacks to rows.len() if the count query fails — same
+    // pattern as audit_list / interactions_list, so the UI still
+    // renders something useful instead of erroring out the whole page.
+    let total = state
+        .app
+        .db
+        .count_activity(&filter)
+        .await
+        .unwrap_or(rows.len() as i64);
+    let items = rows
+        .into_iter()
+        .map(|r| {
+            let detail = r.detail.as_deref().and_then(|s| {
+                match serde_json::from_str::<serde_json::Value>(s) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::warn!(
+                            source = %r.source,
+                            id = r.id,
+                            error = %e,
+                            "activity: detail JSON parse failed, returning null"
+                        );
+                        None
+                    }
+                }
+            });
+            ActivityItem {
+                id: r.id,
+                source: r.source,
+                ts_ms: r.ts_ms,
+                kind: r.kind,
+                account: r.account,
+                agent: r.agent,
+                workspace: r.workspace,
+                session_id: r.session_id,
+                detail,
+            }
+        })
+        .collect();
+    Json(ActivityPage { items, total }).into_response()
+}
+
 // ---------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------

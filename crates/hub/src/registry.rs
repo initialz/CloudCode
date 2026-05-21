@@ -220,10 +220,14 @@ fn classify(frame: &ClientMsg) -> Routing {
         | ClientMsg::WorkspaceResetResult { request_id, .. }
         | ClientMsg::WorkspaceListAllResult { request_id, .. }
         | ClientMsg::UpdateAgentResult { request_id, .. } => Routing::Workspace(*request_id),
-        ClientMsg::Hello { .. } | ClientMsg::Pong | ClientMsg::Message { .. } => {
-            // Message frames are intercepted upstream in ws_handler and
-            // persisted to the admin db directly — they never reach
-            // here under normal operation. Discard defensively.
+        ClientMsg::Hello { .. }
+        | ClientMsg::Pong
+        | ClientMsg::Message { .. }
+        | ClientMsg::UserInteraction { .. } => {
+            // Message + UserInteraction frames are intercepted upstream
+            // in ws_handler and persisted to the admin db directly —
+            // they never reach here under normal operation. Discard
+            // defensively.
             Routing::Discard
         }
     }

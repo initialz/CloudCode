@@ -200,6 +200,22 @@ pub fn router(state: AdminState) -> Router {
             get(api::audit_kinds).route_layer(gate.clone()),
         )
         .route(
+            "/admin/api/interactions",
+            get(api::interactions_list).route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/api/interactions/:id/reveal",
+            post(api::interactions_reveal).route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/api/activity",
+            get(api::activity_list).route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/api/activity/kinds",
+            get(api::activity_kinds).route_layer(gate.clone()),
+        )
+        .route(
             "/admin/api/sessions",
             get(api::sessions_list).route_layer(gate.clone()),
         )

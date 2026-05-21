@@ -1,3 +1,4 @@
+mod audit;
 mod config;
 mod jsonl;
 mod name;
@@ -21,6 +22,10 @@ pub struct AppState {
     pub name: String,
     pub config: Config,
     pub manager: Arc<PtyManager>,
+    /// Shared slot the ws layer plugs the live hub sender into so the
+    /// agent-level audit task (spawned once at startup) can ship
+    /// `UserInteraction` frames to the hub.
+    pub audit_slot: audit::SenderSlot,
 }
 
 #[derive(Parser)]
@@ -198,13 +203,35 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         config.sandbox.clone(),
     )?);
 
+    // Process-level audit pipeline: watches ~/.claude/projects/ and
+    // ships every user-typed prompt up to the hub. Spawned ONCE per
+    // agent lifetime — survives reconnects via SenderSlot.
+    let audit_slot = audit::SenderSlot::new();
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    let workspace_root = expand_workspace_root(&config.claude.workspace_root);
+    audit::spawn(home, workspace_root, audit_slot.clone());
+
     let state = Arc::new(AppState {
         name,
         config,
         manager,
+        audit_slot,
     });
 
     ws::run(state).await
+}
+
+/// Mirror of `pty::expand_path` for the audit pipeline. Kept tiny + local
+/// so `audit.rs` doesn't need to depend on `pty.rs` just for tilde
+/// expansion.
+fn expand_workspace_root(p: &Path) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    p.to_path_buf()
 }
 
 fn init_config(path: &Path) -> anyhow::Result<()> {

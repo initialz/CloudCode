@@ -47,6 +47,12 @@ pub fn apply(params: &SandboxParams) -> Result<()> {
         .unwrap_or_else(|_| params.workspace_root.clone());
     let home_path = std::fs::canonicalize(&params.home).unwrap_or_else(|_| params.home.clone());
 
+    // claude maintains a per-project subdir under ~/.claude/projects/
+    // keyed off the absolute cwd, with every '/' replaced by '-'. We
+    // mirror that encoding so the SBPL profile can carve out *this*
+    // project's subtree while denying every other one.
+    let project_dir_name = workspace_path.to_string_lossy().replace('/', "-");
+
     // Parameter pairs: (key, value), NULL-terminated.
     let workspace = CString::new(workspace_path.as_os_str().as_bytes())
         .map_err(|_| anyhow!("workspace path contains NUL"))?;
@@ -54,9 +60,12 @@ pub fn apply(params: &SandboxParams) -> Result<()> {
         .map_err(|_| anyhow!("workspace_root path contains NUL"))?;
     let home = CString::new(home_path.as_os_str().as_bytes())
         .map_err(|_| anyhow!("home path contains NUL"))?;
+    let claude_project_dir = CString::new(project_dir_name.as_bytes())
+        .map_err(|_| anyhow!("claude project dir name contains NUL"))?;
     let key_ws = CString::new("WORKSPACE").unwrap();
     let key_ws_root = CString::new("WORKSPACE_ROOT").unwrap();
     let key_home = CString::new("HOME_DIR").unwrap();
+    let key_claude_project_dir = CString::new("CLAUDE_PROJECT_DIR").unwrap();
 
     let raw: Vec<*const libc::c_char> = vec![
         key_ws.as_ptr(),
@@ -65,6 +74,8 @@ pub fn apply(params: &SandboxParams) -> Result<()> {
         workspace_root.as_ptr(),
         key_home.as_ptr(),
         home.as_ptr(),
+        key_claude_project_dir.as_ptr(),
+        claude_project_dir.as_ptr(),
         ptr::null(),
     ];
 

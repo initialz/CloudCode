@@ -93,6 +93,14 @@ async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
 
     let (tx, mut rx) = mpsc::channel::<OutFrame>(SEND_QUEUE);
 
+    // Hand the live sender to the agent-level audit task. Cleared on
+    // any return from this function so audit pauses (rather than
+    // silently dropping events) until reconnect re-arms the slot.
+    state.audit_slot.set(tx.clone());
+    let _slot_guard = SlotGuard {
+        slot: state.audit_slot.clone(),
+    };
+
     let writer = tokio::spawn(async move {
         while let Some(out) = rx.recv().await {
             let msg = match out {
@@ -220,6 +228,20 @@ fn reject_label(r: RejectReason) -> &'static str {
         RejectReason::NameTaken => "name_taken (another agent with this name is already connected)",
         RejectReason::AuthFailed => "auth_failed (registration_token does not match)",
         RejectReason::VersionMismatch => "version_mismatch (upgrade agent or hub)",
+    }
+}
+
+/// Clears the audit sender slot whenever we leave `run_once` — covers
+/// normal close, transient error, and fatal reject paths in a single
+/// place so a future code path can't accidentally leave a stale
+/// sender wired into the audit task.
+struct SlotGuard {
+    slot: crate::audit::SenderSlot,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.slot.clear();
     }
 }
 

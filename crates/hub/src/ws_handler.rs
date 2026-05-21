@@ -169,6 +169,39 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         })
                         .await;
                 }
+                Ok(ClientMsg::UserInteraction {
+                    account,
+                    workspace,
+                    claude_session_id,
+                    prompt_id,
+                    parent_uuid,
+                    cwd,
+                    git_branch,
+                    ts_ms,
+                    kind,
+                    content,
+                }) => {
+                    // Captured user input from the agent's process-level
+                    // audit pipeline. Persisted to its own table for
+                    // the admin audit surface; failures only log so
+                    // a flaky disk can't disrupt the PTY tunnel.
+                    state
+                        .db
+                        .insert_user_interaction(&crate::db::UserInteractionRow {
+                            account,
+                            agent: name.clone(),
+                            workspace,
+                            claude_session_id,
+                            prompt_id,
+                            parent_uuid,
+                            cwd: Some(cwd),
+                            git_branch,
+                            ts_ms,
+                            kind,
+                            content,
+                        })
+                        .await;
+                }
                 Ok(frame) => conn.handle_text_frame(frame).await,
                 Err(e) => tracing::warn!(agent = %name, error = %e, "bad frame"),
             },

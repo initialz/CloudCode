@@ -195,7 +195,7 @@ export function Layout() {
             <Tab to="/agents">Agents</Tab>
             <Tab to="/workspaces">Workspaces</Tab>
             <Tab to="/sessions">Sessions</Tab>
-            <Tab to="/audit">Audit</Tab>
+            <Tab to="/activity">Activity</Tab>
           </nav>
         </div>
         <div className="flex items-center gap-2">

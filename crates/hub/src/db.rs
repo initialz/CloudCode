@@ -224,6 +224,33 @@ impl Db {
             )",
             "CREATE INDEX IF NOT EXISTS idx_workspaces_account ON workspaces(account)",
             "CREATE INDEX IF NOT EXISTS idx_workspaces_agent ON workspaces(agent)",
+            // Captured user inputs (prompts + bash escapes) from claude's
+            // per-project jsonl logs, shipped by the agent's
+            // `audit.rs` pipeline. Separate from `messages` because the
+            // semantics differ: `messages` is the conversation feed,
+            // `user_interactions` is the audit feed (filtered to human
+            // input, exposed via the admin UI with explicit "reveal").
+            // The UNIQUE constraint is the agent's restart-resume
+            // dedupe: re-tailing the same jsonl file from offset 0
+            // would otherwise duplicate every row.
+            "CREATE TABLE IF NOT EXISTS user_interactions (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                account            TEXT NOT NULL,
+                agent              TEXT NOT NULL,
+                workspace          TEXT NOT NULL,
+                claude_session_id  TEXT NOT NULL,
+                prompt_id          TEXT,
+                parent_uuid        TEXT,
+                cwd                TEXT,
+                git_branch         TEXT,
+                ts_ms              INTEGER NOT NULL,
+                kind               TEXT NOT NULL,
+                content            TEXT NOT NULL,
+                UNIQUE(claude_session_id, parent_uuid, ts_ms)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_ui_account_ts ON user_interactions(account, ts_ms DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_ui_workspace_ts ON user_interactions(workspace, ts_ms DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_ui_session ON user_interactions(claude_session_id)",
             // Compat for deployments that already ran the unguarded
             // seed (pre-v1.8.x): if the ACL table is non-empty, assume
             // the seed has logically happened and lock the marker in,
@@ -815,6 +842,22 @@ impl Db {
         Ok(rows.into_iter().map(|r| r.get("kind")).collect())
     }
 
+    /// Distinct kinds across both backing tables of the activity view.
+    /// Used by the admin UI to populate the kind multi-select. Sorted
+    /// alphabetically so dropdown order is stable.
+    pub async fn distinct_activity_kinds(&self) -> Result<Vec<String>> {
+        let rows = sqlx::query(
+            "SELECT kind FROM (
+                 SELECT DISTINCT kind FROM audit_events
+                 UNION
+                 SELECT DISTINCT kind FROM user_interactions
+             ) ORDER BY kind",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.get("kind")).collect())
+    }
+
     /// Best-effort insert; logs at debug on failure so a flaky disk
     /// doesn't break PTY flow.
     pub async fn insert_audit(&self, row: &AuditRow) {
@@ -1170,6 +1213,196 @@ impl Db {
         Ok(a + u)
     }
 
+    // ---- user_interactions (captured user prompts from claude jsonl) --
+
+    /// Best-effort insert; INSERT OR IGNORE so the agent's restart-resume
+    /// retail doesn't duplicate rows on `(claude_session_id, parent_uuid, ts_ms)`.
+    /// Logs at debug on failure so audit traffic never disrupts PTY flow.
+    pub async fn insert_user_interaction(&self, row: &UserInteractionRow) {
+        let res = sqlx::query(
+            "INSERT OR IGNORE INTO user_interactions
+                (account, agent, workspace, claude_session_id, prompt_id, parent_uuid,
+                 cwd, git_branch, ts_ms, kind, content)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )
+        .bind(&row.account)
+        .bind(&row.agent)
+        .bind(&row.workspace)
+        .bind(&row.claude_session_id)
+        .bind(&row.prompt_id)
+        .bind(&row.parent_uuid)
+        .bind(&row.cwd)
+        .bind(&row.git_branch)
+        .bind(row.ts_ms)
+        .bind(&row.kind)
+        .bind(&row.content)
+        .execute(&self.pool)
+        .await;
+        if let Err(e) = res {
+            tracing::debug!(error = %e, "user_interaction insert failed");
+        }
+    }
+
+    pub async fn list_user_interactions(
+        &self,
+        f: &UserInteractionFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<UserInteractionDisplayRow>> {
+        use sqlx::QueryBuilder;
+        let mut qb = QueryBuilder::new(
+            "SELECT id, account, agent, workspace, claude_session_id, prompt_id, parent_uuid,
+                    cwd, git_branch, ts_ms, kind, content
+               FROM user_interactions
+              WHERE 1=1",
+        );
+        if let Some(v) = &f.account {
+            qb.push(" AND account = ").push_bind(v.clone());
+        }
+        if let Some(v) = &f.workspace {
+            qb.push(" AND workspace = ").push_bind(v.clone());
+        }
+        if let Some(v) = &f.kind {
+            qb.push(" AND kind = ").push_bind(v.clone());
+        }
+        if let Some(v) = f.since_ms {
+            qb.push(" AND ts_ms >= ").push_bind(v);
+        }
+        if let Some(v) = f.until_ms {
+            qb.push(" AND ts_ms <= ").push_bind(v);
+        }
+        qb.push(" ORDER BY ts_ms DESC, id DESC LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| UserInteractionDisplayRow {
+                id: r.get("id"),
+                account: r.get("account"),
+                agent: r.get("agent"),
+                workspace: r.get("workspace"),
+                claude_session_id: r.get("claude_session_id"),
+                prompt_id: r.get("prompt_id"),
+                parent_uuid: r.get("parent_uuid"),
+                cwd: r.get("cwd"),
+                git_branch: r.get("git_branch"),
+                ts_ms: r.get("ts_ms"),
+                kind: r.get("kind"),
+                content: r.get("content"),
+            })
+            .collect())
+    }
+
+    pub async fn count_user_interactions(&self, f: &UserInteractionFilter) -> Result<i64> {
+        use sqlx::QueryBuilder;
+        let mut qb = QueryBuilder::new(
+            "SELECT COUNT(*) AS n FROM user_interactions WHERE 1=1",
+        );
+        if let Some(v) = &f.account {
+            qb.push(" AND account = ").push_bind(v.clone());
+        }
+        if let Some(v) = &f.workspace {
+            qb.push(" AND workspace = ").push_bind(v.clone());
+        }
+        if let Some(v) = &f.kind {
+            qb.push(" AND kind = ").push_bind(v.clone());
+        }
+        if let Some(v) = f.since_ms {
+            qb.push(" AND ts_ms >= ").push_bind(v);
+        }
+        if let Some(v) = f.until_ms {
+            qb.push(" AND ts_ms <= ").push_bind(v);
+        }
+        let row = qb.build().fetch_one(&self.pool).await?;
+        Ok(row.get::<i64, _>("n"))
+    }
+
+    /// Full row including the (sensitive) content text. Returned only
+    /// from the explicit `/reveal` admin endpoint, which also writes an
+    /// audit event so reveals are forensically traceable.
+    pub async fn get_user_interaction(&self, id: i64) -> Result<Option<UserInteractionFullRow>> {
+        let row = sqlx::query(
+            "SELECT id, account, agent, workspace, claude_session_id, prompt_id, parent_uuid,
+                    cwd, git_branch, ts_ms, kind, content
+               FROM user_interactions
+              WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| UserInteractionFullRow {
+            id: r.get("id"),
+            account: r.get("account"),
+            agent: r.get("agent"),
+            workspace: r.get("workspace"),
+            claude_session_id: r.get("claude_session_id"),
+            prompt_id: r.get("prompt_id"),
+            parent_uuid: r.get("parent_uuid"),
+            cwd: r.get("cwd"),
+            git_branch: r.get("git_branch"),
+            ts_ms: r.get("ts_ms"),
+            kind: r.get("kind"),
+            content: r.get("content"),
+        }))
+    }
+
+    // ---- unified activity (audit_events ∪ user_interactions) ---------
+    //
+    // Single read-only view: each side projects into a common shape
+    // (`id, source, ts_ms, kind, account, agent, workspace, session_id,
+    // detail`), then UNION ALL + ORDER BY across the merged set. The
+    // source filter is applied inside each branch via
+    // `($source = 'all' OR $source = 'audit'/'interaction')` so the
+    // optimiser short-circuits the inactive branch when the caller
+    // pins to one side. `audit_events.ts` is in seconds — we multiply
+    // by 1000 inside the SELECT so a cross-table ORDER BY is meaningful.
+
+    pub async fn list_activity(
+        &self,
+        f: &ActivityFilter,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ActivityRow>> {
+        use sqlx::QueryBuilder;
+        let mut qb = QueryBuilder::new("");
+        build_activity_select(&mut qb, f, /*as_count=*/ false);
+        qb.push(" ORDER BY ts_ms DESC, id DESC LIMIT ")
+            .push_bind(limit)
+            .push(" OFFSET ")
+            .push_bind(offset);
+        let rows = qb.build().fetch_all(&self.pool).await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| ActivityRow {
+                id: r.get("id"),
+                source: r.get("source"),
+                ts_ms: r.get("ts_ms"),
+                kind: r.get("kind"),
+                account: r.get("account"),
+                agent: r.get("agent"),
+                workspace: r.get("workspace"),
+                session_id: r.get("session_id"),
+                // Both branches emit valid JSON object text (audit:
+                // pass-through of audit_events.detail; interaction:
+                // SQLite's json_object()). We keep it as String here
+                // and let the admin layer parse — keeps the DB layer
+                // free of serde_json dependencies on the row type.
+                detail: r.get("detail"),
+            })
+            .collect())
+    }
+
+    pub async fn count_activity(&self, f: &ActivityFilter) -> Result<i64> {
+        use sqlx::QueryBuilder;
+        let mut qb = QueryBuilder::new("SELECT COUNT(*) AS n FROM (");
+        build_activity_select(&mut qb, f, /*as_count=*/ true);
+        qb.push(")");
+        let row = qb.build().fetch_one(&self.pool).await?;
+        Ok(row.get::<i64, _>("n"))
+    }
+
     // ---- user preferences (opaque JSON blob per account) --------------
 
     /// Returns the raw JSON blob the webterm last stored for this
@@ -1264,6 +1497,66 @@ pub struct MessageDisplayRow {
     pub body: String,
 }
 
+/// Wire-shaped row the agent ships; everything we need to persist.
+#[derive(Debug, Clone)]
+pub struct UserInteractionRow {
+    pub account: String,
+    pub agent: String,
+    pub workspace: String,
+    pub claude_session_id: String,
+    pub prompt_id: Option<String>,
+    pub parent_uuid: Option<String>,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub ts_ms: i64,
+    pub kind: String,
+    pub content: String,
+}
+
+/// List-page row — `content` is intentionally omitted so a bulk list
+/// can never leak sensitive text. Use `get_user_interaction(id)` +
+/// the `/reveal` endpoint to surface a single row's content.
+#[derive(Debug, Clone)]
+pub struct UserInteractionDisplayRow {
+    pub id: i64,
+    pub account: String,
+    pub agent: String,
+    pub workspace: String,
+    pub claude_session_id: String,
+    pub prompt_id: Option<String>,
+    pub parent_uuid: Option<String>,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub ts_ms: i64,
+    pub kind: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct UserInteractionFullRow {
+    pub id: i64,
+    pub account: String,
+    pub agent: String,
+    pub workspace: String,
+    pub claude_session_id: String,
+    pub prompt_id: Option<String>,
+    pub parent_uuid: Option<String>,
+    pub cwd: Option<String>,
+    pub git_branch: Option<String>,
+    pub ts_ms: i64,
+    pub kind: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UserInteractionFilter {
+    pub account: Option<String>,
+    pub workspace: Option<String>,
+    pub kind: Option<String>,
+    pub since_ms: Option<i64>,
+    pub until_ms: Option<i64>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct AuditFilter {
     pub account: Option<String>,
@@ -1271,4 +1564,152 @@ pub struct AuditFilter {
     pub kind: Option<String>,
     pub since: Option<i64>,
     pub until: Option<i64>,
+}
+
+/// Filter for the unified activity view. `source` is the literal
+/// string `"audit"`, `"interaction"`, or `"all"` (None == "all").
+/// Anything else from the wire is normalised to "all" by the admin
+/// layer before reaching here.
+#[derive(Debug, Clone, Default)]
+pub struct ActivityFilter {
+    pub source: Option<String>,
+    pub account: Option<String>,
+    pub agent: Option<String>,
+    pub workspace: Option<String>,
+    /// Empty / None means no filter. Non-empty vec means
+    /// `kind IN (a, b, c)` — multi-select.
+    pub kind: Option<Vec<String>>,
+    pub since_ms: Option<i64>,
+    pub until_ms: Option<i64>,
+}
+
+/// One row of the merged audit+interaction stream. `detail` is the
+/// raw JSON object text emitted by either branch of the UNION; the
+/// admin layer parses it into `serde_json::Value` for the wire.
+#[derive(Debug, Clone)]
+pub struct ActivityRow {
+    pub id: i64,
+    pub source: String,
+    pub ts_ms: i64,
+    pub kind: String,
+    pub account: Option<String>,
+    pub agent: Option<String>,
+    pub workspace: Option<String>,
+    pub session_id: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Emit `AND kind IN (?, ?, …)` for a non-empty kind filter, or
+/// nothing at all if the filter is unset/empty. Shared by both
+/// branches of the activity UNION so the filter shape stays
+/// consistent (otherwise a `kind=foo,bar` query would only match
+/// audit rows, not interaction ones, or vice versa).
+fn push_kind_in(
+    qb: &mut sqlx::QueryBuilder<'_, sqlx::Sqlite>,
+    kinds: &Option<Vec<String>>,
+) {
+    let Some(kinds) = kinds else { return };
+    if kinds.is_empty() {
+        return;
+    }
+    qb.push(" AND kind IN (");
+    let mut sep = qb.separated(", ");
+    for k in kinds {
+        sep.push_bind(k.clone());
+    }
+    qb.push(")");
+}
+
+/// Push the UNION ALL body into `qb`. Used by both `list_activity`
+/// (wrapped with ORDER BY + LIMIT/OFFSET) and `count_activity`
+/// (wrapped as `SELECT COUNT(*) FROM (...)`). Kept as a free function
+/// because the two callers share every filter clause verbatim — the
+/// only difference is what wraps the union.
+///
+/// `as_count` is currently informational; both branches need the
+/// same shape because SQLite still types the columns of a UNION
+/// regardless of an outer COUNT(*). Kept as a parameter so future
+/// optimisation (e.g. dropping `detail` projection for the count
+/// path) is a one-line tweak.
+fn build_activity_select(
+    qb: &mut sqlx::QueryBuilder<'_, sqlx::Sqlite>,
+    f: &ActivityFilter,
+    _as_count: bool,
+) {
+    let source = f.source.as_deref().unwrap_or("all");
+
+    // --- audit_events branch --------------------------------------
+    qb.push(
+        "SELECT id, 'audit' AS source, ts * 1000 AS ts_ms, kind,
+                account, agent, workspace, session_id, detail
+           FROM audit_events
+          WHERE (",
+    );
+    qb.push_bind(source.to_string())
+        .push(" = 'all' OR ")
+        .push_bind(source.to_string())
+        .push(" = 'audit')");
+    if let Some(v) = &f.account {
+        qb.push(" AND account = ").push_bind(v.clone());
+    }
+    if let Some(v) = &f.agent {
+        qb.push(" AND agent = ").push_bind(v.clone());
+    }
+    if let Some(v) = &f.workspace {
+        qb.push(" AND workspace = ").push_bind(v.clone());
+    }
+    push_kind_in(qb, &f.kind);
+    // since_ms / until_ms compare against the *projected* ts_ms,
+    // but the underlying column is in seconds. Divide on the
+    // bound side (ceil/floor not critical at second granularity).
+    if let Some(v) = f.since_ms {
+        // audit_events.ts is seconds; bound is ms. >= on ms means
+        // >= on (ts*1000), so equivalently ts >= ceil(v/1000).
+        let secs = v.div_euclid(1000);
+        qb.push(" AND ts >= ").push_bind(secs);
+    }
+    if let Some(v) = f.until_ms {
+        // For the upper bound, allow any second whose *start* is
+        // <= until_ms. ts <= floor(v/1000) is the safe bound.
+        let secs = v.div_euclid(1000);
+        qb.push(" AND ts <= ").push_bind(secs);
+    }
+
+    qb.push(" UNION ALL ");
+
+    // --- user_interactions branch ---------------------------------
+    qb.push(
+        "SELECT id, 'interaction' AS source, ts_ms, kind,
+                account, agent, workspace,
+                claude_session_id AS session_id,
+                json_object(
+                    'content',     content,
+                    'cwd',         cwd,
+                    'git_branch',  git_branch,
+                    'prompt_id',   prompt_id,
+                    'parent_uuid', parent_uuid
+                ) AS detail
+           FROM user_interactions
+          WHERE (",
+    );
+    qb.push_bind(source.to_string())
+        .push(" = 'all' OR ")
+        .push_bind(source.to_string())
+        .push(" = 'interaction')");
+    if let Some(v) = &f.account {
+        qb.push(" AND account = ").push_bind(v.clone());
+    }
+    if let Some(v) = &f.agent {
+        qb.push(" AND agent = ").push_bind(v.clone());
+    }
+    if let Some(v) = &f.workspace {
+        qb.push(" AND workspace = ").push_bind(v.clone());
+    }
+    push_kind_in(qb, &f.kind);
+    if let Some(v) = f.since_ms {
+        qb.push(" AND ts_ms >= ").push_bind(v);
+    }
+    if let Some(v) = f.until_ms {
+        qb.push(" AND ts_ms <= ").push_bind(v);
+    }
 }

@@ -19,8 +19,13 @@
 ;; - signals to own children only — can't poke same-uid host processes.
 ;;
 ;; Parameters supplied via sandbox_init_with_parameters:
-;;   WORKSPACE  — abs path of the current workspace dir (rw allowed)
-;;   HOME_DIR   — abs path of the user's home dir
+;;   WORKSPACE           — abs path of the current workspace dir (rw allowed)
+;;   WORKSPACE_ROOT      — agent's workspace_root dir (siblings get denied)
+;;   HOME_DIR            — abs path of the user's home dir
+;;   CLAUDE_PROJECT_DIR  — claude's own per-cwd subdir name under
+;;                         ~/.claude/projects/ (= abs cwd with every '/'
+;;                         replaced by '-'); used for cross-project
+;;                         isolation under ~/.claude/projects.
 ;;
 ;; Notes
 ;; -----
@@ -149,9 +154,16 @@
 ;; ---------------------------------------------------------------------
 ;; write access — scratch and the controlling TTY
 ;; ---------------------------------------------------------------------
+;; /private/tmp + /private/var/tmp are world-writable system temp dirs
+;; (mode 1777) shared across all uids on the host. Even with our own
+;; Seatbelt isolation, leaving them rw means: (1) a session can drop
+;; world-readable secrets there by accident, (2) it can read whatever
+;; other host services have left in /tmp (X sockets, daemon state, …),
+;; (3) different cloudcode sessions on the same host could cross-talk.
+;; We keep /private/var/folders open because that's the macOS per-user
+;; TMPDIR (already namespaced by uid + 8-char hash); without it node /
+;; git / brew lose their default mktemp dest.
 (allow file-write*
-    (subpath "/private/tmp")
-    (subpath "/private/var/tmp")
     (subpath "/private/var/folders")
     (literal "/dev/null")
     (literal "/dev/dtracehelper")
@@ -202,6 +214,86 @@
 
 (deny file-write*
     (regex #".*/\.git/hooks/.*"))
+
+;; ---------------------------------------------------------------------
+;; cross-project isolation under ~/.claude
+;; ---------------------------------------------------------------------
+;; claude maintains a per-cwd subdir under ~/.claude/projects/ where it
+;; stores the session log + per-project memory dir. Without this rule a
+;; session has read+write access to every historical project's session
+;; log and memory — that's both a cross-session prompt-injection vector
+;; (write somebody else's memory dir → it gets auto-loaded next time
+;; that workspace boots) and a leak of past project names.
+;;
+;; Pattern mirrors the WORKSPACE_ROOT isolation higher up.
+(deny file-read-data file-read-xattr file-write*
+    (require-all
+        (subpath (string-append (param "HOME_DIR") "/.claude/projects"))
+        (require-not
+            (subpath (string-append (param "HOME_DIR")
+                                    "/.claude/projects/"
+                                    (param "CLAUDE_PROJECT_DIR"))))))
+
+;; Global session storage + shell-snapshots + history — contain
+;; conversation logs from every project this user has ever opened.
+;; Block both read and write outright.
+(deny file-read* file-write*
+    (literal (string-append (param "HOME_DIR") "/.claude/__store.db"))
+    (subpath (string-append (param "HOME_DIR") "/.claude/shell-snapshots"))
+    (subpath (string-append (param "HOME_DIR") "/.claude/history")))
+
+;; ---------------------------------------------------------------------
+;; admin-controlled claude config — read-only at runtime
+;; ---------------------------------------------------------------------
+;; Hooks, custom slash commands, plugins, global CLAUDE.md, and
+;; settings.json are things an operator pre-configures. A compromised
+;; session must not be able to rewrite them — that would persist
+;; injection across every workspace this user touches.
+;;
+;; ~/.claude/projects/<self>/ (memory, session log) is intentionally
+;; *not* covered here: claude's own per-project memory needs to persist
+;; within the current workspace's slot. Tightening that further is a
+;; policy decision left to the operator (e.g. ship a read-only
+;; settings.json that disables auto-memory).
+(deny file-write*
+    (literal (string-append (param "HOME_DIR") "/.claude/settings.json"))
+    (literal (string-append (param "HOME_DIR") "/.claude/CLAUDE.md"))
+    (subpath (string-append (param "HOME_DIR") "/.claude/commands"))
+    (subpath (string-append (param "HOME_DIR") "/.claude/hooks"))
+    (subpath (string-append (param "HOME_DIR") "/.claude/plugins")))
+
+;; ~/.claude.json — left writable. claude persists per-project state
+;; into this file (trust prompt acks, project history, last-used
+;; preferences). Denying writes here makes claude hang at the trust
+;; prompt because the ack can't be saved. The earlier rule at
+;; ~line 124 keeps file-read* + file-write* allowed for this regex.
+
+;; ---------------------------------------------------------------------
+;; system tmp dirs — shared across all uids (mode 1777). Block content
+;; read + write but keep metadata so `stat /tmp` still works (some
+;; userland fall back to it if the dir doesn't show up at all).
+;; ---------------------------------------------------------------------
+(deny file-read-data file-read-xattr file-write*
+    (subpath "/private/tmp")
+    (subpath "/private/var/tmp"))
+
+;; ---------------------------------------------------------------------
+;; shell rc — write was already denied above; tighten read so per-user
+;; aliases / env exports don't leak into a session's prompt context.
+;; ---------------------------------------------------------------------
+(deny file-read*
+    (literal (string-append (param "HOME_DIR") "/.bashrc"))
+    (literal (string-append (param "HOME_DIR") "/.bash_profile"))
+    (literal (string-append (param "HOME_DIR") "/.bash_login"))
+    (literal (string-append (param "HOME_DIR") "/.bash_logout"))
+    (literal (string-append (param "HOME_DIR") "/.zshrc"))
+    (literal (string-append (param "HOME_DIR") "/.zprofile"))
+    (literal (string-append (param "HOME_DIR") "/.zlogin"))
+    (literal (string-append (param "HOME_DIR") "/.zlogout"))
+    (literal (string-append (param "HOME_DIR") "/.zshenv"))
+    (literal (string-append (param "HOME_DIR") "/.profile"))
+    (literal (string-append (param "HOME_DIR") "/.cshrc"))
+    (literal (string-append (param "HOME_DIR") "/.tcshrc")))
 
 ;; ---------------------------------------------------------------------
 ;; network — fully open

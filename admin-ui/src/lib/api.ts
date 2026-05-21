@@ -166,6 +166,29 @@ export const apiClient = {
         body: JSON.stringify(body),
       }),
   },
+  interactions: {
+    list: (params: {
+      account?: string;
+      workspace?: string;
+      kind?: string;
+      since_ms?: number;
+      until_ms?: number;
+      limit?: number;
+      offset?: number;
+    }) => {
+      const p = new URLSearchParams();
+      for (const [k, v] of Object.entries(params)) {
+        if (v !== undefined && v !== '') p.set(k, String(v));
+      }
+      return api<{ items: InteractionDto[]; total: number }>(
+        `/interactions?${p.toString()}`,
+      );
+    },
+    reveal: (id: number) =>
+      api<{ id: number; content: string }>(`/interactions/${id}/reveal`, {
+        method: 'POST',
+      }),
+  },
   stats: {
     leaderboard: (window: '7d' | '30d', group: 'account' | 'agent') =>
       api<LeaderboardRowDto[]>(`/stats/leaderboard?window=${window}&group=${group}`),
@@ -177,6 +200,32 @@ export const apiClient = {
       api<MessagesPerSessionDto>(`/stats/messages-per-session?window=${window}`),
     tokensDaily: (days: number) =>
       api<DailyTokenDto[]>(`/stats/tokens-daily?days=${days}`),
+  },
+  activity: {
+    list: (params: {
+      source?: 'audit' | 'interaction' | 'all';
+      account?: string;
+      agent?: string;
+      workspace?: string;
+      /// Comma-separated list of kinds; backend splits and does
+      /// `kind IN (...)`. Pass a single value or `"a,b,c"`.
+      kind?: string;
+      since_ms?: number;
+      until_ms?: number;
+      limit?: number;
+      offset?: number;
+    }) => {
+      const p = new URLSearchParams();
+      for (const [k, v] of Object.entries(params)) {
+        if (v !== undefined && v !== '') p.set(k, String(v));
+      }
+      return api<{ items: ActivityDto[]; total: number }>(
+        `/activity?${p.toString()}`,
+      );
+    },
+    // Distinct kind values across both backing tables — powers the
+    // multi-select dropdown in the Activity filter bar.
+    kinds: () => api<string[]>('/activity/kinds'),
   },
   audit: {
     list: (q: Record<string, string | number | undefined>) => {
@@ -317,4 +366,33 @@ export type WorkspaceRowDto = {
   tmux_alive: boolean;
   agent_online: boolean;
   last_started_at: number | null;
+};
+
+export type InteractionDto = {
+  id: number;
+  account: string;
+  agent: string;
+  workspace: string;
+  claude_session_id: string;
+  prompt_id: string | null;
+  cwd: string | null;
+  git_branch: string | null;
+  ts_ms: number;
+  kind: string; // "prompt" | "bash_input"
+  content: string;
+};
+
+export type ActivityDto = {
+  id: number;
+  source: 'audit' | 'interaction';
+  ts_ms: number; // milliseconds since epoch
+  kind: string;
+  account: string | null;
+  agent: string | null;
+  workspace: string | null;
+  session_id: string | null;
+  detail: Record<string, unknown> | null;
+  // audit row: original audit_events.detail parsed as JSON object
+  // interaction row: { content: string, cwd: string|null, git_branch: string|null,
+  //                    prompt_id: string|null, parent_uuid: string|null }
 };

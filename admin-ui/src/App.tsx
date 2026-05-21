@@ -1,10 +1,10 @@
-import { Routes, Route } from 'react-router-dom';
+import { Routes, Route, Navigate } from 'react-router-dom';
 import { Layout } from '@/components/Layout';
 import { Login } from '@/pages/Login';
 import { Dashboard } from '@/pages/Dashboard';
 import { Accounts } from '@/pages/Accounts';
 import { Agents } from '@/pages/Agents';
-import { Audit } from '@/pages/Audit';
+import { Activity } from '@/pages/Activity';
 import { Sessions } from '@/pages/Sessions';
 import { SessionDetail } from '@/pages/SessionDetail';
 import { Workspaces } from '@/pages/Workspaces';
@@ -29,7 +29,10 @@ export default function App() {
           <Route path="workspaces" element={<Workspaces />} />
           <Route path="sessions" element={<Sessions />} />
           <Route path="sessions/:id" element={<SessionDetail />} />
-          <Route path="audit" element={<Audit />} />
+          <Route path="activity" element={<Activity />} />
+          {/* Legacy redirects — keep bookmarks alive */}
+          <Route path="audit" element={<Navigate to="/activity" replace />} />
+          <Route path="interactions" element={<Navigate to="/activity" replace />} />
         </Route>
       </Routes>
     </AuthProvider>

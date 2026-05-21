@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "7";
+pub const PROTOCOL_VERSION: &str = "8";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
@@ -145,6 +145,32 @@ pub enum ClientMsg {
         request_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+
+    /// One user-typed prompt (or bash escape) captured from claude's
+    /// per-project jsonl log. Distinct from `Message` (which carries
+    /// every event for the conversation view): this is filtered to
+    /// actual human inputs and lands in `user_interactions` for the
+    /// admin audit surface. New in v1.14 (protocol v8).
+    UserInteraction {
+        account: String,
+        workspace: String,
+        /// UUID of the claude session (jsonl filename stem). Independent
+        /// of the cloudcode pty `session_id` namespace.
+        claude_session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent_uuid: Option<String>,
+        cwd: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        git_branch: Option<String>,
+        /// Wall-clock at which claude wrote this jsonl row.
+        ts_ms: i64,
+        /// Either `"prompt"` or `"bash_input"`. Tool writebacks are
+        /// filtered out by the agent before they reach the wire.
+        kind: String,
+        content: String,
     },
 }
 
