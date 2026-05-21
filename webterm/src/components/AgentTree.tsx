@@ -6,6 +6,12 @@ import { useState, useEffect, useMemo } from 'react';
 import type { WorkspaceItem } from '@/lib/wire';
 import { KNOWN_TOOLS } from '@/lib/tools';
 
+// Tools surfaced by the "Open with…" menus. KNOWN_TOOLS stays the
+// source of truth for "can be launched" (tabLabel, preferences
+// schema, default tool); this is a narrower set — codex is hidden
+// from the picker for now alongside the Settings dialog change.
+const OPEN_WITH_TOOLS = KNOWN_TOOLS.filter((t) => t !== 'codex');
+
 type Props = {
   workspaces: WorkspaceItem[];
   loading: boolean;
@@ -85,7 +91,7 @@ export default function AgentTree({
           className="fixed z-50 min-w-[10rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
           style={{ left: wsMenu.x, top: wsMenu.y }}
         >
-          {KNOWN_TOOLS.map((tool) => (
+          {OPEN_WITH_TOOLS.map((tool) => (
             <button
               key={tool}
               type="button"
@@ -245,7 +251,7 @@ function WorkspaceRow({
             className="fixed z-50 min-w-[10rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
             style={{ left: dropdownPos.x, top: dropdownPos.y }}
           >
-            {KNOWN_TOOLS.map((tool) => (
+            {OPEN_WITH_TOOLS.map((tool) => (
               <button
                 key={tool}
                 type="button"

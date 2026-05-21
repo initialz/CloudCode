@@ -336,6 +336,26 @@ export default function Workbench() {
       );
       if (existing) {
         setActiveTabId(existing.id);
+        // Mirror the focus + fit that `selectTab` does so clicking a
+        // sidebar row for an already-open tab lands the cursor in
+        // xterm — without this the user has to click the terminal
+        // pane once more before typing.
+        requestAnimationFrame(() => {
+          if (!containersRef.current.has(existing.id)) return;
+          try {
+            existing.fitAddon.fit();
+            if (existing.ws.connected) {
+              existing.ws.send({
+                type: 'resize',
+                cols: existing.term.cols,
+                rows: existing.term.rows,
+              });
+            }
+          } catch {
+            // ignore
+          }
+          existing.term.focus();
+        });
         return;
       }
 
@@ -577,11 +597,11 @@ export default function Workbench() {
         break;
       case 'session_closed':
         // claude exited (/exit, Ctrl+C, crash) — collapse the tab so
-        // the user doesn't have to click ✕. The sidebar's status dot
-        // tracks the workspace separately.
-        if (ctrlAgentRef.current === agent) {
-          ctrlWsRef.current?.send({ type: 'list_workspaces' });
-        }
+        // the user doesn't have to click ✕, and pull a fresh
+        // workspace list so the sidebar dot drops from green
+        // immediately. v1.13's list_workspaces is cross-agent, so
+        // there's no agent-scoped guard to keep here.
+        ctrlWsRef.current?.send({ type: 'list_workspaces' });
         closeTabRef.current(tabId);
         break;
       default:
@@ -605,13 +625,34 @@ export default function Workbench() {
       }
       dispatchTabs({ type: 'REMOVE', id });
 
-      // Pick next active tab
+      // Pick next active tab + land the cursor in its xterm. Without
+      // the focus deferral, ctrl-C / /exit collapses the current tab,
+      // we slide one over, and the user has to click the terminal
+      // again before they can type.
       setActiveTabId((prev) => {
         if (prev !== id) return prev;
         const remaining = all.filter((t) => t.id !== id);
         if (remaining.length === 0) return null;
         const idx = all.findIndex((t) => t.id === id);
-        return remaining[Math.min(idx, remaining.length - 1)].id;
+        const nextId = remaining[Math.min(idx, remaining.length - 1)].id;
+        requestAnimationFrame(() => {
+          const next = tabsRef.current.find((t) => t.id === nextId);
+          if (!next || !containersRef.current.has(next.id)) return;
+          try {
+            next.fitAddon.fit();
+            if (next.ws.connected) {
+              next.ws.send({
+                type: 'resize',
+                cols: next.term.cols,
+                rows: next.term.rows,
+              });
+            }
+          } catch {
+            // ignore
+          }
+          next.term.focus();
+        });
+        return nextId;
       });
     },
     [],
