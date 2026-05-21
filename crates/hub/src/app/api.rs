@@ -17,8 +17,8 @@ use crate::AppState;
 use axum::{
     extract::{Extension, State},
     http::{
-        header::{AUTHORIZATION, SET_COOKIE},
-        HeaderMap, HeaderValue, StatusCode,
+        header::SET_COOKIE,
+        HeaderMap, StatusCode,
     },
     response::{IntoResponse, Response},
     Json,
@@ -39,44 +39,32 @@ fn err(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
 
 #[derive(Deserialize)]
 pub struct LoginRequest {
+    pub username: String,
     pub token: String,
 }
 
 /// `POST /api/login`
 ///
-/// Body: `{"token":"cc_..."}`. We reuse `crate::auth::authenticate`
-/// (same code path the CLI client and the pty WS Hello frame go
-/// through), packing the body token into an Authorization header so
-/// the helper sees it.
+/// Body: `{"username":"alice","token":"cc_..."}`. Looks the account
+/// up by name, then argon2-verifies the token — single hash check
+/// instead of the WS Hello frame's all-rows scan.
 ///
 /// On success: set the session cookie and return the account name +
 /// hub version (cuts a follow-up `/me` round-trip on first paint).
 pub async fn login(State(state): State<Arc<AppState>>, Json(req): Json<LoginRequest>) -> Response {
+    let username = req.username.trim().to_string();
     let token = req.token.trim().to_string();
-    if token.is_empty() {
+    if username.is_empty() || token.is_empty() {
         return err(
             StatusCode::BAD_REQUEST,
             "invalid_input",
-            "token is required",
+            "username and token are required",
         );
     }
-    let mut headers = HeaderMap::new();
-    let bearer = match HeaderValue::from_str(&format!("Bearer {}", token)) {
-        Ok(v) => v,
-        Err(_) => {
-            return err(
-                StatusCode::BAD_REQUEST,
-                "invalid_input",
-                "token contains invalid characters",
-            );
-        }
-    };
-    headers.insert(AUTHORIZATION, bearer);
-
-    let account = match auth::authenticate(&state.db, &headers).await {
+    let account = match auth::authenticate_account(&state.db, &username, &token).await {
         Ok(a) => a,
         Err(reason) => {
-            return err(StatusCode::UNAUTHORIZED, "invalid_token", reason);
+            return err(StatusCode::UNAUTHORIZED, "invalid_credentials", reason);
         }
     };
 

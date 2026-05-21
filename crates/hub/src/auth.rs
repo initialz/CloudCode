@@ -62,9 +62,38 @@ pub fn extract_token(headers: &HeaderMap) -> Option<String> {
         .map(String::from)
 }
 
-/// Look up a plaintext token against every active account in the db.
-/// O(N) on accounts (each row needs an argon2 verify) but N is small
-/// — hubs in the wild have one account per developer.
+/// Username+token authentication path used by the SPA login form.
+/// O(1) account lookup, one argon2 verify on hit. Returns a generic
+/// "invalid credentials" error in every failure mode so the caller
+/// can't tell missing-account from bad-token (avoids a user-name
+/// enumeration oracle).
+pub async fn authenticate_account(
+    db: &Db,
+    username: &str,
+    token: &str,
+) -> Result<DbAccount, &'static str> {
+    let username = username.trim();
+    if username.is_empty() || token.is_empty() {
+        return Err("invalid credentials");
+    }
+    let account = db
+        .get_account(username)
+        .await
+        .map_err(|_| "db error")?
+        .ok_or("invalid credentials")?;
+    if account.disabled {
+        return Err("invalid credentials");
+    }
+    if !verify_token(token, &account.token_hash) {
+        return Err("invalid credentials");
+    }
+    Ok(account)
+}
+
+/// Token-only authentication used by the WS Hello frame (CLI client
+/// sends a bare token, no username). O(N) on accounts (each row
+/// needs an argon2 verify) but N is small — hubs in the wild have
+/// one account per developer.
 pub async fn authenticate(db: &Db, headers: &HeaderMap) -> Result<DbAccount, &'static str> {
     let token = extract_token(headers).ok_or("missing token")?;
     let accounts = db.list_accounts().await.map_err(|_| "db error")?;

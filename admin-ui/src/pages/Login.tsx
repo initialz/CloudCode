@@ -5,6 +5,11 @@ import { useAuth } from '@/lib/auth';
 import { Logo } from '@/components/Logo';
 
 export function Login() {
+  // The hub has exactly one admin identity, so the username is
+  // effectively a constant. We still surface a field for visual
+  // parity with the user-facing login and pre-fill it; the server
+  // rejects anything other than "admin".
+  const [username, setUsername] = useState('admin');
   const [token, setToken] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -22,7 +27,7 @@ export function Login() {
     setError(null);
     setBusy(true);
     try {
-      await apiClient.login(token.trim());
+      await apiClient.login(username.trim(), token.trim());
       setIn();
       const dest = (loc.state as any)?.from?.pathname ?? '/';
       nav(dest, { replace: true });
@@ -54,9 +59,25 @@ export function Login() {
         )}
 
         <label className="block">
+          <span className="text-sm text-zinc-700 dark:text-zinc-300">Username</span>
+          <input
+            type="text"
+            autoComplete="username"
+            spellCheck={false}
+            autoCapitalize="off"
+            autoCorrect="off"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            required
+            className="mt-1 w-full px-3 py-2 rounded border border-zinc-300 dark:border-zinc-700 bg-transparent text-sm focus:outline-none focus:ring-2 focus:ring-zinc-400"
+          />
+        </label>
+
+        <label className="block">
           <span className="text-sm text-zinc-700 dark:text-zinc-300">Admin token</span>
           <input
             type="password"
+            autoComplete="current-password"
             value={token}
             onChange={(e) => setToken(e.target.value)}
             autoFocus
@@ -67,7 +88,7 @@ export function Login() {
 
         <button
           type="submit"
-          disabled={busy || !token.trim()}
+          disabled={busy || !username.trim() || !token.trim()}
           className="w-full py-2 rounded bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 text-sm font-medium hover:opacity-90 disabled:opacity-50"
         >
           {busy ? 'Signing in…' : 'Sign in'}

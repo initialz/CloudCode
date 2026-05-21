@@ -83,8 +83,16 @@ fn norm(v: &Option<String>) -> Option<String> {
 // Auth — login / logout / me
 // ---------------------------------------------------------------------
 
+/// The admin login form gained a username field for visual parity
+/// with the user-facing login, but the hub still has exactly one
+/// admin identity. We require the literal `"admin"` here so a typo
+/// fails fast instead of the user wondering why their non-`admin`
+/// username silently "worked".
+const ADMIN_USERNAME: &str = "admin";
+
 #[derive(Deserialize)]
 pub struct LoginRequest {
+    pub username: String,
     pub token: String,
 }
 
@@ -92,8 +100,21 @@ pub async fn login(
     State(state): State<AdminState>,
     Json(req): Json<LoginRequest>,
 ) -> Response {
-    let Some(sid) = state.auth.login(req.token.trim()).await else {
-        return err(StatusCode::UNAUTHORIZED, "invalid_token", "invalid admin token");
+    let username = req.username.trim();
+    let token = req.token.trim();
+    if username != ADMIN_USERNAME || token.is_empty() {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "invalid admin credentials",
+        );
+    }
+    let Some(sid) = state.auth.login(token).await else {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "invalid_credentials",
+            "invalid admin credentials",
+        );
     };
     let cookie = format!(
         "{name}={sid}; HttpOnly; SameSite=Strict; Path=/admin; Max-Age={ttl}",

@@ -307,6 +307,27 @@ impl Db {
             .collect())
     }
 
+    /// Look up a single account by name. Used by the username+token
+    /// login path so we don't pay the O(N) argon2 verify of
+    /// `authenticate()`. `Ok(None)` means no such name.
+    pub async fn get_account(&self, name: &str) -> Result<Option<DbAccount>> {
+        let row = sqlx::query(
+            "SELECT name, token_hash, token_prefix, created_at, disabled, sandbox_enabled
+             FROM accounts WHERE name = ?1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| DbAccount {
+            name: r.get("name"),
+            token_hash: r.get("token_hash"),
+            token_prefix: r.get("token_prefix"),
+            created_at: r.get("created_at"),
+            disabled: r.get::<i64, _>("disabled") != 0,
+            sandbox_enabled: r.get::<i64, _>("sandbox_enabled") != 0,
+        }))
+    }
+
     pub async fn list_accounts(&self) -> Result<Vec<DbAccount>> {
         let rows = sqlx::query(
             "SELECT name, token_hash, token_prefix, created_at, disabled, sandbox_enabled
