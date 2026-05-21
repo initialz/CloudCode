@@ -554,6 +554,31 @@ impl Db {
             .collect())
     }
 
+    /// Every workspace binding in the table, across all accounts and
+    /// agents. Used by the admin inventory page so it can surface
+    /// bindings whose owning agent happens to be offline at request
+    /// time (without falling back to reconstructing the set from the
+    /// sessions table — which would resurrect rows the admin just
+    /// deleted).
+    pub async fn list_all_workspace_bindings(&self) -> Result<Vec<WorkspaceBinding>> {
+        let rows = sqlx::query(
+            "SELECT account, agent, name, created_at
+               FROM workspaces
+              ORDER BY agent, account, name",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| WorkspaceBinding {
+                account: r.get("account"),
+                agent: r.get("agent"),
+                name: r.get("name"),
+                created_at: r.get("created_at"),
+            })
+            .collect())
+    }
+
     /// Look up the owning agent for a given workspace name. Used by
     /// OpenSession to route to the right agent without the client
     /// having to specify it on every call. Returns `Ok(None)` if no

@@ -1338,29 +1338,40 @@ pub async fn workspaces_list(State(state): State<AdminState>) -> Response {
         }
     }
 
-    // Surface historical workspaces whose agent is offline (or didn't
-    // respond): they still belong on the inventory page, just shown as
-    // fresh with agent_online=false so the admin can see them.
-    for ((agent, account, workspace), ts) in last_started.iter() {
-        let key = (agent.clone(), account.clone(), workspace.clone());
+    // Surface DB-tracked workspaces whose owning agent is offline:
+    // they still belong on the inventory page, just shown as fresh
+    // with agent_online=false. We deliberately *don't* fall back to
+    // the sessions table here — using session history to reconstruct
+    // the inventory would resurrect rows the admin just deleted via
+    // the Delete button, because audit records (correctly) outlive a
+    // binding deletion.
+    let db_bindings = state
+        .app
+        .db
+        .list_all_workspace_bindings()
+        .await
+        .unwrap_or_default();
+    for b in db_bindings {
+        let key = (b.agent.clone(), b.account.clone(), b.name.clone());
         if seen.contains(&key) {
             continue;
         }
-        let online = online_names.contains(agent);
-        if online {
-            // Agent is online but its list didn't include this workspace
-            // — it was likely deleted on the agent side. Skip.
+        if online_names.contains(&b.agent) {
+            // Agent is online but its list didn't include this
+            // workspace — it was likely deleted on the agent side
+            // out-of-band. Skip; the next refresh will catch up
+            // either way.
             continue;
         }
         rows.push(WorkspaceRowDto {
-            agent: agent.clone(),
-            account: account.clone(),
-            workspace: workspace.clone(),
+            agent: b.agent,
+            account: b.account,
+            workspace: b.name,
             status: "fresh",
             has_client: false,
             tmux_alive: false,
             agent_online: false,
-            last_started_at: Some(*ts),
+            last_started_at: last_started.get(&key).copied(),
         });
     }
 
