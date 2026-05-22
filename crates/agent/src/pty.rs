@@ -147,10 +147,20 @@ impl PtyManager {
                     // Drag-end: stop the selection but stay in copy
                     // mode so it remains visible and the user can
                     // decide what to do next.
+                    //
+                    // Single click in copy-mode → `clear-selection`,
+                    // NOT `cancel`. Difference matters: `cancel` exits
+                    // copy-mode and snaps the viewport back to the
+                    // alt-screen bottom, which on webterm felt like
+                    // "click teleports me to the bottom" while
+                    // scrolled up; `clear-selection` drops the
+                    // highlighted region but keeps the viewport
+                    // exactly where the user scrolled to. Esc remains
+                    // the deliberate exit (default tmux binding).
                     "bind-key -T copy-mode    MouseDragEnd1Pane send-keys -X stop-selection\n\
                      bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X stop-selection\n\
-                     bind-key -T copy-mode    MouseDown1Pane    send-keys -X cancel\n\
-                     bind-key -T copy-mode-vi MouseDown1Pane    send-keys -X cancel\n\
+                     bind-key -T copy-mode    MouseDown1Pane    send-keys -X clear-selection\n\
+                     bind-key -T copy-mode-vi MouseDown1Pane    send-keys -X clear-selection\n\
                      bind-key -T copy-mode    Enter {copy_pipe}\n\
                      bind-key -T copy-mode-vi Enter {copy_pipe}\n\
                      bind-key -T copy-mode    y     {copy_pipe}\n\
@@ -351,8 +361,8 @@ impl PtyManager {
         // without emitting PtyClosed because we set a no-emit marker through
         // the absence of the entry in `sessions`).
         let _ = self.sessions.remove(&session_id);
-        let cwd = self.workspace_root().join(&account).join(&workspace);
-        if let Err(e) = std::fs::create_dir_all(&cwd) {
+        let cwd_raw = self.workspace_root().join(&account).join(&workspace);
+        if let Err(e) = std::fs::create_dir_all(&cwd_raw) {
             let _ = tx
                 .send(OutFrame::Text(ClientMsg::PtyError {
                     session_id,
@@ -361,6 +371,17 @@ impl PtyManager {
                 .await;
             return;
         }
+        // Canonicalize so `claude --continue` actually finds its
+        // session history. claude derives its per-project subdir
+        // under ~/.claude/projects/ from the *absolute* cwd; if we
+        // hand the wrapper a relative cwd (because agent.toml ships
+        // `workspace_root = "./agent/workspaces"`) the encoded
+        // path mismatches every existing jsonl and the wrapper
+        // falls back to a fresh boot — i.e. "every reconnect starts
+        // with empty chat history". canonicalize fails if the dir
+        // somehow vanished between create_dir_all and now; fall back
+        // to the raw path in that pathological case.
+        let cwd = std::fs::canonicalize(&cwd_raw).unwrap_or(cwd_raw);
 
         // Open the PTY.
         let size = PtySize {
@@ -668,10 +689,17 @@ impl PtyManager {
 
         let session_name = format!("cloudcode-{}-{}", handle.account, handle.workspace);
         let tmux_label = format!("cc-{}-{}", handle.account, handle.workspace);
-        let cwd = self
+        let cwd_raw = self
             .workspace_root()
             .join(&handle.account)
             .join(&handle.workspace);
+        // Canonicalize so claude's per-project jsonl lookup hits its
+        // real `~/.claude/projects/<abs-path-encoded>/` dir. See the
+        // longer note in the `OpenSession` branch above — agent.toml
+        // commonly ships a relative `workspace_root`, which leaks
+        // through every code path that wants to derive claude's
+        // project encoding from cwd.
+        let cwd = std::fs::canonicalize(&cwd_raw).unwrap_or(cwd_raw);
 
         // Pre-compute claude project dir so the wrapper's resume gating
         // works even when tool_name == "claude" in a split pane.
@@ -903,8 +931,8 @@ impl PtyManager {
         {
             Err(e) => Some(e),
             Ok(()) => {
-                let dir = self.account_root(&account).join(&name);
-                if !dir.exists() {
+                let dir_raw = self.account_root(&account).join(&name);
+                if !dir_raw.exists() {
                     Some(format!("workspace '{}' does not exist", name))
                 } else {
                     // Tear down the per-workspace tmux server we spawned
@@ -916,13 +944,17 @@ impl PtyManager {
                     // a recreated workspace with the same name doesn't
                     // silently `--continue` into the old chat. The
                     // workspace cwd encodes deterministically into a
-                    // dir name under ~/.claude/projects/.
+                    // dir name under ~/.claude/projects/ — but the
+                    // encoding is based on the *absolute* cwd claude
+                    // sees, so we canonicalize first (workspace_root
+                    // is often a relative path in agent.toml).
+                    let dir = std::fs::canonicalize(&dir_raw).unwrap_or_else(|_| dir_raw.clone());
                     if let Some(home) = dirs::home_dir() {
                         let claude_proj =
                             crate::jsonl::project_dir(&home, &dir);
                         let _ = std::fs::remove_dir_all(&claude_proj);
                     }
-                    std::fs::remove_dir_all(&dir)
+                    std::fs::remove_dir_all(&dir_raw)
                         .err()
                         .map(|e| format!("remove: {}", e))
                 }
@@ -953,13 +985,20 @@ impl PtyManager {
         {
             Err(e) => Some(e),
             Ok(()) => {
-                let dir = self.account_root(&account).join(&name);
-                if !dir.exists() {
+                let dir_raw = self.account_root(&account).join(&name);
+                if !dir_raw.exists() {
                     Some(format!("workspace '{}' does not exist", name))
                 } else {
                     let _ = std::process::Command::new(&self.tmux.executable)
                         .args(["-L", &format!("cc-{}-{}", account, name), "kill-server"])
                         .output();
+                    // Canonicalize before computing claude's project
+                    // dir; same reasoning as workspace_delete above
+                    // (workspace_root is typically relative in
+                    // agent.toml, the encoded dir under
+                    // ~/.claude/projects/ is keyed on the absolute
+                    // cwd claude sees).
+                    let dir = std::fs::canonicalize(&dir_raw).unwrap_or(dir_raw);
                     if let Some(home) = dirs::home_dir() {
                         let claude_proj = crate::jsonl::project_dir(&home, &dir);
                         let _ = std::fs::remove_dir_all(&claude_proj);

@@ -367,6 +367,15 @@ export default function Workbench() {
         fontFamily: 'ui-monospace, Menlo, Monaco, monospace',
         fontSize: 14,
         theme: xtermTheme(isDark),
+        // Default is true, which interprets "any user input" — *including
+        // a plain click on the terminal pane* — as a signal to snap the
+        // viewport to the bottom. That ruined the UX of scrolling up
+        // through claude's history: the moment you click anywhere to,
+        // say, start a selection, you're yanked back to the end. New PTY
+        // output still scrolls automatically (xterm respects the user's
+        // current scroll position only while they're scrolled up — once
+        // the viewport is at the bottom new bytes push it along).
+        scrollOnUserInput: false,
       });
       const fitAddon = new FitAddon();
       const linksAddon = new WebLinksAddon();
@@ -732,6 +741,7 @@ export default function Workbench() {
       let downX = 0;
       let downY = 0;
       let movedDuringDrag = false;
+
       el.addEventListener(
         'mousedown',
         (ev) => {
