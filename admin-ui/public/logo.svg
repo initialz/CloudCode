@@ -4,9 +4,4 @@
   <path d="M18 44 C9 44, 9 30, 18 30 C16 19, 31 16, 35 25 C41 17, 54 22, 50 31 C58 31, 58 44, 50 44 Z"
         stroke="currentColor" stroke-width="3" stroke-linejoin="round"
         fill="currentColor" fill-opacity="0.08"/>
-  <polyline points="23 30, 30 36, 23 42"
-            stroke="currentColor" stroke-width="2.5"
-            stroke-linecap="round" stroke-linejoin="round"/>
-  <line x1="33" y1="42" x2="44" y2="42"
-        stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
 </svg>

@@ -23,22 +23,6 @@ export default function Logo({ className = '', size = 32 }: Props) {
         fill="currentColor"
         fillOpacity="0.08"
       />
-      <polyline
-        points="23 30, 30 36, 23 42"
-        stroke="currentColor"
-        strokeWidth="2.5"
-        strokeLinecap="round"
-        strokeLinejoin="round"
-      />
-      <line
-        x1="33"
-        y1="42"
-        x2="44"
-        y2="42"
-        stroke="currentColor"
-        strokeWidth="2.5"
-        strokeLinecap="round"
-      />
     </svg>
   );
 }
