@@ -56,6 +56,9 @@ export type AccountDto = {
   last_used_at: number | null;
   /// At least one session is currently live.
   online: boolean;
+  /// At least one WebSocket connection is open (webterm tab loaded
+  /// or CLI dialled in), even before a workspace is opened.
+  connected: boolean;
   /// Per-account sandbox toggle (replaces agent.toml [sandbox]).
   sandbox_enabled: boolean;
 };
@@ -116,6 +119,10 @@ export const apiClient = {
       api<void>(`/accounts/${encodeURIComponent(name)}/toggle`, { method: 'POST' }),
     toggleSandbox: (name: string) =>
       api<void>(`/accounts/${encodeURIComponent(name)}/sandbox`, { method: 'POST' }),
+    disconnect: (name: string) =>
+      api<void>(`/accounts/${encodeURIComponent(name)}/disconnect`, {
+        method: 'POST',
+      }),
     delete: (name: string) =>
       api<void>(`/accounts/${encodeURIComponent(name)}`, { method: 'DELETE' }),
     allowedAgents: (name: string) =>

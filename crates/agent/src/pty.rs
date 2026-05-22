@@ -417,23 +417,34 @@ impl PtyManager {
         // execing tmux (so tmux + claude inherit the sandbox state).
         let session_name = format!("cloudcode-{}-{}", account, workspace);
         let tmux_label = format!("cc-{}-{}", account, workspace);
-        // Sandbox is now a per-session decision driven by the hub
-        // (account.sandbox_enabled). If the hub asked for sandbox but
-        // this platform can't deliver it (Linux), surface that as a
-        // PtyError rather than silently spawning unsandboxed.
-        if sandbox && self.self_exe.is_none() {
+        // Sandbox mode selection:
+        //   sandbox = true  → strict profile  (full per-workspace
+        //                     secrets/persistence hardening)
+        //   sandbox = false → permissive profile (cross-account
+        //                     isolation only; everything else open)
+        //
+        // We ALWAYS wrap through `cloudcode-agent sandbox-exec` —
+        // there is no "no sandbox at all" branch any more, because
+        // cross-account isolation must hold regardless of the
+        // per-account toggle. If the platform doesn't support
+        // Seatbelt at all (Linux today), surface that as a
+        // PtyError; we don't want to silently run unconfined.
+        let Some(self_exe) = self.self_exe.as_ref() else {
             let _ = tx
                 .send(OutFrame::Text(ClientMsg::PtyError {
                     session_id,
-                    message: "sandbox requested but not supported on this agent platform"
+                    message: "workspace sandbox is not supported on this agent platform"
                         .to_string(),
                 }))
                 .await;
             return;
-        }
-        let mut cmd = if sandbox {
-            // self_exe is Some here because we just checked above.
-            let self_exe = self.self_exe.as_ref().unwrap();
+        };
+        let sandbox_mode = if sandbox {
+            crate::sandbox::SandboxMode::Strict
+        } else {
+            crate::sandbox::SandboxMode::Permissive
+        };
+        let mut cmd = {
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
             let ws_root = self.workspace_root();
             let mut c = CommandBuilder::new(self_exe);
@@ -444,11 +455,11 @@ impl PtyManager {
             c.arg(&ws_root);
             c.arg("--home");
             c.arg(&home);
+            c.arg("--mode");
+            c.arg(sandbox_mode.as_str());
             c.arg("--");
             c.arg(&self.tmux.executable);
             c
-        } else {
-            CommandBuilder::new(&self.tmux.executable)
         };
         // Our private tmux.conf (set -g mouse on). Must come BEFORE
         // the subcommand because tmux only honors -f as a global flag.
@@ -1329,12 +1340,32 @@ fn validate_name(name: &str, kind: &str) -> std::result::Result<(), String> {
 
 fn expand_path(p: &Path) -> PathBuf {
     let s = p.to_string_lossy();
-    if let Some(rest) = s.strip_prefix("~/") {
+    let expanded = if let Some(rest) = s.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
+            home.join(rest)
+        } else {
+            p.to_path_buf()
         }
+    } else {
+        p.to_path_buf()
+    };
+    // The sandbox profile passes WORKSPACE_ROOT to SBPL's `subpath`,
+    // which only matches against the absolute paths the kernel
+    // actually reports. Relative paths like `./agent/workspaces` would
+    // never match, silently disabling the cross-account deny. Always
+    // anchor to an absolute path so every downstream consumer (sandbox
+    // params, claude project-dir encoding, etc.) sees the same canonical
+    // form. canonicalize() requires the dir to exist; fall back to
+    // current_dir+join when it hasn't been created yet.
+    if expanded.is_absolute() {
+        expanded
+    } else if let Ok(abs) = std::fs::canonicalize(&expanded) {
+        abs
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(&expanded)
+    } else {
+        expanded
     }
-    p.to_path_buf()
 }
 
 /// Quick liveness probe for the per-workspace tmux server we spawn

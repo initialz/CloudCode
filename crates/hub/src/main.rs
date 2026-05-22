@@ -44,6 +44,42 @@ pub struct AppState {
     /// session id to the logged-in account name. Backs `/api/*`
     /// and the cookie-auth path through `/v1/pty/ws`.
     pub user_auth: Arc<UserAuth>,
+    /// Per-account broadcast channels used by the admin "disconnect"
+    /// action. Each live `/v1/pty/ws` connection subscribes; the
+    /// admin endpoint signals every subscriber for a given account,
+    /// which closes the WS after sending a terminal `Rejected` frame.
+    /// Entries are created lazily on first subscribe and stay around
+    /// across reconnects (capacity is tiny — one Sender per account).
+    pub user_kick: Arc<DashMap<String, tokio::sync::broadcast::Sender<()>>>,
+}
+
+impl AppState {
+    /// Get-or-create the kick channel for an account. Used both by
+    /// the user WS handler (to subscribe) and by the admin endpoint
+    /// (to fire). Capacity is 8 because the only thing we ever send
+    /// is a single unit; we never expect backlog.
+    pub fn user_kick_sender(&self, account: &str) -> tokio::sync::broadcast::Sender<()> {
+        if let Some(s) = self.user_kick.get(account) {
+            return s.clone();
+        }
+        self.user_kick
+            .entry(account.to_string())
+            .or_insert_with(|| tokio::sync::broadcast::channel::<()>(8).0)
+            .clone()
+    }
+
+    /// Cheap read-only check: does this account have at least one
+    /// live `/v1/pty/ws` connection? Used by the admin UI to decide
+    /// whether the "Disconnect" button should be active even before
+    /// the user has opened a workspace (i.e. WS attached, no PTY
+    /// session yet). Doesn't materialise a Sender for unknown
+    /// accounts.
+    pub fn user_is_connected(&self, account: &str) -> bool {
+        self.user_kick
+            .get(account)
+            .map(|s| s.receiver_count() > 0)
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Parser)]
@@ -148,6 +184,7 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         registry: Arc::new(AgentRegistry::new()),
         workspaces: DashMap::new(),
         user_auth,
+        user_kick: Arc::new(DashMap::new()),
     });
 
     // Root — user-facing webterm SPA + its JSON API. Lives on the

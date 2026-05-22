@@ -244,6 +244,12 @@ struct AccountDto {
     /// True iff this account has at least one session currently live
     /// (ended_at IS NULL).
     online: bool,
+    /// True iff this account has at least one live `/v1/pty/ws`
+    /// connection — webterm tab open or CLI dialled in, regardless
+    /// of whether they're sitting in a workspace yet. Drives the
+    /// admin "Disconnect" button (which kicks the WebSocket, not
+    /// the PTY).
+    connected: bool,
     /// Whether claude runs inside the workspace sandbox for this
     /// account. Replaces the agent.toml-level switch.
     sandbox_enabled: bool,
@@ -275,6 +281,7 @@ pub async fn accounts_list(State(state): State<AdminState>) -> Response {
             .unwrap_or_default();
         let (last_used_at, active_count) =
             activity_map.get(&a.name).copied().unwrap_or((None, 0));
+        let connected = state.app.user_is_connected(&a.name);
         dto.push(AccountDto {
             name: a.name,
             token_prefix: a.token_prefix,
@@ -283,6 +290,7 @@ pub async fn accounts_list(State(state): State<AdminState>) -> Response {
             allowed_agents: allowed,
             last_used_at,
             online: active_count > 0,
+            connected,
             sandbox_enabled: a.sandbox_enabled,
         });
     }
@@ -410,6 +418,26 @@ pub async fn accounts_delete(
     if let Err(e) = state.app.db.delete_account(&name).await {
         return err(StatusCode::NOT_FOUND, "not_found", e.to_string());
     }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Forcibly close every live user WS connection for this account.
+/// The connection receives a terminal `Rejected { reason }` frame
+/// before the socket is shut. New logins keep working — this does
+/// NOT rotate the token or disable the account. 204 even when no
+/// session was online, so the UI doesn't have to guess.
+pub async fn accounts_disconnect(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+) -> Response {
+    match state.app.db.account_exists(&name).await {
+        Ok(true) => {}
+        Ok(false) => return err(StatusCode::NOT_FOUND, "not_found", "account not found"),
+        Err(e) => return internal(e),
+    }
+    // send() returns Err(_) when there are no subscribers; that's
+    // the "account is currently offline" case and is not an error.
+    let _ = state.app.user_kick_sender(&name).send(());
     StatusCode::NO_CONTENT.into_response()
 }
 

@@ -86,6 +86,13 @@ enum Cmd {
         workspace_root: PathBuf,
         #[arg(long)]
         home: PathBuf,
+        /// `strict` (the full per-workspace profile, applied when the
+        /// per-account sandbox toggle is on) or `permissive` (a
+        /// minimal cross-account-only profile, applied even when the
+        /// toggle is off). Defaults to `strict` for backwards
+        /// compatibility with older callers.
+        #[arg(long, default_value = "strict")]
+        mode: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         argv: Vec<String>,
     },
@@ -128,8 +135,9 @@ async fn main() -> anyhow::Result<()> {
             workspace,
             workspace_root,
             home,
+            mode,
             argv,
-        }) => run_sandbox_exec(workspace, workspace_root, home, argv),
+        }) => run_sandbox_exec(workspace, workspace_root, home, mode, argv),
     }
 }
 
@@ -140,15 +148,19 @@ fn run_sandbox_exec(
     workspace: PathBuf,
     workspace_root: PathBuf,
     home: PathBuf,
+    mode: String,
     argv: Vec<String>,
 ) -> anyhow::Result<()> {
     if argv.is_empty() {
         return Err(anyhow!("sandbox-exec: missing target command after `--`"));
     }
+    let mode = sandbox::SandboxMode::parse(&mode)
+        .ok_or_else(|| anyhow!("sandbox-exec: unknown --mode {:?}", mode))?;
     sandbox::apply(&sandbox::SandboxParams {
         workspace,
         workspace_root,
         home,
+        mode,
     })
     .context("applying workspace sandbox")?;
 
@@ -226,12 +238,24 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
 /// expansion.
 fn expand_workspace_root(p: &Path) -> PathBuf {
     let s = p.to_string_lossy();
-    if let Some(rest) = s.strip_prefix("~/") {
+    let expanded = if let Some(rest) = s.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
-            return home.join(rest);
+            home.join(rest)
+        } else {
+            p.to_path_buf()
         }
+    } else {
+        p.to_path_buf()
+    };
+    if expanded.is_absolute() {
+        expanded
+    } else if let Ok(abs) = std::fs::canonicalize(&expanded) {
+        abs
+    } else if let Ok(cwd) = std::env::current_dir() {
+        cwd.join(&expanded)
+    } else {
+        expanded
     }
-    p.to_path_buf()
 }
 
 fn init_config(path: &Path) -> anyhow::Result<()> {

@@ -25,6 +25,7 @@ export function Accounts() {
 
   const [tokenModal, setTokenModal] = useState<TokenModal | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [confirmDisconnect, setConfirmDisconnect] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const [agentsModal, setAgentsModal] = useState<AgentsModalState | null>(null);
 
@@ -89,6 +90,19 @@ export function Accounts() {
       await reload();
     } catch (e: any) {
       setErr(e?.message ?? 'sandbox toggle failed');
+    } finally {
+      setPending(false);
+    }
+  }
+
+  async function onDisconnect(name: string) {
+    setPending(true);
+    try {
+      await apiClient.accounts.disconnect(name);
+      setConfirmDisconnect(null);
+      await reload();
+    } catch (e: any) {
+      setErr(e?.message ?? 'disconnect failed');
     } finally {
       setPending(false);
     }
@@ -281,6 +295,18 @@ export function Accounts() {
                     </td>
                     <td className="px-3 py-2 text-right space-x-1 whitespace-nowrap">
                       <button
+                        disabled={pending || !a.connected}
+                        onClick={() => setConfirmDisconnect(a.name)}
+                        title={
+                          a.connected
+                            ? 'Forcibly close every live WebSocket session for this account'
+                            : 'Account is not connected to the hub'
+                        }
+                        className="px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-50"
+                      >
+                        Disconnect
+                      </button>
+                      <button
                         disabled={pending}
                         onClick={() => onRotate(a.name)}
                         className="px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-50"
@@ -440,6 +466,36 @@ export function Accounts() {
             })}
           </div>
         ) : null}
+      </Modal>
+
+      <Modal
+        open={confirmDisconnect !== null}
+        onClose={() => !pending && setConfirmDisconnect(null)}
+        title={`Disconnect account ${confirmDisconnect ?? ''}?`}
+        footer={
+          <>
+            <button
+              disabled={pending}
+              onClick={() => setConfirmDisconnect(null)}
+              className="px-3 py-1.5 text-sm rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              disabled={pending}
+              onClick={() => confirmDisconnect && onDisconnect(confirmDisconnect)}
+              className="px-3 py-1.5 text-sm rounded bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:opacity-90 disabled:opacity-50"
+            >
+              Disconnect
+            </button>
+          </>
+        }
+      >
+        <p className="text-sm text-zinc-600 dark:text-zinc-400">
+          Every live webterm tab and CLI for this account will be closed
+          right now. The account token stays valid — they can log back in
+          immediately.
+        </p>
       </Modal>
 
       <Modal

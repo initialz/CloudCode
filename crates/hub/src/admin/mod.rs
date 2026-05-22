@@ -144,6 +144,10 @@ pub fn router(state: AdminState) -> Router {
             post(api::accounts_sandbox_toggle).route_layer(gate.clone()),
         )
         .route(
+            "/admin/api/accounts/:name/disconnect",
+            post(api::accounts_disconnect).route_layer(gate.clone()),
+        )
+        .route(
             "/admin/api/accounts/:name",
             delete(api::accounts_delete).route_layer(gate.clone()),
         )

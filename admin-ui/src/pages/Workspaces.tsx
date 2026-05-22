@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { apiClient, type WorkspaceRowDto, type WorkspaceStatus } from '@/lib/api';
+import { Modal } from '@/components/Modal';
 import { formatRelative } from '@/lib/time';
 
 const ALL = '__all__';
@@ -10,6 +11,9 @@ export function Workspaces() {
   const [agentFilter, setAgentFilter] = useState<string>(ALL);
   const [accountFilter, setAccountFilter] = useState<string>(ALL);
   const [deletingKey, setDeletingKey] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<WorkspaceRowDto | null>(
+    null,
+  );
 
   async function reload() {
     try {
@@ -20,11 +24,8 @@ export function Workspaces() {
     }
   }
 
-  async function handleDelete(r: WorkspaceRowDto) {
+  async function performDelete(r: WorkspaceRowDto) {
     const label = `${r.workspace}@${r.agent} (${r.account})`;
-    if (!confirm(`Delete workspace ${label}? This removes it from the agent's disk and from the hub binding.`)) {
-      return;
-    }
     const key = `${r.agent}|${r.account}|${r.workspace}`;
     setDeletingKey(key);
     setErr(null);
@@ -34,6 +35,7 @@ export function Workspaces() {
         account: r.account,
         workspace: r.workspace,
       });
+      setConfirmDelete(null);
       await reload();
     } catch (e: any) {
       setErr(e?.message ?? `failed to delete ${label}`);
@@ -181,7 +183,7 @@ export function Workspaces() {
                       </td>
                       <td className="px-3 py-2 text-right">
                         <button
-                          onClick={() => handleDelete(r)}
+                          onClick={() => setConfirmDelete(r)}
                           disabled={isDeleting || r.status === 'active'}
                           title={
                             r.status === 'active'
@@ -201,6 +203,42 @@ export function Workspaces() {
           </table>
         </div>
       )}
+
+      <Modal
+        open={confirmDelete !== null}
+        onClose={() => deletingKey === null && setConfirmDelete(null)}
+        title={
+          confirmDelete
+            ? `Delete workspace ${confirmDelete.workspace}@${confirmDelete.agent}?`
+            : 'Delete workspace?'
+        }
+        footer={
+          <>
+            <button
+              disabled={deletingKey !== null}
+              onClick={() => setConfirmDelete(null)}
+              className="px-3 py-1.5 text-sm rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              disabled={deletingKey !== null}
+              onClick={() => confirmDelete && performDelete(confirmDelete)}
+              className="px-3 py-1.5 text-sm rounded bg-red-600 text-white hover:bg-red-700 disabled:opacity-50"
+            >
+              {deletingKey !== null ? 'Deleting…' : 'Delete'}
+            </button>
+          </>
+        }
+      >
+        <p className="text-sm text-zinc-600 dark:text-zinc-400">
+          Removes the workspace dir from{' '}
+          <span className="font-mono">{confirmDelete?.agent ?? ''}</span>'s
+          disk and unbinds it from the hub for account{' '}
+          <span className="font-mono">{confirmDelete?.account ?? ''}</span>.
+          This cannot be undone.
+        </p>
+      </Modal>
     </div>
   );
 }

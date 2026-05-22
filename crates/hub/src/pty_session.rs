@@ -64,6 +64,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, pre_auth: Option
         None => return,
     };
 
+    // Subscribe to the per-account kick channel BEFORE entering the
+    // loop so an admin "disconnect" fired between authenticate() and
+    // the first select! is still caught by this connection.
+    let mut kick_rx = state.user_kick_sender(&account_name).subscribe();
+
     let mut ctx = ConnCtx {
         state: state.clone(),
         account_name,
@@ -82,6 +87,21 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, pre_auth: Option
         };
 
         tokio::select! {
+            kick = kick_rx.recv() => {
+                // Either we got a kick (Ok) or the sender was lagged
+                // (RecvError::Lagged) — both mean an admin asked us
+                // to leave. RecvError::Closed shouldn't happen (the
+                // Sender lives in AppState for the hub's lifetime),
+                // but if it does we treat it the same.
+                let _ = kick;
+                let frame = HubToClient::Rejected {
+                    reason: "disconnected by administrator".into(),
+                };
+                if let Ok(json) = serde_json::to_string(&frame) {
+                    let _ = sink.send(Message::Text(json)).await;
+                }
+                break;
+            }
             client_msg = stream.next() => {
                 let msg = match client_msg {
                     Some(Ok(m)) => m,

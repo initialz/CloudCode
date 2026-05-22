@@ -15,13 +15,14 @@
 //! void sandbox_free_error(char *errorbuf);
 //! ```
 
-use crate::sandbox::SandboxParams;
+use crate::sandbox::{SandboxMode, SandboxParams};
 use anyhow::{anyhow, Result};
 use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStrExt;
 use std::ptr;
 
-const PROFILE: &str = include_str!("profile.sb");
+const PROFILE_STRICT: &str = include_str!("profile.sb");
+const PROFILE_PERMISSIVE: &str = include_str!("profile_permissive.sb");
 
 extern "C" {
     fn sandbox_init_with_parameters(
@@ -35,7 +36,11 @@ extern "C" {
 }
 
 pub fn apply(params: &SandboxParams) -> Result<()> {
-    let profile = CString::new(PROFILE).map_err(|_| anyhow!("sandbox profile contains NUL"))?;
+    let profile_src = match params.mode {
+        SandboxMode::Strict => PROFILE_STRICT,
+        SandboxMode::Permissive => PROFILE_PERMISSIVE,
+    };
+    let profile = CString::new(profile_src).map_err(|_| anyhow!("sandbox profile contains NUL"))?;
 
     // SBPL doesn't canonicalize subpath arguments — `/tmp/foo` won't match
     // accesses the kernel reports as `/private/tmp/foo`. Resolve symlinks
@@ -49,9 +54,19 @@ pub fn apply(params: &SandboxParams) -> Result<()> {
 
     // claude maintains a per-project subdir under ~/.claude/projects/
     // keyed off the absolute cwd, with every '/' replaced by '-'. We
-    // mirror that encoding so the SBPL profile can carve out *this*
-    // project's subtree while denying every other one.
+    // mirror that encoding so the strict profile can carve out *this*
+    // project's subtree while denying every other one. Permissive
+    // mode ignores this param; we still pass it so both profiles
+    // accept the same parameter list.
     let project_dir_name = workspace_path.to_string_lossy().replace('/', "-");
+
+    // OWN_ACCOUNT_ROOT = <WORKSPACE_ROOT>/<this account>. Used by the
+    // permissive profile to keep cross-account isolation when the
+    // strict toggle is off.
+    let own_account_root = workspace_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| workspace_path.clone());
 
     // Parameter pairs: (key, value), NULL-terminated.
     let workspace = CString::new(workspace_path.as_os_str().as_bytes())
@@ -62,10 +77,13 @@ pub fn apply(params: &SandboxParams) -> Result<()> {
         .map_err(|_| anyhow!("home path contains NUL"))?;
     let claude_project_dir = CString::new(project_dir_name.as_bytes())
         .map_err(|_| anyhow!("claude project dir name contains NUL"))?;
+    let own_account = CString::new(own_account_root.as_os_str().as_bytes())
+        .map_err(|_| anyhow!("own account root path contains NUL"))?;
     let key_ws = CString::new("WORKSPACE").unwrap();
     let key_ws_root = CString::new("WORKSPACE_ROOT").unwrap();
     let key_home = CString::new("HOME_DIR").unwrap();
     let key_claude_project_dir = CString::new("CLAUDE_PROJECT_DIR").unwrap();
+    let key_own_account = CString::new("OWN_ACCOUNT_ROOT").unwrap();
 
     let raw: Vec<*const libc::c_char> = vec![
         key_ws.as_ptr(),
@@ -76,6 +94,8 @@ pub fn apply(params: &SandboxParams) -> Result<()> {
         home.as_ptr(),
         key_claude_project_dir.as_ptr(),
         claude_project_dir.as_ptr(),
+        key_own_account.as_ptr(),
+        own_account.as_ptr(),
         ptr::null(),
     ];
 

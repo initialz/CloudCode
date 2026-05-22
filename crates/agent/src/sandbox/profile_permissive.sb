@@ -1,0 +1,28 @@
+;; cloudcode workspace sandbox — PERMISSIVE mode.
+;;
+;; Applied when the per-account sandbox toggle is OFF. The intent
+;; here is NOT "no sandbox at all": even with the strict profile
+;; disabled, an agent running for account A must not be able to
+;; read or write any other account's workspace files on this host.
+;; Everything else (network, secrets, ~/, /tmp, package managers,
+;; persistence vectors, …) is unrestricted — that's the whole
+;; point of "sandbox off".
+;;
+;; Parameters supplied via sandbox_init_with_parameters:
+;;   WORKSPACE_ROOT    — agent's workspace_root dir
+;;   OWN_ACCOUNT_ROOT  — abs path of <WORKSPACE_ROOT>/<this account>
+;;                       (everything under this subtree is allowed;
+;;                       everything else under WORKSPACE_ROOT is
+;;                       denied)
+;;
+;; The strict-profile parameters (WORKSPACE / HOME_DIR /
+;; CLAUDE_PROJECT_DIR) are also passed in by the caller but
+;; deliberately unused here.
+
+(version 1)
+(allow default)
+
+(deny file-read* file-write*
+    (require-all
+        (subpath (param "WORKSPACE_ROOT"))
+        (require-not (subpath (param "OWN_ACCOUNT_ROOT")))))

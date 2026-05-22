@@ -33,6 +33,41 @@ pub struct SandboxParams {
     /// The user's home dir. The sandbox grants RW only to `~/.claude`
     /// (OAuth) and read-only access elsewhere.
     pub home: PathBuf,
+    /// Which sandbox profile to apply. `Strict` is the per-workspace
+    /// secrets-and-persistence-hardened profile that ships with the
+    /// "sandbox = on" account toggle. `Permissive` is the minimal
+    /// profile we apply even when the toggle is off — it lets the
+    /// process touch the whole host (network, secrets, all of ~/,
+    /// /tmp, …) but still denies access to *other accounts'*
+    /// workspaces under WORKSPACE_ROOT. Sandbox = off is therefore
+    /// no longer the same as "no sandbox at all" — cross-account
+    /// isolation is unconditional.
+    pub mode: SandboxMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxMode {
+    Strict,
+    Permissive,
+}
+
+impl SandboxMode {
+    /// Stable wire form for the `sandbox-exec` subcommand. Kept ASCII
+    /// so it round-trips through CLI args cleanly.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SandboxMode::Strict => "strict",
+            SandboxMode::Permissive => "permissive",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "strict" => Some(SandboxMode::Strict),
+            "permissive" => Some(SandboxMode::Permissive),
+            _ => None,
+        }
+    }
 }
 
 /// Whether the workspace sandbox is implemented on this platform.
