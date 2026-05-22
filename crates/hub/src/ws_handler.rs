@@ -10,7 +10,14 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
-const PING_INTERVAL: Duration = Duration::from_secs(30);
+/// How often the hub probes each agent connection with a PING frame.
+/// Kept short (5s) so the agent's read loop, which trips a reconnect
+/// after ~10s of silence, surfaces a dead hub (e.g. mid-upgrade,
+/// crashed, or stale TCP after a network blip) within ~10s instead
+/// of waiting on the OS-level keepalive timer. The opposite tradeoff
+/// is bandwidth — but a ping is a few bytes per agent every 5s, so
+/// even hundreds of agents are < 1 KB/s.
+const PING_INTERVAL: Duration = Duration::from_secs(5);
 const SEND_QUEUE: usize = 256;
 
 pub async fn upgrade(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {

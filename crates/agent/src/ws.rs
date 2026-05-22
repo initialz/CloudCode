@@ -13,6 +13,13 @@ use tokio_tungstenite::tungstenite::Message;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SEND_QUEUE: usize = 256;
+/// Maximum gap we tolerate between frames from the hub before
+/// declaring the connection dead and reconnecting. Hub pings every
+/// 5s, so 10s = "missed one ping" — short enough that an upgrading
+/// hub or stale TCP is detected within ~10s, long enough that a
+/// transient network blip doesn't flap us. Reading the OS-level
+/// keepalive timer alone would take minutes.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
     let mut backoff = Backoff::new();
@@ -134,7 +141,22 @@ async fn read_loop<S>(
 where
     S: futures::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    while let Some(item) = stream.next().await {
+    loop {
+        let next = match tokio::time::timeout(READ_IDLE_TIMEOUT, stream.next()).await {
+            Ok(opt) => opt,
+            Err(_) => {
+                // No frame from hub for READ_IDLE_TIMEOUT. Hub pings
+                // every 5s so this means the connection is wedged
+                // (hub mid-upgrade / crashed / network dropped without
+                // a TCP FIN). Break out so the outer reconnect loop
+                // can re-establish.
+                return Err(RunError::Transient(format!(
+                    "no hub frame for {}s; assuming dead connection",
+                    READ_IDLE_TIMEOUT.as_secs()
+                )));
+            }
+        };
+        let Some(item) = next else { break };
         let msg = item.map_err(|e| RunError::Transient(format!("ws: {}", e)))?;
         match msg {
             Message::Text(s) => match serde_json::from_str::<ServerMsg>(&s) {
