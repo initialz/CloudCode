@@ -277,6 +277,19 @@
     (subpath "/private/tmp")
     (subpath "/private/var/tmp"))
 
+;; tmux carve-out: tmux insists on writing its server socket to
+;; /tmp/tmux-<uid>/ (it deliberately ignores $TMPDIR — see pty.rs).
+;; Without this exception the previous deny breaks `set -g mouse on`
+;; (mouse-wheel scroll in claude's TUI) and may prevent the tmux
+;; server from coming up at all. We re-allow the entire tmux-<uid>
+;; subtree under /private/tmp; uid varies per machine so a literal
+;; subpath won't do. SBPL is last-rule-wins so this overrides the
+;; broader deny above for the matched paths.
+(allow file-read* file-write* file-ioctl
+    (regex #"^/private/tmp/tmux-[0-9]+(/.*)?$"))
+(allow network-bind network-outbound
+    (regex #"^/private/tmp/tmux-[0-9]+/"))
+
 ;; ---------------------------------------------------------------------
 ;; shell rc — write was already denied above; tighten read so per-user
 ;; aliases / env exports don't leak into a session's prompt context.

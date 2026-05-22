@@ -14,6 +14,7 @@ import { useNavigate } from 'react-router-dom';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
+import { CanvasAddon } from '@xterm/addon-canvas';
 import '@xterm/xterm/css/xterm.css';
 
 import { apiClient } from '@/lib/api';
@@ -371,6 +372,17 @@ export default function Workbench() {
       const linksAddon = new WebLinksAddon();
       term.loadAddon(fitAddon);
       term.loadAddon(linksAddon);
+      // Canvas renderer: noticeably smoother than xterm's default DOM
+      // renderer once scrollback grows or the output flips fast (e.g.
+      // claude streaming a long response). Mounted before term.open()
+      // so first paint already uses the canvas backend.
+      try {
+        term.loadAddon(new CanvasAddon());
+      } catch {
+        // Some headless / older browsers fail to acquire a 2D context.
+        // Fall back silently to DOM renderer — still functional, just
+        // slower on heavy scroll. No need to surface this in the UI.
+      }
 
       // OSC 52 clipboard write. tmux (with `set -g set-clipboard on`)
       // emits this escape on every drag-select copy: `OSC 52 ; c ;
