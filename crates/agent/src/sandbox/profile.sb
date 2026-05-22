@@ -9,10 +9,15 @@
 ;;   ~/.gnupg, Keychains, …) — overrides the broad read allow above
 ;;   because SBPL is last-rule-wins;
 ;; - write access is restricted to the active workspace, ~/.claude,
-;;   a small whitelist of cache dirs, and the usual scratch dirs;
+;;   a small whitelist of cache + dev-tool state dirs (~/.docker,
+;;   ~/.kube, ~/.terraform.d, ~/.gitconfig, REPL history files), the
+;;   system temp dirs, and the usual /opt/homebrew + /usr/local
+;;   global-install locations;
 ;; - even where writes are otherwise allowed, persistence vectors a
 ;;   compromised / hallucinating AI run might hit on its way past you
 ;;   (shell init files, LaunchAgents, .git/hooks) are denied;
+;; - shell init files are READABLE (tools that source ~/.zshrc /
+;;   ~/.bashrc work) but not writable;
 ;; - network is left fully open (claude needs Anthropic API, GitHub,
 ;;   package registries — an IP-level allowlist isn't workable against
 ;;   global CDNs);
@@ -121,7 +126,30 @@
     (subpath (string-append (param "HOME_DIR") "/.config"))
     (subpath (string-append (param "HOME_DIR") "/.local"))
     (subpath (string-append (param "HOME_DIR") "/Library/Caches"))
-    (subpath (string-append (param "HOME_DIR") "/Library/Application Support")))
+    (subpath (string-append (param "HOME_DIR") "/Library/Application Support"))
+    ;; Common dev-tool state dirs. Read was already allowed via the
+    ;; broad file-read* rule; writes here are routine (e.g.
+    ;; `docker login`, `kubectl config use-context`, terraform plugin
+    ;; cache, `git config --global …`). These aren't on the secrets
+    ;; deny-list higher up because their contents are operational
+    ;; config, not bearer tokens, and an attacker who can write them
+    ;; already gets nothing they couldn't already do via the
+    ;; whitelisted toolchain.
+    (subpath (string-append (param "HOME_DIR") "/.docker"))
+    (subpath (string-append (param "HOME_DIR") "/.kube"))
+    (subpath (string-append (param "HOME_DIR") "/.terraform.d"))
+    (literal (string-append (param "HOME_DIR") "/.terraformrc"))
+    ;; ~/.gitconfig + atomic-write helpers (~/.gitconfig.lock).
+    (regex (string-append "^" (param "HOME_DIR") "/\\.gitconfig"))
+    ;; REPL / interactive history. Tools just emit "history append
+    ;; failed" warnings without these, but they're harmless to allow
+    ;; — the files are append-only logs of this session's own input.
+    (literal (string-append (param "HOME_DIR") "/.bash_history"))
+    (literal (string-append (param "HOME_DIR") "/.zsh_history"))
+    (literal (string-append (param "HOME_DIR") "/.python_history"))
+    (literal (string-append (param "HOME_DIR") "/.node_repl_history"))
+    (literal (string-append (param "HOME_DIR") "/.lesshst"))
+    (literal (string-append (param "HOME_DIR") "/.wget-hsts")))
 
 ;; ~/.claude.json* — claude stores its global config in a sibling file
 ;; of ~/.claude/, not under it. The .lock and .tmp.<pid>.<rand> variants
@@ -155,15 +183,20 @@
 ;; write access — scratch and the controlling TTY
 ;; ---------------------------------------------------------------------
 ;; /private/tmp + /private/var/tmp are world-writable system temp dirs
-;; (mode 1777) shared across all uids on the host. Even with our own
-;; Seatbelt isolation, leaving them rw means: (1) a session can drop
-;; world-readable secrets there by accident, (2) it can read whatever
-;; other host services have left in /tmp (X sockets, daemon state, …),
-;; (3) different cloudcode sessions on the same host could cross-talk.
-;; We keep /private/var/folders open because that's the macOS per-user
-;; TMPDIR (already namespaced by uid + 8-char hash); without it node /
-;; git / brew lose their default mktemp dest.
+;; (mode 1777) shared across all uids on the host. We keep these open
+;; because too many tools hardcode `/tmp` (mktemp scripts, build
+;; toolchains, language runtimes) and the friction of denying them
+;; outweighs the cross-host-service leak risk on a typical dev box.
+;; Files written here are still subject to Unix DAC (your uid only),
+;; so cross-user leakage isn't trivial. Operators who want the
+;; previous hard isolation should turn on the per-account strict
+;; sandbox AND keep their workspaces off shared hosts.
+;;
+;; /private/var/folders is the macOS per-user TMPDIR (namespaced by
+;; uid + 8-char hash); kept rw so $TMPDIR-respecting tools work.
 (allow file-write*
+    (subpath "/private/tmp")
+    (subpath "/private/var/tmp")
     (subpath "/private/var/folders")
     (literal "/dev/null")
     (literal "/dev/dtracehelper")
@@ -268,45 +301,14 @@
 ;; prompt because the ack can't be saved. The earlier rule at
 ;; ~line 124 keeps file-read* + file-write* allowed for this regex.
 
-;; ---------------------------------------------------------------------
-;; system tmp dirs — shared across all uids (mode 1777). Block content
-;; read + write but keep metadata so `stat /tmp` still works (some
-;; userland fall back to it if the dir doesn't show up at all).
-;; ---------------------------------------------------------------------
-(deny file-read-data file-read-xattr file-write*
-    (subpath "/private/tmp")
-    (subpath "/private/var/tmp"))
-
 ;; tmux carve-out: tmux insists on writing its server socket to
 ;; /tmp/tmux-<uid>/ (it deliberately ignores $TMPDIR — see pty.rs).
-;; Without this exception the previous deny breaks `set -g mouse on`
-;; (mouse-wheel scroll in claude's TUI) and may prevent the tmux
-;; server from coming up at all. We re-allow the entire tmux-<uid>
-;; subtree under /private/tmp; uid varies per machine so a literal
-;; subpath won't do. SBPL is last-rule-wins so this overrides the
-;; broader deny above for the matched paths.
-(allow file-read* file-write* file-ioctl
-    (regex #"^/private/tmp/tmux-[0-9]+(/.*)?$"))
+;; The broader `/private/tmp` write allow above already covers the
+;; basic file ops; we keep this stanza to add `network-bind` /
+;; `network-outbound` on the socket (those verbs are distinct from
+;; file-write* and tmux can't ship its protocol without them).
 (allow network-bind network-outbound
     (regex #"^/private/tmp/tmux-[0-9]+/"))
-
-;; ---------------------------------------------------------------------
-;; shell rc — write was already denied above; tighten read so per-user
-;; aliases / env exports don't leak into a session's prompt context.
-;; ---------------------------------------------------------------------
-(deny file-read*
-    (literal (string-append (param "HOME_DIR") "/.bashrc"))
-    (literal (string-append (param "HOME_DIR") "/.bash_profile"))
-    (literal (string-append (param "HOME_DIR") "/.bash_login"))
-    (literal (string-append (param "HOME_DIR") "/.bash_logout"))
-    (literal (string-append (param "HOME_DIR") "/.zshrc"))
-    (literal (string-append (param "HOME_DIR") "/.zprofile"))
-    (literal (string-append (param "HOME_DIR") "/.zlogin"))
-    (literal (string-append (param "HOME_DIR") "/.zlogout"))
-    (literal (string-append (param "HOME_DIR") "/.zshenv"))
-    (literal (string-append (param "HOME_DIR") "/.profile"))
-    (literal (string-append (param "HOME_DIR") "/.cshrc"))
-    (literal (string-append (param "HOME_DIR") "/.tcshrc")))
 
 ;; ---------------------------------------------------------------------
 ;; network — fully open
