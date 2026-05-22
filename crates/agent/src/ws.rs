@@ -15,11 +15,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const SEND_QUEUE: usize = 256;
 /// Maximum gap we tolerate between frames from the hub before
 /// declaring the connection dead and reconnecting. Hub pings every
-/// 5s, so 10s = "missed one ping" — short enough that an upgrading
-/// hub or stale TCP is detected within ~10s, long enough that a
-/// transient network blip doesn't flap us. Reading the OS-level
-/// keepalive timer alone would take minutes.
-const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// 5s, so 6s gives us a 1s safety margin against jitter while
+/// surfacing a dead hub (mid-upgrade, crashed, or stale TCP) within
+/// ~6s instead of waiting on the OS keepalive timer.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(6);
 
 pub async fn run(state: Arc<AppState>) -> anyhow::Result<()> {
     let mut backoff = Backoff::new();
@@ -128,7 +127,19 @@ async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
     });
 
     let read_result = read_loop(state.clone(), tx.clone(), &mut stream).await;
+    // Abort the writer instead of awaiting it. read_loop spawns
+    // detached tasks (PtyManager::handle) that each hold their own
+    // tx clone — those tasks survive the connection and only drop
+    // their tx when their PTY session ends. If we awaited the
+    // writer, we'd wait on rx.recv() returning None, which only
+    // happens once *every* tx clone is dropped — practically
+    // "forever" if a workspace is open. That made the second hub
+    // restart look like the agent stopped reconnecting: run_once
+    // never returned, so the outer reconnect loop never advanced.
+    // Aborting the writer is fine here — the WS is already torn
+    // down and we're about to throw away the sink anyway.
     drop(tx);
+    writer.abort();
     let _ = writer.await;
     read_result
 }
@@ -290,21 +301,28 @@ impl Drop for SlotGuard {
     }
 }
 
+/// Exponential reconnect backoff. The cap is intentionally short
+/// (5s) so the agent reattaches quickly after a hub restart — the
+/// previous 30s cap meant operators perceived hub upgrades as
+/// "agent died, must restart manually" because the next retry was
+/// almost a full minute away. The whole purpose of backoff is to
+/// avoid pummelling a hub that's genuinely down; 5s is plenty for
+/// that while staying responsive in the common rolling-upgrade case.
 struct Backoff {
     next_ms: u64,
 }
 
 impl Backoff {
     fn new() -> Self {
-        Self { next_ms: 1000 }
+        Self { next_ms: 500 }
     }
     fn reset(&mut self) {
-        self.next_ms = 1000;
+        self.next_ms = 500;
     }
     fn next(&mut self) -> Duration {
         let cur = self.next_ms;
-        self.next_ms = (cur * 2).min(30_000);
-        let jitter = rand::thread_rng().gen_range(0..500);
+        self.next_ms = (cur * 2).min(5_000);
+        let jitter = rand::thread_rng().gen_range(0..200);
         Duration::from_millis(cur + jitter)
     }
 }
