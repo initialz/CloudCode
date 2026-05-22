@@ -88,7 +88,7 @@ async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
                     tracing::info!(agent = %name, "connected to hub");
                 }
                 ServerMsg::Rejected { reason } => {
-                    return Err(RunError::Fatal(reject_label(reason).into()));
+                    return Err(classify_reject(reason));
                 }
                 _ => return Err(RunError::Transient("unexpected handshake frame".into())),
             }
@@ -167,7 +167,7 @@ where
                     tracing::warn!("duplicate welcome from hub; ignoring");
                 }
                 Ok(ServerMsg::Rejected { reason }) => {
-                    return Err(RunError::Fatal(reject_label(reason).into()));
+                    return Err(classify_reject(reason));
                 }
                 Ok(ServerMsg::UpdateAgent {
                     request_id,
@@ -243,6 +243,29 @@ where
         }
     }
     Ok(())
+}
+
+/// Decide whether a hub-side rejection should kill the agent process
+/// (Fatal) or just trip a reconnect (Transient).
+///
+/// - `VersionMismatch`: transient. Rolling upgrades are the normal
+///   case here — e.g. the operator upgrades the agent first and the
+///   hub a minute later, or the supervisor restarts the hub on a
+///   newer protocol. Treating this as Fatal forces a manual restart
+///   *every* time the two binaries drift, which is the opposite of
+///   the "agent self-heals when hub catches up" UX we want. Backoff
+///   keeps the reconnect storm bounded (cap 30s).
+/// - `AuthFailed`: fatal. The token is a config item; auto-retry just
+///   pummels the hub with bad credentials without any chance of
+///   succeeding until the operator fixes `registration_token` and
+///   restarts the agent.
+/// - `NameTaken`: fatal. Two agents sharing a name is a config bug;
+///   silently retrying would mask the misconfiguration.
+fn classify_reject(r: RejectReason) -> RunError {
+    match r {
+        RejectReason::VersionMismatch => RunError::Transient(reject_label(r).to_string()),
+        _ => RunError::Fatal(reject_label(r).to_string()),
+    }
 }
 
 fn reject_label(r: RejectReason) -> &'static str {
