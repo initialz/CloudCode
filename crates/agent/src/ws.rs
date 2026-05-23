@@ -266,15 +266,26 @@ where
 ///   *every* time the two binaries drift, which is the opposite of
 ///   the "agent self-heals when hub catches up" UX we want. Backoff
 ///   keeps the reconnect storm bounded (cap 30s).
+/// - `NameTaken`: transient. The most common reason this fires is
+///   *not* a real config conflict — it's the hub still holding our
+///   own prior AgentConn after a silent TCP drop, until its
+///   read-idle timeout finally fires. Treating it as Fatal in that
+///   case kicks us out of the agent process entirely and forces a
+///   supervisor restart on exponential backoff, which can drag the
+///   reconnect out to tens of seconds. Transient + the same
+///   `run_once` backoff (cap 5s) closes the gap much faster, and a
+///   genuine name conflict (operator misconfig — two agents sharing
+///   `[agent].name`) still shows up loudly in the log on every
+///   retry.
 /// - `AuthFailed`: fatal. The token is a config item; auto-retry just
 ///   pummels the hub with bad credentials without any chance of
 ///   succeeding until the operator fixes `registration_token` and
 ///   restarts the agent.
-/// - `NameTaken`: fatal. Two agents sharing a name is a config bug;
-///   silently retrying would mask the misconfiguration.
 fn classify_reject(r: RejectReason) -> RunError {
     match r {
-        RejectReason::VersionMismatch => RunError::Transient(reject_label(r).to_string()),
+        RejectReason::VersionMismatch | RejectReason::NameTaken => {
+            RunError::Transient(reject_label(r).to_string())
+        }
         _ => RunError::Fatal(reject_label(r).to_string()),
     }
 }

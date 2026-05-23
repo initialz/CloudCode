@@ -18,6 +18,16 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 /// is bandwidth — but a ping is a few bytes per agent every 5s, so
 /// even hundreds of agents are < 1 KB/s.
 const PING_INTERVAL: Duration = Duration::from_secs(5);
+/// Maximum gap between frames from the agent before the hub declares
+/// the connection dead and unregisters. Agents Pong every Ping (so we
+/// expect a frame every ~5s) and otherwise stream PTY output. 10s
+/// gives a 2x margin against jitter. Without this the OS-level TCP
+/// keepalive (default ~2h on macOS) is the only timeout, so a silent
+/// TCP drop pins the AgentConn in the registry for hours; every
+/// reconnect attempt by the same agent then gets NameTaken and the
+/// supervisor pumps the agent process in a loop until TCP finally
+/// gives up.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
 const SEND_QUEUE: usize = 256;
 
 pub async fn upgrade(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
@@ -145,7 +155,23 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         let _ = sink.close().await;
     });
 
-    while let Some(item) = stream.next().await {
+    loop {
+        let next = match tokio::time::timeout(READ_IDLE_TIMEOUT, stream.next()).await {
+            Ok(opt) => opt,
+            Err(_) => {
+                // Silent TCP drop: agent stopped pong-ing but the OS
+                // hasn't reported the connection closed yet. Tear it
+                // down so the agent's reconnect attempt can claim the
+                // registry slot.
+                tracing::info!(
+                    agent = %name,
+                    "no frame from agent for {}s; declaring dead",
+                    READ_IDLE_TIMEOUT.as_secs()
+                );
+                break;
+            }
+        };
+        let Some(item) = next else { break };
         let msg = match item {
             Ok(m) => m,
             Err(e) => {
