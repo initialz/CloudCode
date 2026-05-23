@@ -15,6 +15,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { CanvasAddon } from '@xterm/addon-canvas';
+import { WebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
 
 import { apiClient } from '@/lib/api';
@@ -376,21 +377,46 @@ export default function Workbench() {
         // current scroll position only while they're scrolled up — once
         // the viewport is at the bottom new bytes push it along).
         scrollOnUserInput: false,
+        // Higher = more rows per wheel tick. Default 1 feels sluggish
+        // on Mac trackpads where each tick is small but frequent;
+        // 3 covers a chat exchange in roughly one swipe without
+        // overshooting on a precise scroll.
+        scrollSensitivity: 3,
       });
       const fitAddon = new FitAddon();
       const linksAddon = new WebLinksAddon();
       term.loadAddon(fitAddon);
       term.loadAddon(linksAddon);
-      // Canvas renderer: noticeably smoother than xterm's default DOM
-      // renderer once scrollback grows or the output flips fast (e.g.
-      // claude streaming a long response). Mounted before term.open()
-      // so first paint already uses the canvas backend.
+      // Renderer ladder: WebGL → Canvas → DOM (xterm's built-in).
+      // WebGL is the fastest by a wide margin (GPU-backed texture
+      // atlas, batched draws) and is the only one that keeps up
+      // smoothly when claude streams a long response while the user
+      // scrolls the buffer. Canvas is a usable middle ground; the
+      // built-in DOM renderer is the last resort.
+      //
+      // The WebGL addon can fail or its GL context can be lost
+      // mid-session (Safari with memory pressure, certain GPU
+      // drivers, virtualized displays). We register a
+      // `contextLoss` handler and demote to Canvas in place
+      // instead of leaving the user with a broken / blank pane.
       try {
-        term.loadAddon(new CanvasAddon());
+        const webgl = new WebglAddon();
+        webgl.onContextLoss(() => {
+          webgl.dispose();
+          try {
+            term.loadAddon(new CanvasAddon());
+          } catch {
+            // Final fallback is xterm's DOM renderer, which is
+            // always present and doesn't need loading.
+          }
+        });
+        term.loadAddon(webgl);
       } catch {
-        // Some headless / older browsers fail to acquire a 2D context.
-        // Fall back silently to DOM renderer — still functional, just
-        // slower on heavy scroll. No need to surface this in the UI.
+        try {
+          term.loadAddon(new CanvasAddon());
+        } catch {
+          // Headless / very old browser — DOM renderer takes over.
+        }
       }
 
       // OSC 52 clipboard write. tmux (with `set -g set-clipboard on`)
