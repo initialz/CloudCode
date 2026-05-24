@@ -102,6 +102,27 @@ export default function Workbench() {
   tabsRef.current = tabs;
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
 
+  // Per-tab auto-reconnect controller. Lives outside React state so
+  // setTimeout callbacks can mutate it without re-renders, and so a
+  // synchronous closeTab() can cancel a pending attempt without
+  // racing the reducer.
+  //
+  // - `attempt`              : number of attempts since last successful open.
+  // - `timerId`              : pending setTimeout handle, if any.
+  // - `intentionallyClosed`  : true once the user clicked ✕ (or the tab was
+  //                            closed programmatically). Suppresses reconnect.
+  // - `fatalReject`          : true if the hub sent a `rejected` frame
+  //                            (admin disconnect, account disabled, …).
+  //                            The next onClose tears the tab down for good.
+  type ReconnectState = {
+    attempt: number;
+    timerId: number | null;
+    intentionallyClosed: boolean;
+    fatalReject: boolean;
+    fatalReason?: string;
+  };
+  const reconnectRef = useRef<Map<string, ReconnectState>>(new Map());
+
   // Settings dialog
   const [showSettings, setShowSettings] = useState(false);
 
@@ -327,6 +348,101 @@ export default function Workbench() {
     });
   }
 
+  // ── WS handlers (shared between initial open + reconnect) ────────────────
+  //
+  // Returning a fresh object each call is intentional: the WireSocket
+  // we hand them to is replaced on every reconnect, so binding the
+  // callbacks to that specific instance (rather than a long-lived
+  // listener registry) keeps the lifetime trivial — when the old
+  // WireSocket is dropped, its callbacks go with it.
+
+  function makeWsHandlers(
+    id: string,
+    agent: string,
+    workspace: string,
+    tool: string | undefined,
+  ) {
+    return {
+      onMessage: (msg: HubMsg) => handleTabMsg(id, agent, workspace, tool, msg),
+      onBinary: (data: Uint8Array) => {
+        const tab = tabsRef.current.find((t) => t.id === id);
+        tab?.term.write(data);
+      },
+      onClose: (_code: number, _reason: string) => {
+        handleTabWsClose(id, agent, workspace, tool);
+      },
+      // onerror always fires before onclose on every browser I've
+      // checked, so the close handler does the real work and this
+      // is a no-op — letting it close the tab here too would
+      // double-fire scheduling.
+      onError: () => {},
+    };
+  }
+
+  // Decide what happens after a per-tab WS closes. Three cases:
+  //
+  //   1) User clicked ✕ (closeTab cleared the controller) — tab is
+  //      already gone or being torn down; nothing to do.
+  //   2) Hub sent a terminal `rejected` frame just before close
+  //      (admin kicked, account disabled, hub upgrade incompatible).
+  //      Tear the tab down with the error message — auto-reconnect
+  //      would just loop forever against the same condition.
+  //   3) Anything else (network drop, hub restart, proxy idle
+  //      timeout). Auto-reconnect with exponential backoff.
+  function handleTabWsClose(
+    id: string,
+    agent: string,
+    workspace: string,
+    tool: string | undefined,
+  ) {
+    const rc = reconnectRef.current.get(id);
+    if (!rc || rc.intentionallyClosed) {
+      reconnectRef.current.delete(id);
+      return;
+    }
+    if (rc.fatalReject) {
+      reconnectRef.current.delete(id);
+      dispatchTabs({
+        type: 'UPDATE',
+        id,
+        patch: { status: 'error', errorMsg: rc.fatalReason ?? 'Connection rejected by hub' },
+      });
+      if (ctrlAgentRef.current === agent) {
+        ctrlWsRef.current?.send({ type: 'list_workspaces' });
+      }
+      return;
+    }
+    scheduleReconnect(id, agent, workspace, tool);
+  }
+
+  function scheduleReconnect(
+    id: string,
+    agent: string,
+    workspace: string,
+    tool: string | undefined,
+  ) {
+    const rc = reconnectRef.current.get(id);
+    if (!rc) return;
+    if (rc.timerId !== null) {
+      window.clearTimeout(rc.timerId);
+      rc.timerId = null;
+    }
+    rc.attempt += 1;
+    // 500ms → 1s → 2s → 4s → 8s → 16s → 30s (cap).
+    const delayMs = Math.min(500 * 2 ** (rc.attempt - 1), 30000);
+    dispatchTabs({ type: 'UPDATE', id, patch: { status: 'reconnecting' } });
+    rc.timerId = window.setTimeout(() => {
+      const cur = reconnectRef.current.get(id);
+      if (!cur || cur.intentionallyClosed) return;
+      cur.timerId = null;
+      const tab = tabsRef.current.find((t) => t.id === id);
+      if (!tab) return;
+      const newWs = new WireSocket(makeWsHandlers(id, agent, workspace, tool));
+      dispatchTabs({ type: 'UPDATE', id, patch: { ws: newWs, status: 'connecting' } });
+      newWs.connect();
+    }, delayMs);
+  }
+
   // ── Open tab ──────────────────────────────────────────────────────────────
 
   const openTab = useCallback(
@@ -460,26 +576,19 @@ export default function Workbench() {
       });
 
       const id = crypto.randomUUID();
-
-      const ws = new WireSocket({
-        onMessage: (msg) => handleTabMsg(id, agent, workspace, tool, msg),
-        onBinary: (data) => {
-          const tab = tabsRef.current.find((t) => t.id === id);
-          tab?.term.write(data);
-        },
-        onClose: (_code, _reason) => {
-          // WS dropped — close the tab so the user doesn't have to
-          // click ✕ on a dead session. Refresh the sidebar so the
-          // workspace's status dot tracks reality.
-          if (ctrlAgentRef.current === agent) {
-            ctrlWsRef.current?.send({ type: 'list_workspaces' });
-          }
-          closeTabRef.current(id);
-        },
-        onError: () => {
-          closeTabRef.current(id);
-        },
+      // Seed the reconnect controller so the very first onClose has
+      // something to consult. The handlers (makeWsHandlers below)
+      // route through reconnectRef instead of calling closeTab
+      // directly, so any drop that wasn't `intentionallyClosed` or
+      // `fatalReject` triggers an automatic reconnect attempt.
+      reconnectRef.current.set(id, {
+        attempt: 0,
+        timerId: null,
+        intentionallyClosed: false,
+        fatalReject: false,
       });
+
+      const ws = new WireSocket(makeWsHandlers(id, agent, workspace, tool));
 
       // Wire terminal input → WS
       term.onData((data) => {
@@ -574,7 +683,17 @@ export default function Workbench() {
         // v1.13: skip select_agent. open_session carries the
         // workspace's bound `agent` directly so the hub routes
         // without an extra round-trip.
-        dispatchTabs({ type: 'UPDATE', id: tabId, patch: { status: 'opening' } });
+        //
+        // While auto-reconnecting (rc.attempt > 0), leave status as
+        // 'reconnecting' so the yellow badge stays put and the user
+        // doesn't see the "Opening session..." white overlay flash
+        // on every retry. We only flip to 'opening' on the very
+        // first attempt of the tab's lifetime.
+        const rcWelcome = reconnectRef.current.get(tabId);
+        const inReconnect = rcWelcome ? rcWelcome.attempt > 0 : false;
+        if (!inReconnect) {
+          dispatchTabs({ type: 'UPDATE', id: tabId, patch: { status: 'opening' } });
+        }
         const tab = tabsRef.current.find((t) => t.id === tabId);
         if (!tab) break;
         let cols = 80;
@@ -612,7 +731,31 @@ export default function Workbench() {
         tab.ws.send(openMsg);
         break;
       }
+      case 'rejected': {
+        // Terminal frame: hub kicked us (admin disconnect, account
+        // disabled, version drift, …). Tell the reconnect controller
+        // not to retry; the upcoming onclose will tear the tab down
+        // and surface `msg.reason` to the user.
+        const rc = reconnectRef.current.get(tabId);
+        if (rc) {
+          rc.fatalReject = true;
+          rc.fatalReason = msg.reason;
+        }
+        break;
+      }
       case 'session_opened': {
+        // Reset the reconnect controller — a brand-new live session
+        // is the strongest "we recovered" signal we have. Without
+        // this, every reconnect would keep growing its backoff
+        // window across the lifetime of the tab.
+        const rc = reconnectRef.current.get(tabId);
+        if (rc) {
+          rc.attempt = 0;
+          if (rc.timerId !== null) {
+            window.clearTimeout(rc.timerId);
+            rc.timerId = null;
+          }
+        }
         dispatchTabs({ type: 'UPDATE', id: tabId, patch: { status: 'live' } });
         // Do a proper fit + resize now that session is open
         setTimeout(() => {
@@ -633,15 +776,36 @@ export default function Workbench() {
         }, 50);
         break;
       }
-      case 'session_error':
-        // SessionError is non-fatal by protocol contract (see
-        // crates/hub/src/pty_proto.rs). Surface the message as a
-        // toast and leave the tab + underlying claude session intact —
-        // closing the tab here would discard a live conversation just
-        // because Split with codex (or similar) failed.
-        addToast(msg.message || 'Session error');
-        ctrlWsRef.current?.send({ type: 'list_workspaces' });
+      case 'session_error': {
+        // Two regimes:
+        //
+        //  - DURING open (connecting/opening/reconnecting): the most
+        //    common cause is "hub came back online before its agent
+        //    did, so registry.get returned None and hub replied
+        //    'agent X is offline'". Close the WS — handleTabWsClose
+        //    then routes through scheduleReconnect with the
+        //    already-armed backoff, the badge stays yellow, and a
+        //    later attempt picks up the moment the agent is back.
+        //    No toast: the badge already says what's happening, and
+        //    one toast per retry would spam.
+        //
+        //  - AFTER open (live): split-pane failures, transient
+        //    in-session glitches. Surface as a toast and leave the
+        //    claude session untouched — tearing it down would
+        //    discard a live conversation.
+        const current = tabsRef.current.find((t) => t.id === tabId);
+        const stillOpening =
+          current?.status === 'opening' ||
+          current?.status === 'connecting' ||
+          current?.status === 'reconnecting';
+        if (stillOpening) {
+          current?.ws.close();
+        } else {
+          addToast(msg.message || 'Session error');
+          ctrlWsRef.current?.send({ type: 'list_workspaces' });
+        }
         break;
+      }
       case 'session_closed':
         // claude exited (/exit, Ctrl+C, crash) — collapse the tab so
         // the user doesn't have to click ✕, and pull a fresh
@@ -666,10 +830,23 @@ export default function Workbench() {
     (id: string) => {
       const all = tabsRef.current;
       const tab = all.find((t) => t.id === id);
+      // Cancel any pending reconnect AND tell the in-flight WS's
+      // close handler to NOT schedule another one. Order matters:
+      // we have to mark intentionallyClosed *before* ws.close() in
+      // case the close fires synchronously (browsers vary).
+      const rc = reconnectRef.current.get(id);
+      if (rc) {
+        rc.intentionallyClosed = true;
+        if (rc.timerId !== null) {
+          window.clearTimeout(rc.timerId);
+          rc.timerId = null;
+        }
+      }
       if (tab) {
         tab.ws.close();
         tab.term.dispose();
       }
+      reconnectRef.current.delete(id);
       dispatchTabs({ type: 'REMOVE', id });
 
       // Pick next active tab + land the cursor in its xterm. Without
@@ -911,6 +1088,20 @@ export default function Workbench() {
                   <span className="text-sm text-zinc-500 dark:text-zinc-400">
                     {tab.status === 'connecting' ? 'Connecting...' : 'Opening session...'}
                   </span>
+                </div>
+              )}
+              {/* Reconnect badge: top-right yellow pill, non-blocking
+                  so the user keeps seeing their scrollback / claude
+                  UI behind it. Stays visible until session_opened
+                  fires (status flips back to 'live'). The terminal
+                  itself is left mounted on purpose — tmux will
+                  redraw the alt-screen on reattach. */}
+              {tab.status === 'reconnecting' && (
+                <div className="absolute top-2 right-2 z-20 pointer-events-none">
+                  <div className="flex items-center gap-1.5 rounded-full border border-yellow-400 bg-yellow-50 dark:border-yellow-500/60 dark:bg-yellow-900/40 px-2.5 py-1 text-xs font-medium text-yellow-800 dark:text-yellow-200 shadow-sm">
+                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-yellow-500 animate-pulse" />
+                    Reconnecting…
+                  </div>
                 </div>
               )}
               {(tab.status === 'closed' || tab.status === 'error') && (

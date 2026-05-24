@@ -4,7 +4,17 @@ import type { Terminal } from '@xterm/xterm';
 import type { FitAddon } from '@xterm/addon-fit';
 import type { WireSocket } from './wire';
 
-export type TabStatus = 'connecting' | 'opening' | 'live' | 'closed' | 'error';
+export type TabStatus =
+  | 'connecting'
+  | 'opening'
+  | 'live'
+  // WS dropped without a terminal `rejected` frame; the workbench is
+  // looping a fresh WireSocket + open_session under the hood with
+  // exponential backoff. The terminal stays mounted and visible so the
+  // user keeps their scrollback context.
+  | 'reconnecting'
+  | 'closed'
+  | 'error';
 
 export type Tab = {
   id: string;

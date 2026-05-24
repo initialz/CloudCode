@@ -37,6 +37,16 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 const WORKSPACE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const PTY_EVENT_QUEUE: usize = 1024;
+/// Cadence for the periodic `HubToClient::Ping` we shove down every
+/// live user WS. Purpose is purely keepalive — without an
+/// application-level frame on the wire, intermediate proxies (nginx,
+/// Cloudflare, corporate firewalls) and browsers' own background-tab
+/// throttling routinely drop "idle" WebSockets after 30-60s. The
+/// client's wire.ts replies with `pong` and the connection stays
+/// fresh. 25s is the safe side of every default proxy idle timeout
+/// I've seen, while still cheap (one tiny text frame per minute per
+/// user).
+const USER_PING_INTERVAL: Duration = Duration::from_secs(25);
 
 pub async fn upgrade(
     State(state): State<Arc<AppState>>,
@@ -76,6 +86,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, pre_auth: Option
         active: None,
     };
 
+    // Application-level keepalive ticker (see USER_PING_INTERVAL doc).
+    // The first tick fires immediately by default; consume it so we
+    // don't ping the moment the socket opens.
+    let mut ping_tick = tokio::time::interval(USER_PING_INTERVAL);
+    ping_tick.tick().await;
+
     // Single big loop — menu phase + (optionally) PTY phase.
     loop {
         let agent_evt_recv = async {
@@ -87,6 +103,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, pre_auth: Option
         };
 
         tokio::select! {
+            _ = ping_tick.tick() => {
+                if send_client(&mut sink, &HubToClient::Ping).await.is_err() {
+                    break;
+                }
+            }
             kick = kick_rx.recv() => {
                 // Either we got a kick (Ok) or the sender was lagged
                 // (RecvError::Lagged) — both mean an admin asked us
