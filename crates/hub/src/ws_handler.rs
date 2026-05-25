@@ -57,7 +57,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
     let (name, secret, version, agent_version, target_triple, agent_workspaces) = hello;
 
-    if version != PROTOCOL_VERSION {
+    let agent_proto: u32 = version.parse().unwrap_or(0);
+    let hub_proto: u32 = PROTOCOL_VERSION.parse().unwrap_or(0);
+    if agent_proto > hub_proto {
         let _ = send_rejected(&mut sink, RejectReason::VersionMismatch).await;
         return;
     }
