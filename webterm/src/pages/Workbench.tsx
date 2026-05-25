@@ -1009,6 +1009,21 @@ export default function Workbench() {
     };
   }, [activeTabId]);
 
+  // ── Auto-focus active terminal ──────────────────────────────────────────
+  // When the active tab changes or its status flips to 'live', push focus
+  // into xterm so the user can type immediately without clicking the
+  // terminal area first. Covers two cases: (a) clicking a sidebar row to
+  // open/switch tabs, and (b) session_opened arriving while focus is still
+  // on the sidebar button or any other non-terminal element.
+
+  const activeStatus = activeTab?.status;
+  useEffect(() => {
+    if (!activeTabId) return;
+    const tab = tabsRef.current.find((t) => t.id === activeTabId);
+    if (!tab || tab.status !== 'live') return;
+    requestAnimationFrame(() => tab.term.focus());
+  }, [activeTabId, activeStatus]);
+
   // ── Theme change: update all terminals ───────────────────────────────────
 
   function handleThemeChange(t: Theme) {
@@ -1086,6 +1101,7 @@ export default function Workbench() {
               key={tab.id}
               ref={(el) => attachContainer(tab.id, el)}
               className={`absolute inset-0 ${tab.id === activeTabId ? 'block' : 'hidden'}`}
+              onMouseDown={() => tab.term.focus()}
             >
               {/* Status overlays */}
               {(tab.status === 'connecting' || tab.status === 'opening') && (
