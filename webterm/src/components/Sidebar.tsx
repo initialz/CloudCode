@@ -17,6 +17,7 @@ type Props = {
   onCreateWorkspace: (agent: string, name: string) => void;
   onResetWorkspace: (agent: string, workspace: string) => void;
   onDeleteWorkspace: (agent: string, workspace: string) => void;
+  onOpenFiles?: (agent: string, workspace: string) => void;
   onSettings: () => void;
   onLogout: () => void;
 };
@@ -40,6 +41,7 @@ export default function Sidebar({
   onCreateWorkspace,
   onResetWorkspace,
   onDeleteWorkspace,
+  onOpenFiles,
   onSettings,
   onLogout,
 }: Props) {
@@ -139,6 +141,7 @@ export default function Sidebar({
             onOpenWorkspace={onOpenWorkspace}
             onResetWorkspace={askReset}
             onDeleteWorkspace={askDelete}
+            onOpenFiles={onOpenFiles}
           />
         </div>
 

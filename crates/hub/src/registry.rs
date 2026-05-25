@@ -55,6 +55,7 @@ impl AgentRegistry {
                     send,
                     sessions: DashMap::new(),
                     workspace_requests: DashMap::new(),
+                    fs_read_streams: DashMap::new(),
                 });
                 v.insert(conn.clone());
                 Some(conn)
@@ -81,6 +82,20 @@ impl AgentRegistry {
             }
         }
         conn.workspace_requests.clear();
+        // Drain any in-flight FsRead streams: send a terminal error
+        // chunk so the HTTP handler closes its response body promptly
+        // (instead of hanging on a 30s idle timeout).
+        let rids: Vec<Uuid> = conn.fs_read_streams.iter().map(|e| *e.key()).collect();
+        for rid in rids {
+            if let Some((_, tx)) = conn.fs_read_streams.remove(&rid) {
+                let _ = tx.try_send(ClientMsg::FsReadChunk {
+                    request_id: rid,
+                    data_b64: String::new(),
+                    eof: true,
+                    error: Some("agent disconnected".into()),
+                });
+            }
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<AgentConn>> {
@@ -118,6 +133,11 @@ pub struct AgentConn {
     sessions: DashMap<Uuid, mpsc::Sender<PtyEventOut>>,
     /// One-shot reply slots for workspace_list / create / delete / update by request_id.
     workspace_requests: DashMap<Uuid, oneshot::Sender<ClientMsg>>,
+    /// Streaming reply slots for `FsRead`: many `FsReadChunk` frames per
+    /// request_id until one arrives with `eof = true` (or an `error`).
+    /// Distinct from `workspace_requests` because oneshot can only carry
+    /// a single frame.
+    fs_read_streams: DashMap<Uuid, mpsc::Sender<ClientMsg>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -159,6 +179,21 @@ impl AgentConn {
         self.workspace_requests.insert(request_id, tx);
     }
 
+    /// Register an mpsc sink that will receive every `FsReadChunk`
+    /// frame for `request_id` until the agent emits `eof = true`
+    /// (or an `error`). The hub's HTTP download handler holds the
+    /// matching receiver and decodes chunks as they arrive.
+    pub fn register_fs_read_stream(&self, request_id: Uuid, tx: mpsc::Sender<ClientMsg>) {
+        self.fs_read_streams.insert(request_id, tx);
+    }
+
+    /// Best-effort cleanup of the stream entry. Idempotent — safe to
+    /// call from the HTTP handler's drop path even if the routing
+    /// layer already removed it on EOF.
+    pub fn unregister_fs_read_stream(&self, request_id: Uuid) {
+        self.fs_read_streams.remove(&request_id);
+    }
+
     /// Handle an incoming text JSON frame from the agent.
     pub async fn handle_text_frame(&self, frame: ClientMsg) {
         match classify(&frame) {
@@ -177,7 +212,37 @@ impl AgentConn {
                     tracing::warn!(request = %rid, "no workspace request route");
                 }
             }
-            Routing::Discard => {}
+            Routing::FsStream(rid) => {
+                // Inspect terminal-ness BEFORE forwarding so we can
+                // remove the routing entry first — the receiver may
+                // drop its handle on EOF and we don't want a racing
+                // chunk to log "no route" spuriously.
+                let terminal = matches!(
+                    &frame,
+                    ClientMsg::FsReadChunk { eof, error, .. } if *eof || error.is_some()
+                );
+                let tx = self.fs_read_streams.get(&rid).map(|e| e.value().clone());
+                if let Some(tx) = tx {
+                    // Backpressure: if the HTTP client is slow, this
+                    // await blocks the per-agent frame loop. That is
+                    // intentional — the agent's chunk emitter is
+                    // similarly bounded so file streaming applies
+                    // end-to-end backpressure.
+                    let _ = tx.send(frame).await;
+                    if terminal {
+                        self.fs_read_streams.remove(&rid);
+                    }
+                } else {
+                    tracing::warn!(request = %rid, "no fs read stream route");
+                    if terminal {
+                        // Already removed; ensure idempotency.
+                        self.fs_read_streams.remove(&rid);
+                    }
+                }
+            }
+            Routing::Discard => {
+                tracing::debug!("discarding unroutable frame");
+            }
         }
     }
 
@@ -205,6 +270,9 @@ impl AgentConn {
 enum Routing {
     Session(Uuid),
     Workspace(Uuid),
+    /// `FsReadChunk` stream: many frames per request_id, routed via the
+    /// mpsc-backed `fs_read_streams` map (oneshot can't carry a stream).
+    FsStream(Uuid),
     Discard,
 }
 
@@ -220,6 +288,8 @@ fn classify(frame: &ClientMsg) -> Routing {
         | ClientMsg::WorkspaceResetResult { request_id, .. }
         | ClientMsg::WorkspaceListAllResult { request_id, .. }
         | ClientMsg::UpdateAgentResult { request_id, .. } => Routing::Workspace(*request_id),
+        ClientMsg::FsListResult { request_id, .. } => Routing::Workspace(*request_id),
+        ClientMsg::FsReadChunk { request_id, .. } => Routing::FsStream(*request_id),
         ClientMsg::Hello { .. }
         | ClientMsg::Pong
         | ClientMsg::Message { .. }
@@ -230,5 +300,85 @@ fn classify(frame: &ClientMsg) -> Routing {
             // defensively.
             Routing::Discard
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_conn() -> Arc<AgentConn> {
+        // Drop the send half — we never exercise it in these unit
+        // tests; the receiver going away just means
+        // `AgentConn::send` would fail, which we don't call.
+        let (send, _rx) = mpsc::channel(1);
+        Arc::new(AgentConn {
+            name: "test".into(),
+            agent_version: None,
+            target_triple: None,
+            id: 0,
+            send,
+            sessions: DashMap::new(),
+            workspace_requests: DashMap::new(),
+            fs_read_streams: DashMap::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn fs_stream_eof_removes_route() {
+        let conn = mk_conn();
+        let rid = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(8);
+        conn.register_fs_read_stream(rid, tx);
+        assert!(conn.fs_read_streams.contains_key(&rid));
+
+        // First chunk: not terminal — entry must remain.
+        conn.handle_text_frame(ClientMsg::FsReadChunk {
+            request_id: rid,
+            data_b64: "aGVsbG8=".into(),
+            eof: false,
+            error: None,
+        })
+        .await;
+        assert!(conn.fs_read_streams.contains_key(&rid));
+        let got = rx.recv().await.expect("first chunk");
+        assert!(matches!(
+            got,
+            ClientMsg::FsReadChunk { eof: false, ref data_b64, .. } if data_b64 == "aGVsbG8="
+        ));
+
+        // Terminal chunk: entry must be removed.
+        conn.handle_text_frame(ClientMsg::FsReadChunk {
+            request_id: rid,
+            data_b64: String::new(),
+            eof: true,
+            error: None,
+        })
+        .await;
+        assert!(!conn.fs_read_streams.contains_key(&rid));
+        let got = rx.recv().await.expect("eof chunk");
+        assert!(matches!(got, ClientMsg::FsReadChunk { eof: true, .. }));
+    }
+
+    #[tokio::test]
+    async fn fs_stream_error_removes_route() {
+        let conn = mk_conn();
+        let rid = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(8);
+        conn.register_fs_read_stream(rid, tx);
+
+        conn.handle_text_frame(ClientMsg::FsReadChunk {
+            request_id: rid,
+            data_b64: String::new(),
+            eof: true,
+            error: Some("boom".into()),
+        })
+        .await;
+        assert!(!conn.fs_read_streams.contains_key(&rid));
+        let got = rx.recv().await.expect("error chunk");
+        assert!(matches!(
+            got,
+            ClientMsg::FsReadChunk { error: Some(ref e), .. } if e == "boom"
+        ));
     }
 }

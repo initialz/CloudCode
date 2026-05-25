@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "8";
+pub const PROTOCOL_VERSION: &str = "10";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
@@ -53,14 +53,10 @@ pub enum ClientMsg {
         /// Used by the hub to pick the right release asset on self-update.
         #[serde(default)]
         target_triple: Option<String>,
-        /// Workspaces the agent has on local disk, formatted as
-        /// `"<account>/<name>"`. Hub uses this on connect to seed
-        /// its `workspaces` table for any name it hasn't seen before
-        /// (one-time migration from the pre-v1.13 per-agent model).
-        /// New rows are inserted with `INSERT OR IGNORE` so we don't
-        /// stomp on existing bindings — first agent to report a
-        /// given `(account, name)` wins. Older agents simply omit
-        /// this field; hub treats them as if they had no workspaces.
+        /// Workspaces that exist on the agent's local disk, formatted
+        /// as `"<account>/<name>"`. Hub seeds its workspaces table
+        /// with these on first sighting (one-time migration so users
+        /// don't lose access to pre-v1.13 dirs).
         #[serde(default)]
         workspaces: Vec<String>,
     },
@@ -86,8 +82,10 @@ pub enum ClientMsg {
     },
 
     /// Reply to a hub-initiated `SplitPane` request. Session-keyed so the
-    /// hub routes it back through the same client connection. `error =
-    /// None` means the new pane was successfully spawned. New in v1.10.
+    /// hub can route the result to the same client that asked. `error =
+    /// None` means the new pane was successfully spawned; otherwise the
+    /// message explains the failure (unknown tool, tmux missing, …).
+    /// New in v1.10; pre-1.10 hubs/agents won't emit or expect this.
     SplitPaneResult {
         session_id: Uuid,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -95,10 +93,8 @@ pub enum ClientMsg {
     },
 
     /// One JSONL line tailed from claude's per-project history file.
-    /// The agent streams these to the hub so the admin UI can show the
-    /// conversation for each session. `kind` is the outer `type` field
-    /// (user / assistant / permission-mode / file-history-snapshot /
-    /// …); `body` is the raw line.
+    /// Streamed to the hub so the admin UI can show the conversation
+    /// associated with each session.
     Message {
         session_id: Uuid,
         claude_session_id: String,
@@ -148,7 +144,7 @@ pub enum ClientMsg {
     },
 
     /// One user-typed prompt (or bash escape) captured from claude's
-    /// per-project jsonl log. Distinct from `Message` (which carries
+    /// per-project jsonl log. Distinct from `Message` (which streams
     /// every event for the conversation view): this is filtered to
     /// actual human inputs and lands in `user_interactions` for the
     /// admin audit surface. New in v1.14 (protocol v8).
@@ -156,7 +152,8 @@ pub enum ClientMsg {
         account: String,
         workspace: String,
         /// UUID of the claude session (jsonl filename stem). Independent
-        /// of the cloudcode pty `session_id` namespace.
+        /// of the cloudcode pty `session_id` namespace — the same
+        /// claude session can outlive several pty sessions.
         claude_session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt_id: Option<String>,
@@ -167,16 +164,71 @@ pub enum ClientMsg {
         git_branch: Option<String>,
         /// Wall-clock at which claude wrote this jsonl row.
         ts_ms: i64,
-        /// Either `"prompt"` or `"bash_input"`. Tool writebacks are
-        /// filtered out by the agent before they reach the wire.
+        /// Either `"prompt"` (normal chat) or `"bash_input"` (the user
+        /// hit `!` and typed a shell line). Tool writebacks
+        /// (bash-stdout / bash-stderr / system-reminder) are filtered
+        /// out by the agent before they reach the wire.
         kind: String,
         content: String,
     },
+
+    /// Reply to a `FsList` request — one shot per request_id.
+    /// New in v1.15 (protocol v9). `error` is set when the workspace
+    /// dir doesn't exist, the path escapes the workspace root, etc.
+    /// `entries` is populated for ANY successful list, even if empty.
+    FsListResult {
+        request_id: Uuid,
+        #[serde(default)]
+        entries: Vec<FsEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    /// One chunk of a streaming download started by `FsRead`. The agent
+    /// emits these in order, each carrying up to ~64 KB of file
+    /// contents base64-encoded. `eof = true` marks the final chunk
+    /// (`data_b64` may still hold the tail). On any read failure the
+    /// agent emits a single chunk with `error` set and `eof = true`
+    /// to terminate the stream; the hub then short-reads its HTTP
+    /// response.
+    FsReadChunk {
+        request_id: Uuid,
+        #[serde(default)]
+        data_b64: String,
+        #[serde(default)]
+        eof: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
-/// One row in a WorkspaceListResult. Same shape on both sides of the
-/// tunnel; hub layers on `has_client` separately when forwarding to
-/// the cloudcode client.
+/// One entry returned in a `FsListResult`. Directory entries have
+/// `size = 0`; symlinks report the link's own size (which is
+/// usually meaningless, but the UI can show them distinctly via
+/// `kind`).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FsEntry {
+    pub name: String,
+    pub kind: FsKind,
+    pub size: u64,
+    /// Last-modified wall-clock in milliseconds since the Unix epoch.
+    pub mtime_ms: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FsKind {
+    File,
+    Dir,
+    Symlink,
+    /// Anything else we don't recognise (device files, FIFOs, …).
+    /// Listed for completeness but the UI usually hides these.
+    Other,
+}
+
+/// One row in a WorkspaceListResult. `tmux_alive` lets the picker
+/// distinguish "session state still on the agent" (saved) from
+/// "blank slot" (fresh).
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WorkspaceItem {
     pub name: String,
@@ -184,7 +236,7 @@ pub struct WorkspaceItem {
 }
 
 /// Row in a `WorkspaceListAllResult`. Carries the account because the
-/// admin view aggregates across all accounts the agent serves.
+/// admin view aggregates across every account this agent serves.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WorkspaceFullItem {
     pub account: String,
@@ -194,11 +246,8 @@ pub struct WorkspaceFullItem {
 
 /// Where a SplitPane lands relative to the active pane.
 ///
-/// - `Right`: vertical divider, new pane appears to the right (tmux `-h`).
-/// - `Down`:  horizontal divider, new pane appears below       (tmux `-v`).
-///
-/// `Down` is the default to match tmux's own default; older hubs without
-/// this field round-trip to the same behaviour.
+/// `Right`: vertical divider, new pane appears to the right (tmux `-h`).
+/// `Down`:  horizontal divider, new pane appears below       (tmux `-v`).
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SplitDirection {
@@ -239,16 +288,15 @@ pub enum ServerMsg {
         rows: u16,
         #[serde(default)]
         claude_args: Vec<String>,
-        /// Whether the agent should wrap the spawned tmux+claude in
-        /// the workspace sandbox. Decided per-account on the hub
-        /// (`accounts.sandbox_enabled`); the agent.toml `[sandbox]`
-        /// switch is deprecated. Optional for back-compat with pre-
-        /// v1.9 hubs (default false = no sandbox).
+        /// Wrap the spawned tmux+claude in the workspace sandbox.
+        /// Decided per-account on the hub. Defaults to false for
+        /// back-compat with pre-v1.9 hubs that never sent it.
         #[serde(default)]
         sandbox: bool,
         /// Which tool to launch in the first pane (claude / codex / …).
-        /// `None` -> agent falls back to its `[tools].default`.
-        /// Optional for back-compat with pre-v1.10 hubs.
+        /// `None` means "agent default" — the agent falls back to its
+        /// `[tools].default`. Optional for back-compat with pre-v1.10
+        /// hubs that didn't know about multi-tool.
         #[serde(default)]
         tool: Option<String>,
     },
@@ -265,19 +313,21 @@ pub enum ServerMsg {
 
     /// Add a new tmux pane to an existing PTY session, running `tool`
     /// (with optional extra args) alongside whatever was already there.
-    /// New in v1.10.
+    /// New in v1.10; pre-1.10 agents will fail to deserialize this and
+    /// drop the frame — the hub won't send it to them because the
+    /// client only emits it when the user explicitly hits split.
     SplitPane {
         session_id: Uuid,
         tool: String,
-        /// Where the new pane lands. Defaults to `Down` so older agents
-        /// that don't know this field keep tmux's default split direction.
+        /// Where the new pane lands. Defaults to `Down` so frames from
+        /// pre-direction hubs/clients keep tmux's default split behaviour.
         #[serde(default)]
         direction: SplitDirection,
         #[serde(default)]
         args: Vec<String>,
     },
 
-    /// Re-arrange the panes in an existing session via `tmux select-layout`.
+    /// Re-arrange panes in an existing session via `tmux select-layout`.
     /// New in v1.10.
     ChangeLayout {
         session_id: Uuid,
@@ -322,6 +372,40 @@ pub enum ServerMsg {
         download_url: String,
         /// `.sha256` manifest URL covering the same asset.
         sha256_url: String,
+    },
+
+    /// List a workspace directory. `path` is relative to the workspace
+    /// root (leading `/` allowed but ignored). `show_hidden` controls
+    /// whether dotfiles appear in the result. New in v1.15 (proto v9).
+    FsList {
+        request_id: Uuid,
+        account: String,
+        workspace: String,
+        #[serde(default)]
+        path: String,
+        #[serde(default)]
+        show_hidden: bool,
+    },
+    /// Stream a workspace file back to the hub as a series of
+    /// `FsReadChunk` frames. `path` is relative to the workspace root.
+    /// New in v1.15 (proto v9).
+    FsRead {
+        request_id: Uuid,
+        account: String,
+        workspace: String,
+        path: String,
+    },
+
+    /// Bundle one or more workspace paths (files and/or directories,
+    /// any mix) into a single in-memory zip and stream it back as a
+    /// series of `FsReadChunk` frames — same wire shape as `FsRead`
+    /// so the hub's existing fs_read_streams routing handles it
+    /// without changes. New in v1.16 (proto v10).
+    FsArchive {
+        request_id: Uuid,
+        account: String,
+        workspace: String,
+        paths: Vec<String>,
     },
 }
 

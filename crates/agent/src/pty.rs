@@ -280,6 +280,116 @@ impl PtyManager {
             ServerMsg::UpdateAgent { request_id, .. } => {
                 tracing::warn!(%request_id, "UpdateAgent reached PtyManager; should be handled in ws");
             }
+            // Filesystem ops: account/workspace names are validated up
+            // front so a bogus identifier produces a fast structured
+            // error rather than a confusing "workspace not found" from
+            // canonicalize(). Path safety itself lives in fs::resolve_safe.
+            ServerMsg::FsList {
+                request_id,
+                account,
+                workspace,
+                path,
+                show_hidden,
+            } => {
+                let workspace_root = self.workspace_root();
+                let (entries, error) = match validate_name(&account, "account")
+                    .and_then(|_| validate_name(&workspace, "workspace"))
+                {
+                    Err(e) => (Vec::new(), Some(e)),
+                    Ok(()) => {
+                        match crate::fs::list(
+                            &workspace_root,
+                            &account,
+                            &workspace,
+                            &path,
+                            show_hidden,
+                        )
+                        .await
+                        {
+                            Ok(rows) => (rows, None),
+                            Err(e) => (Vec::new(), Some(e)),
+                        }
+                    }
+                };
+                let _ = tx
+                    .send(OutFrame::Text(ClientMsg::FsListResult {
+                        request_id,
+                        entries,
+                        error,
+                    }))
+                    .await;
+            }
+            ServerMsg::FsRead {
+                request_id,
+                account,
+                workspace,
+                path,
+            } => {
+                // Run the streaming read in a detached task so a
+                // multi-MB download doesn't block subsequent control
+                // frames on the same WS. The task owns its tx clone
+                // and terminates the stream with an eof chunk in
+                // every exit path (see fs::read_stream).
+                if let Err(e) = validate_name(&account, "account")
+                    .and_then(|_| validate_name(&workspace, "workspace"))
+                {
+                    let _ = tx
+                        .send(OutFrame::Text(ClientMsg::FsReadChunk {
+                            request_id,
+                            data_b64: String::new(),
+                            eof: true,
+                            error: Some(e),
+                        }))
+                        .await;
+                } else {
+                    let workspace_root = self.workspace_root();
+                    let tx2 = tx.clone();
+                    tokio::spawn(async move {
+                        crate::fs::read_stream(
+                            &workspace_root,
+                            &account,
+                            &workspace,
+                            &path,
+                            request_id,
+                            tx2,
+                        )
+                        .await;
+                    });
+                }
+            }
+            ServerMsg::FsArchive {
+                request_id,
+                account,
+                workspace,
+                paths,
+            } => {
+                if let Err(e) = validate_name(&account, "account")
+                    .and_then(|_| validate_name(&workspace, "workspace"))
+                {
+                    let _ = tx
+                        .send(OutFrame::Text(ClientMsg::FsReadChunk {
+                            request_id,
+                            data_b64: String::new(),
+                            eof: true,
+                            error: Some(e),
+                        }))
+                        .await;
+                } else {
+                    let workspace_root = self.workspace_root();
+                    let tx2 = tx.clone();
+                    tokio::spawn(async move {
+                        crate::fs::archive_stream(
+                            &workspace_root,
+                            &account,
+                            &workspace,
+                            &paths,
+                            request_id,
+                            tx2,
+                        )
+                        .await;
+                    });
+                }
+            }
             ServerMsg::Welcome { .. } | ServerMsg::Rejected { .. } | ServerMsg::Ping => {}
         }
     }

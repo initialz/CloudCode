@@ -1,0 +1,630 @@
+//! Filesystem ops for the workspace file-manager (proto v9).
+//!
+//! Two entry points:
+//!   - [`list`] enumerates entries under a workspace-relative directory.
+//!   - [`read_stream`] streams a workspace-relative file back to the hub
+//!     as a series of base64-encoded `FsReadChunk` frames.
+//!
+//! Everything goes through [`resolve_safe`], which is the only thing
+//! standing between an attacker-controlled `path` field and the agent's
+//! host filesystem. The agent runs OUTSIDE the workspace sandbox (it's
+//! the supervisor that applies sandbox-exec to spawned tmux/claude
+//! children), so a traversal bug here would expose the entire user's
+//! home directory.
+//!
+//! Security invariants enforced by `resolve_safe`:
+//!   - the workspace base dir must already exist on disk (we never
+//!     auto-create from a path request);
+//!   - leading `/` is stripped from the request (otherwise `join`
+//!     treats it as absolute and discards the base);
+//!   - NUL bytes in the request are rejected outright;
+//!   - the final canonicalized target must be a strict descendant of
+//!     the canonicalized base, which catches `..` traversal AND
+//!     symlinks pointing outside the workspace.
+
+use crate::pty::OutFrame;
+use crate::tunnel::{ClientMsg, FsEntry, FsKind};
+use base64::Engine;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+use tokio::fs;
+use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+/// Hard cap on entries returned in a single `FsList`. Past this point
+/// we truncate and append a synthetic "(truncated, N total)" sentinel
+/// so the UI can warn instead of silently dropping rows.
+const MAX_LIST_ENTRIES: usize = 10_000;
+
+/// Max bytes per `FsReadChunk` frame. 64 KiB is small enough to keep
+/// individual JSON frames manageable but large enough that we're not
+/// paying per-frame overhead on multi-MB downloads.
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Refuse to stream files larger than 1 GiB. The hub buffers each
+/// response in memory (see `crates/hub/src/pty_session.rs` for the
+/// pending-FsRead map), so unbounded sizes would let any account OOM
+/// the hub.
+const MAX_FILE_BYTES: u64 = 1 << 30; // 1 GiB
+
+/// Resolve a workspace-relative path against `workspace_root/account/workspace`
+/// and prove the result is still inside that base.
+///
+/// Returns the canonicalized absolute target on success, or a short
+/// human-readable error string on failure. The error string is sent
+/// back to the hub verbatim, so it must not leak filesystem layout —
+/// stick to high-level reasons ("not found", "outside workspace", …).
+pub fn resolve_safe(
+    workspace_root: &Path,
+    account: &str,
+    workspace: &str,
+    requested: &str,
+) -> Result<PathBuf, String> {
+    if requested.as_bytes().contains(&0u8) {
+        return Err("path contains NUL byte".into());
+    }
+    let base_raw = workspace_root.join(account).join(workspace);
+    let base = std::fs::canonicalize(&base_raw)
+        .map_err(|e| format!("workspace not found: {}", e))?;
+
+    // Strip any number of leading slashes so the join doesn't discard
+    // `base` (PathBuf::join on an absolute path replaces the receiver).
+    let rel = requested.trim_start_matches('/');
+    let target_raw = if rel.is_empty() {
+        base.clone()
+    } else {
+        base.join(rel)
+    };
+
+    // canonicalize requires existence — that's what makes it a real
+    // anti-symlink check rather than a syntactic prefix match.
+    let target = std::fs::canonicalize(&target_raw)
+        .map_err(|e| format!("path not found: {}", e))?;
+
+    if !target.starts_with(&base) {
+        return Err("path escapes workspace".into());
+    }
+    Ok(target)
+}
+
+/// List entries directly under `rel_path` (relative to the workspace
+/// root). Returns the entries sorted (dirs first, then files, each
+/// alphabetical). Hidden entries (leading dot) are filtered out
+/// unless `show_hidden` is true.
+pub async fn list(
+    workspace_root: &Path,
+    account: &str,
+    workspace: &str,
+    rel_path: &str,
+    show_hidden: bool,
+) -> Result<Vec<FsEntry>, String> {
+    let target = resolve_safe(workspace_root, account, workspace, rel_path)?;
+
+    // We resolved through symlinks, so `is_dir` is correct here — the
+    // canonicalized path no longer contains any link components.
+    let meta = fs::metadata(&target)
+        .await
+        .map_err(|e| format!("stat: {}", e))?;
+    if !meta.is_dir() {
+        return Err("not a directory".into());
+    }
+
+    let mut rd = fs::read_dir(&target)
+        .await
+        .map_err(|e| format!("read_dir: {}", e))?;
+
+    let mut dirs: Vec<FsEntry> = Vec::new();
+    let mut files: Vec<FsEntry> = Vec::new();
+    let mut total: usize = 0;
+
+    loop {
+        match rd.next_entry().await {
+            Ok(Some(entry)) => {
+                let name = match entry.file_name().into_string() {
+                    Ok(n) => n,
+                    // Non-UTF8 filenames are skipped: the wire format
+                    // is JSON strings, so we can't faithfully round-trip
+                    // them anyway.
+                    Err(_) => continue,
+                };
+                if !show_hidden && name.starts_with('.') {
+                    continue;
+                }
+                total += 1;
+                // Use symlink_metadata so symlinks are reported as
+                // symlinks, not as whatever they happen to point at.
+                let lmeta = match entry.metadata().await {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let ft = lmeta.file_type();
+                let kind = if ft.is_symlink() {
+                    FsKind::Symlink
+                } else if ft.is_dir() {
+                    FsKind::Dir
+                } else if ft.is_file() {
+                    FsKind::File
+                } else {
+                    FsKind::Other
+                };
+                let size = if matches!(kind, FsKind::Dir) {
+                    0
+                } else {
+                    lmeta.len()
+                };
+                let mtime_ms = lmeta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let row = FsEntry {
+                    name,
+                    kind,
+                    size,
+                    mtime_ms,
+                };
+                if matches!(row.kind, FsKind::Dir) {
+                    dirs.push(row);
+                } else {
+                    files.push(row);
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return Err(format!("read_dir entry: {}", e)),
+        }
+    }
+
+    dirs.sort_by(|a, b| a.name.cmp(&b.name));
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut out = Vec::with_capacity(dirs.len() + files.len());
+    out.extend(dirs);
+    out.extend(files);
+
+    if out.len() > MAX_LIST_ENTRIES {
+        out.truncate(MAX_LIST_ENTRIES);
+        out.push(FsEntry {
+            name: format!("(truncated, {} total)", total),
+            kind: FsKind::Other,
+            size: 0,
+            mtime_ms: 0,
+        });
+    }
+
+    Ok(out)
+}
+
+/// Stream a workspace file back to the hub as `FsReadChunk` frames.
+///
+/// Always terminates the stream with a chunk where `eof = true` — on
+/// success the last chunk carries any trailing bytes; on failure a
+/// single chunk with `error = Some(...)` and empty `data_b64` is sent.
+/// The hub uses `eof` to know when to flush its outgoing HTTP body, so
+/// missing it would hang the client until the WS timeout.
+pub async fn read_stream(
+    workspace_root: &Path,
+    account: &str,
+    workspace: &str,
+    rel_path: &str,
+    request_id: Uuid,
+    tx: mpsc::Sender<OutFrame>,
+) {
+    if let Err(err) = read_stream_inner(workspace_root, account, workspace, rel_path, request_id, &tx).await {
+        let _ = tx
+            .send(OutFrame::Text(ClientMsg::FsReadChunk {
+                request_id,
+                data_b64: String::new(),
+                eof: true,
+                error: Some(err),
+            }))
+            .await;
+    }
+}
+
+/// Inner read pipeline that returns `Err(String)` on any failure so
+/// the wrapper can emit a single terminal error frame. On success it
+/// has already pushed the final `eof = true` chunk and returns Ok.
+async fn read_stream_inner(
+    workspace_root: &Path,
+    account: &str,
+    workspace: &str,
+    rel_path: &str,
+    request_id: Uuid,
+    tx: &mpsc::Sender<OutFrame>,
+) -> Result<(), String> {
+    let target = resolve_safe(workspace_root, account, workspace, rel_path)?;
+
+    let meta = fs::metadata(&target)
+        .await
+        .map_err(|e| format!("stat: {}", e))?;
+    if meta.is_dir() {
+        return Err("is a directory".into());
+    }
+    if !meta.is_file() {
+        // Symlinks were resolved by canonicalize; whatever's left
+        // (FIFOs, sockets, device files, …) we refuse rather than
+        // potentially hanging on open().
+        return Err("not a regular file".into());
+    }
+    if meta.len() > MAX_FILE_BYTES {
+        return Err("file too large".into());
+    }
+
+    let mut f = fs::File::open(&target)
+        .await
+        .map_err(|e| format!("open: {}", e))?;
+
+    let mut buf = vec![0u8; READ_CHUNK_BYTES];
+    let mut peek: Option<Vec<u8>> = None;
+
+    loop {
+        let n = f
+            .read(&mut buf)
+            .await
+            .map_err(|e| format!("read: {}", e))?;
+        if n == 0 {
+            // Flush whatever was buffered as the EOF chunk. If `peek`
+            // is None the file was empty — send one terminal chunk
+            // with empty data so the hub still observes the eof flag.
+            let tail = peek.take().unwrap_or_default();
+            let data_b64 = if tail.is_empty() {
+                String::new()
+            } else {
+                base64::engine::general_purpose::STANDARD.encode(&tail)
+            };
+            tx.send(OutFrame::Text(ClientMsg::FsReadChunk {
+                request_id,
+                data_b64,
+                eof: true,
+                error: None,
+            }))
+            .await
+            .map_err(|_| "tx closed".to_string())?;
+            return Ok(());
+        }
+
+        // We can't mark `eof=true` until we've seen a 0-byte read,
+        // because read() is allowed to return short. Buffer one
+        // chunk ahead so the final chunk gets eof set correctly.
+        if let Some(prev) = peek.take() {
+            let data_b64 = base64::engine::general_purpose::STANDARD.encode(&prev);
+            tx.send(OutFrame::Text(ClientMsg::FsReadChunk {
+                request_id,
+                data_b64,
+                eof: false,
+                error: None,
+            }))
+            .await
+            .map_err(|_| "tx closed".to_string())?;
+        }
+        peek = Some(buf[..n].to_vec());
+    }
+}
+
+/// Stream a zip archive of multiple workspace paths (files and/or
+/// directories) back to the hub as `FsReadChunk` frames.
+///
+/// Always terminates with `eof = true` — either on the last data
+/// chunk or in a single error frame. The hub uses the same
+/// `fs_read_streams` routing as `FsRead`.
+pub async fn archive_stream(
+    workspace_root: &Path,
+    account: &str,
+    workspace: &str,
+    paths: &[String],
+    request_id: Uuid,
+    tx: mpsc::Sender<OutFrame>,
+) {
+    if let Err(err) = archive_stream_inner(workspace_root, account, workspace, paths, request_id, &tx).await {
+        let _ = tx
+            .send(OutFrame::Text(ClientMsg::FsReadChunk {
+                request_id,
+                data_b64: String::new(),
+                eof: true,
+                error: Some(err),
+            }))
+            .await;
+    }
+}
+
+/// Inner archive pipeline — returns `Err(String)` so the wrapper can
+/// emit a single terminal error frame.
+async fn archive_stream_inner(
+    workspace_root: &Path,
+    account: &str,
+    workspace: &str,
+    paths: &[String],
+    request_id: Uuid,
+    tx: &mpsc::Sender<OutFrame>,
+) -> Result<(), String> {
+    use std::io::{Cursor, Write};
+    use zip::write::SimpleFileOptions;
+
+    if paths.is_empty() {
+        return Err("no paths specified".into());
+    }
+
+    // Resolve the workspace base once so we can compute relative
+    // archive entry names.
+    let base_raw = workspace_root.join(account).join(workspace);
+    let base = std::fs::canonicalize(&base_raw)
+        .map_err(|e| format!("workspace not found: {}", e))?;
+
+    // Build the zip in memory.
+    let buf: Vec<u8> = Vec::new();
+    let cursor = Cursor::new(buf);
+    let mut archive = zip::ZipWriter::new(cursor);
+    let options = SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+
+    for rel_path in paths {
+        let target = resolve_safe(workspace_root, account, workspace, rel_path)?;
+        let lmeta = std::fs::symlink_metadata(&target)
+            .map_err(|e| format!("stat {}: {}", rel_path, e))?;
+
+        if lmeta.is_file() {
+            // Single file — archive entry is the workspace-relative path.
+            let entry_name = target
+                .strip_prefix(&base)
+                .map_err(|_| "path escapes workspace".to_string())?
+                .to_string_lossy()
+                .to_string();
+            let data = std::fs::read(&target)
+                .map_err(|e| format!("read {}: {}", rel_path, e))?;
+            archive
+                .start_file(&entry_name, options)
+                .map_err(|e| format!("zip start_file: {}", e))?;
+            archive
+                .write_all(&data)
+                .map_err(|e| format!("zip write: {}", e))?;
+        } else if lmeta.is_dir() {
+            // Walk recursively, skip symlinks (don't follow).
+            for entry in walkdir::WalkDir::new(&target)
+                .follow_links(false)
+                .into_iter()
+            {
+                let entry = entry.map_err(|e| format!("walkdir: {}", e))?;
+                let emeta = entry.metadata().map_err(|e| format!("stat: {}", e))?;
+                let entry_path = entry.path();
+                let entry_name = entry_path
+                    .strip_prefix(&base)
+                    .map_err(|_| "walked path escapes workspace".to_string())?
+                    .to_string_lossy()
+                    .to_string();
+
+                if entry_name.is_empty() {
+                    // The workspace root itself — skip.
+                    continue;
+                }
+
+                if emeta.is_dir() {
+                    // Add directory entry.
+                    archive
+                        .add_directory(&entry_name, options)
+                        .map_err(|e| format!("zip add_directory: {}", e))?;
+                } else if emeta.is_file() {
+                    let data = std::fs::read(entry_path)
+                        .map_err(|e| format!("read {}: {}", entry_name, e))?;
+                    archive
+                        .start_file(&entry_name, options)
+                        .map_err(|e| format!("zip start_file: {}", e))?;
+                    archive
+                        .write_all(&data)
+                        .map_err(|e| format!("zip write: {}", e))?;
+                } else if entry.path_is_symlink() {
+                    // Store symlink as a regular file containing the
+                    // link target text (security: never follow it).
+                    let link_target = std::fs::read_link(entry_path)
+                        .map_err(|e| format!("readlink {}: {}", entry_name, e))?;
+                    let target_str = link_target.to_string_lossy();
+                    archive
+                        .start_file(&entry_name, options)
+                        .map_err(|e| format!("zip start_file: {}", e))?;
+                    archive
+                        .write_all(target_str.as_bytes())
+                        .map_err(|e| format!("zip write: {}", e))?;
+                }
+                // Other file types (FIFOs, sockets, …) are silently skipped.
+            }
+        } else {
+            return Err(format!("unsupported file type: {}", rel_path));
+        }
+    }
+
+    let cursor = archive
+        .finish()
+        .map_err(|e| format!("zip finish: {}", e))?;
+    let zip_bytes = cursor.into_inner();
+
+    if zip_bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err("archive too large".into());
+    }
+
+    // Stream the zip bytes as base64-encoded FsReadChunk frames, using
+    // the same one-chunk-ahead buffering pattern as read_stream_inner.
+    let mut offset = 0usize;
+    let mut peek: Option<&[u8]> = None;
+
+    loop {
+        let end = (offset + READ_CHUNK_BYTES).min(zip_bytes.len());
+        let n = end - offset;
+        if n == 0 {
+            // No more data — flush whatever was buffered as the EOF chunk.
+            let tail = peek.unwrap_or(&[]);
+            let data_b64 = if tail.is_empty() {
+                String::new()
+            } else {
+                base64::engine::general_purpose::STANDARD.encode(tail)
+            };
+            tx.send(OutFrame::Text(ClientMsg::FsReadChunk {
+                request_id,
+                data_b64,
+                eof: true,
+                error: None,
+            }))
+            .await
+            .map_err(|_| "tx closed".to_string())?;
+            return Ok(());
+        }
+
+        // Send the previously buffered chunk (not eof yet).
+        if let Some(prev) = peek.take() {
+            let data_b64 = base64::engine::general_purpose::STANDARD.encode(prev);
+            tx.send(OutFrame::Text(ClientMsg::FsReadChunk {
+                request_id,
+                data_b64,
+                eof: false,
+                error: None,
+            }))
+            .await
+            .map_err(|_| "tx closed".to_string())?;
+        }
+        peek = Some(&zip_bytes[offset..end]);
+        offset = end;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs as stdfs;
+    use std::os::unix::fs::symlink;
+    use tempfile::TempDir;
+
+    /// Build a workspace_root/account/workspace tree and return
+    /// `(tmp, workspace_root_path, account, workspace, base_path)`.
+    fn setup() -> (TempDir, PathBuf, String, String, PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let account = "alice".to_string();
+        let workspace = "demo".to_string();
+        let base = tmp.path().join(&account).join(&workspace);
+        stdfs::create_dir_all(&base).unwrap();
+        let root = tmp.path().to_path_buf();
+        (tmp, root, account, workspace, base)
+    }
+
+    #[test]
+    fn resolves_empty_path_to_base() {
+        let (_tmp, root, account, workspace, base) = setup();
+        let got = resolve_safe(&root, &account, &workspace, "").unwrap();
+        // Both sides are canonicalized; on macOS that includes the
+        // /private prefix for /tmp.
+        assert_eq!(got, stdfs::canonicalize(&base).unwrap());
+    }
+
+    #[test]
+    fn strips_leading_slash() {
+        let (_tmp, root, account, workspace, base) = setup();
+        stdfs::create_dir(base.join("sub")).unwrap();
+        let got = resolve_safe(&root, &account, &workspace, "/sub").unwrap();
+        assert_eq!(got, stdfs::canonicalize(base.join("sub")).unwrap());
+    }
+
+    #[test]
+    fn nested_legitimate_path() {
+        let (_tmp, root, account, workspace, base) = setup();
+        stdfs::create_dir_all(base.join("a/b/c")).unwrap();
+        stdfs::write(base.join("a/b/c/file.txt"), b"hi").unwrap();
+        let got = resolve_safe(&root, &account, &workspace, "a/b/c/file.txt").unwrap();
+        assert!(got.starts_with(stdfs::canonicalize(&base).unwrap()));
+    }
+
+    #[test]
+    fn rejects_dotdot_escape() {
+        let (_tmp, root, account, workspace, _base) = setup();
+        // Create a sibling file outside the workspace to make the
+        // canonicalize succeed; we want the prefix check to fail,
+        // not "not found".
+        let outside = root.join(&account).join("evil.txt");
+        stdfs::write(&outside, b"secret").unwrap();
+        let err = resolve_safe(&root, &account, &workspace, "../evil.txt").unwrap_err();
+        assert!(
+            err.contains("escapes") || err.contains("not found"),
+            "unexpected err: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_symlink_escape() {
+        let (_tmp, root, account, workspace, base) = setup();
+        // Make a target outside the workspace and symlink into it.
+        let outside = root.join("etc_secrets.txt");
+        stdfs::write(&outside, b"top secret").unwrap();
+        symlink(&outside, base.join("passwd_link")).unwrap();
+        let err = resolve_safe(&root, &account, &workspace, "passwd_link").unwrap_err();
+        assert!(
+            err.contains("escapes"),
+            "expected escape error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn rejects_nonexistent_path() {
+        let (_tmp, root, account, workspace, _base) = setup();
+        let err = resolve_safe(&root, &account, &workspace, "missing.txt").unwrap_err();
+        assert!(err.contains("not found"), "got: {}", err);
+    }
+
+    #[test]
+    fn rejects_nul_byte() {
+        let (_tmp, root, account, workspace, _base) = setup();
+        let err = resolve_safe(&root, &account, &workspace, "ok\0bad").unwrap_err();
+        assert!(err.contains("NUL"), "got: {}", err);
+    }
+
+    #[test]
+    fn rejects_missing_workspace_base() {
+        let (_tmp, root, _account, _workspace, _base) = setup();
+        // base for a different (account, workspace) was never created.
+        let err = resolve_safe(&root, "ghost", "ghost", "").unwrap_err();
+        assert!(
+            err.contains("workspace not found"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sorts_dirs_first_then_files() {
+        let (_tmp, root, account, workspace, base) = setup();
+        stdfs::create_dir(base.join("zdir")).unwrap();
+        stdfs::create_dir(base.join("adir")).unwrap();
+        stdfs::write(base.join("zfile"), b"").unwrap();
+        stdfs::write(base.join("afile"), b"hello").unwrap();
+        let entries = list(&root, &account, &workspace, "", false).await.unwrap();
+        let names: Vec<_> = entries.iter().map(|e| e.name.clone()).collect();
+        assert_eq!(names, vec!["adir", "zdir", "afile", "zfile"]);
+        // Sanity: kinds reflect what we created.
+        assert_eq!(entries[0].kind, FsKind::Dir);
+        assert_eq!(entries[2].kind, FsKind::File);
+        // Size populated for files.
+        let afile = &entries[2];
+        assert_eq!(afile.size, 5);
+    }
+
+    #[tokio::test]
+    async fn list_hides_dotfiles_by_default() {
+        let (_tmp, root, account, workspace, base) = setup();
+        stdfs::write(base.join(".secret"), b"").unwrap();
+        stdfs::write(base.join("visible"), b"").unwrap();
+        let entries = list(&root, &account, &workspace, "", false).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "visible");
+        let with_hidden = list(&root, &account, &workspace, "", true).await.unwrap();
+        assert_eq!(with_hidden.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn list_rejects_non_dir() {
+        let (_tmp, root, account, workspace, base) = setup();
+        stdfs::write(base.join("file"), b"").unwrap();
+        let err = list(&root, &account, &workspace, "file", false)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not a directory"), "got: {}", err);
+    }
+}

@@ -1,5 +1,6 @@
 mod audit;
 mod config;
+mod fs;
 mod jsonl;
 mod name;
 mod pty;

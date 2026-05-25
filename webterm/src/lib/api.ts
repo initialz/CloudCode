@@ -67,3 +67,64 @@ export const apiClient = {
       body: JSON.stringify(prefs),
     }),
 };
+
+// ── File manager API ─────────────────────────────────────────────────────────
+
+export type FsEntry = {
+  name: string;
+  kind: 'file' | 'dir' | 'symlink' | 'other';
+  size: number;
+  mtime_ms: number;
+};
+
+export async function listFiles(
+  agent: string,
+  workspace: string,
+  path: string,
+  showHidden: boolean,
+  signal?: AbortSignal,
+): Promise<{ entries: FsEntry[]; error: string | null }> {
+  const qs = new URLSearchParams({
+    agent,
+    workspace,
+    path,
+    ...(showHidden ? { show_hidden: '1' } : {}),
+  });
+  const res = await fetch(`/api/files/list?${qs.toString()}`, {
+    credentials: 'same-origin',
+    signal,
+  });
+  if (!res.ok) {
+    let errMsg = `HTTP ${res.status}`;
+    try {
+      const body = await res.json() as { error?: string };
+      if (body.error) errMsg = body.error;
+    } catch {
+      // ignore parse error
+    }
+    throw new Error(errMsg);
+  }
+  return res.json() as Promise<{ entries: FsEntry[]; error: string | null }>;
+}
+
+export function downloadFileUrl(
+  agent: string,
+  workspace: string,
+  path: string,
+): string {
+  const qs = new URLSearchParams({ agent, workspace, path });
+  return `/api/files/download?${qs.toString()}`;
+}
+
+export function archiveUrl(
+  agent: string,
+  workspace: string,
+  paths: string[],
+): string {
+  const qs = new URLSearchParams({
+    agent,
+    workspace,
+    paths: paths.join(','),
+  });
+  return `/api/files/archive?${qs.toString()}`;
+}

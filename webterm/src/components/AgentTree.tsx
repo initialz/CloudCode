@@ -22,6 +22,7 @@ type Props = {
   onOpenWorkspace: (agent: string, workspace: string, tool?: string) => void;
   onResetWorkspace: (agent: string, workspace: string) => void;
   onDeleteWorkspace: (agent: string, workspace: string) => void;
+  onOpenFiles?: (agent: string, workspace: string) => void;
 };
 
 type WorkspaceMenu = { x: number; y: number; agent: string; workspace: string };
@@ -34,6 +35,7 @@ export default function AgentTree({
   onOpenWorkspace,
   onResetWorkspace,
   onDeleteWorkspace,
+  onOpenFiles,
 }: Props) {
   const [wsMenu, setWsMenu] = useState<WorkspaceMenu | null>(null);
 
@@ -165,6 +167,7 @@ export default function AgentTree({
             }}
             onReset={() => onResetWorkspace(ws.agent, ws.name)}
             onDelete={() => onDeleteWorkspace(ws.agent, ws.name)}
+            onOpenFiles={onOpenFiles ? () => onOpenFiles(ws.agent, ws.name) : undefined}
             onContextMenu={(x, y) => {
               setWsMenu({ x, y, agent: ws.agent, workspace: ws.name });
             }}
@@ -208,6 +211,7 @@ function WorkspaceRow({
   onOpenWithTool,
   onReset,
   onDelete,
+  onOpenFiles,
   onContextMenu,
 }: {
   workspace: WorkspaceItem;
@@ -218,6 +222,7 @@ function WorkspaceRow({
   onOpenWithTool: (tool: string) => void;
   onReset: () => void;
   onDelete: () => void;
+  onOpenFiles?: () => void;
   onContextMenu: (x: number, y: number) => void;
 }) {
   const [dropdownOpen, setDropdownOpen] = useState(false);
@@ -306,6 +311,20 @@ function WorkspaceRow({
           >
             <ChevronDownIcon />
           </button>
+          {/* Files — always enabled */}
+          {onOpenFiles && (
+            <button
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenFiles();
+              }}
+              className="p-0.5 rounded text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
+              title="Files"
+              aria-label={`Browse files for workspace ${workspace.name}`}
+            >
+              <FolderOpenIcon />
+            </button>
+          )}
           {/* Reset — disabled when offline */}
           <button
             onClick={(e) => {
@@ -357,6 +376,25 @@ function ChevronDownIcon() {
       aria-hidden
     >
       <path d="M6 9l6 6 6-6" />
+    </svg>
+  );
+}
+
+function FolderOpenIcon() {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+      <polyline points="2 10 22 10" />
     </svg>
   );
 }

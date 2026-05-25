@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "8";
+pub const PROTOCOL_VERSION: &str = "10";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
@@ -171,6 +171,59 @@ pub enum ClientMsg {
         kind: String,
         content: String,
     },
+
+    /// Reply to a `FsList` request — one shot per request_id.
+    /// New in v1.15 (protocol v9). `error` is set when the workspace
+    /// dir doesn't exist, the path escapes the workspace root, etc.
+    /// `entries` is populated for ANY successful list, even if empty.
+    FsListResult {
+        request_id: Uuid,
+        #[serde(default)]
+        entries: Vec<FsEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    /// One chunk of a streaming download started by `FsRead`. The agent
+    /// emits these in order, each carrying up to ~64 KB of file
+    /// contents base64-encoded. `eof = true` marks the final chunk
+    /// (`data_b64` may still hold the tail). On any read failure the
+    /// agent emits a single chunk with `error` set and `eof = true`
+    /// to terminate the stream; the hub then short-reads its HTTP
+    /// response.
+    FsReadChunk {
+        request_id: Uuid,
+        #[serde(default)]
+        data_b64: String,
+        #[serde(default)]
+        eof: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+}
+
+/// One entry returned in a `FsListResult`. Directory entries have
+/// `size = 0`; symlinks report the link's own size (which is
+/// usually meaningless, but the UI can show them distinctly via
+/// `kind`).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct FsEntry {
+    pub name: String,
+    pub kind: FsKind,
+    pub size: u64,
+    /// Last-modified wall-clock in milliseconds since the Unix epoch.
+    pub mtime_ms: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FsKind {
+    File,
+    Dir,
+    Symlink,
+    /// Anything else we don't recognise (device files, FIFOs, …).
+    /// Listed for completeness but the UI usually hides these.
+    Other,
 }
 
 /// One row in a WorkspaceListResult. `tmux_alive` lets the picker
@@ -319,6 +372,46 @@ pub enum ServerMsg {
         download_url: String,
         /// `.sha256` manifest URL covering the same asset.
         sha256_url: String,
+    },
+
+    /// List a workspace directory. `path` is relative to the workspace
+    /// root (leading `/` allowed but ignored). `show_hidden` controls
+    /// whether dotfiles appear in the result. New in v1.15 (proto v9).
+    FsList {
+        request_id: Uuid,
+        account: String,
+        workspace: String,
+        #[serde(default)]
+        path: String,
+        #[serde(default)]
+        show_hidden: bool,
+    },
+    /// Stream a workspace file back to the hub as a series of
+    /// `FsReadChunk` frames. `path` is relative to the workspace root.
+    /// New in v1.15 (proto v9).
+    FsRead {
+        request_id: Uuid,
+        account: String,
+        workspace: String,
+        path: String,
+    },
+
+    /// Bundle one or more workspace paths (files and/or directories,
+    /// any mix) into a single in-memory zip and stream it back as a
+    /// series of `FsReadChunk` frames — same wire shape as `FsRead`
+    /// so the hub's existing fs_read_streams routing handles it
+    /// without changes. Paths are relative to the workspace root and
+    /// keep that relative layout inside the zip (`src/` → `src/...`,
+    /// `[a.txt, b/c.txt]` → `a.txt` + `b/c.txt`). Directories are
+    /// walked recursively; symlinks are NOT followed (the link entry
+    /// is stored as a regular file containing the link target, so we
+    /// never escape the workspace via symlink chasing).
+    /// New in v1.16 (proto v10).
+    FsArchive {
+        request_id: Uuid,
+        account: String,
+        workspace: String,
+        paths: Vec<String>,
     },
 }
 

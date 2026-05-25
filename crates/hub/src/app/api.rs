@@ -13,19 +13,27 @@
 
 use super::{AuthedAccount, USER_SESSION_COOKIE};
 use crate::auth;
+use crate::tunnel::{ClientMsg, ServerMsg};
 use crate::AppState;
 use axum::{
-    extract::{Extension, State},
+    body::Body,
+    extract::{Extension, Query, State},
     http::{
-        header::SET_COOKIE,
+        header::{CONTENT_DISPOSITION, CONTENT_TYPE, SET_COOKIE},
         HeaderMap, StatusCode,
     },
     response::{IntoResponse, Response},
     Json,
 };
+use base64::Engine;
+use bytes::Bytes;
+use futures::stream::StreamExt;
 use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot};
+use uuid::Uuid;
 
 /// 12-hour TTL, matching the admin session. Webterm sessions are
 /// interactive — long enough to survive a workday, short enough that
@@ -181,4 +189,620 @@ pub async fn put_preferences(
         return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", "db error");
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+// ---------------------------------------------------------------------------
+// File-manager endpoints (v1.15 / protocol v9)
+//
+// Both /api/files/list and /api/files/download cookie-auth via the
+// same `require_user` middleware as /api/me, then enforce two
+// account-scoped checks before fanning out to the agent:
+//   1. is_agent_allowed(account, agent): the account has been
+//      whitelisted on this agent at all.
+//   2. get_workspace_agent(account, agent, workspace): the workspace
+//      exists for this (account, agent) pair.
+// Without (2) a user with broad agent access could enumerate other
+// users' workspaces by guessing names. Don't relax either check
+// without re-reading this comment.
+// ---------------------------------------------------------------------------
+
+/// Wait at most this long for an `FsListResult` on the workspace
+/// one-shot. Aligned with the existing workspace_request_timeout
+/// constants used elsewhere; longer than the agent's typical 1-2s
+/// fs walk, short enough to fail fast on a hung agent.
+const FS_LIST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Idle timeout between consecutive `FsReadChunk` frames during a
+/// download. Generous compared to the agent's ~5s ping interval, so
+/// a healthy connection won't hit it; if it fires, the agent is
+/// stuck and we'd rather short-read the response than hang on the
+/// client forever.
+const FS_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// mpsc capacity for the FsRead stream. Tunable — too small wastes
+/// awakenings, too big lets the agent buffer a lot of memory if the
+/// HTTP consumer is slow. 16 chunks * ~64 KiB ≈ 1 MiB max in-flight.
+const FS_READ_CHANNEL_CAP: usize = 16;
+
+#[derive(Deserialize)]
+pub struct FsListQuery {
+    pub agent: String,
+    pub workspace: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub show_hidden: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct FsDownloadQuery {
+    pub agent: String,
+    pub workspace: String,
+    pub path: String,
+}
+
+#[derive(Deserialize)]
+pub struct FsArchiveQuery {
+    pub agent: String,
+    pub workspace: String,
+    /// Comma-separated workspace-relative paths (files and/or dirs).
+    pub paths: String,
+}
+
+/// Parse the truthy variants we accept for `show_hidden`. "1" /
+/// "true" / "yes" all opt in; anything else (including absent) means
+/// off. Lower-case'd before comparing so the query string can be
+/// any-case.
+fn truthy(s: &str) -> bool {
+    matches!(s.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+}
+
+/// Authorize an (account, agent, workspace) tuple. Returns `Ok(())`
+/// on pass, or a ready-to-return error `Response` describing exactly
+/// what failed. Centralised so list + download stay in lockstep.
+async fn authorize_workspace(
+    state: &Arc<AppState>,
+    account: &str,
+    agent: &str,
+    workspace: &str,
+) -> Result<(), Response> {
+    match state.db.is_agent_allowed(account, agent).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return Err(err(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "account is not allowed on this agent",
+            ));
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "is_agent_allowed failed");
+            return Err(err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", "db error"));
+        }
+    }
+    match state.db.get_workspace_agent(account, agent, workspace).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(err(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "workspace not found for this account/agent",
+        )),
+        Err(e) => {
+            tracing::warn!(error = %e, "get_workspace_agent failed");
+            Err(err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", "db error"))
+        }
+    }
+}
+
+/// `GET /api/files/list?agent=A&workspace=W&path=src/&show_hidden=1`
+///
+/// Lists one directory inside (account, agent, workspace). Returns a
+/// 200 with `{ entries, error }` even when the agent surfaces an
+/// error string (e.g. "path escapes workspace") so the SPA can
+/// display it inline; non-200 status codes are reserved for auth /
+/// transport / availability failures.
+pub async fn files_list(
+    State(state): State<Arc<AppState>>,
+    Extension(account): Extension<AuthedAccount>,
+    Query(q): Query<FsListQuery>,
+) -> Response {
+    let account = account.0;
+    if let Err(resp) = authorize_workspace(&state, &account, &q.agent, &q.workspace).await {
+        return resp;
+    }
+    let Some(conn) = state.registry.get(&q.agent) else {
+        return err(StatusCode::NOT_FOUND, "agent_offline", "agent is not connected");
+    };
+
+    let request_id = Uuid::new_v4();
+    let (tx, rx) = oneshot::channel();
+    conn.register_workspace_request(request_id, tx);
+
+    let path = q.path.unwrap_or_default();
+    let show_hidden = q.show_hidden.as_deref().map(truthy).unwrap_or(false);
+    if conn
+        .send(ServerMsg::FsList {
+            request_id,
+            account: account.clone(),
+            workspace: q.workspace.clone(),
+            path,
+            show_hidden,
+        })
+        .await
+        .is_err()
+    {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent_offline",
+            "agent disconnected before request was sent",
+        );
+    }
+
+    match tokio::time::timeout(FS_LIST_TIMEOUT, rx).await {
+        Ok(Ok(ClientMsg::FsListResult { entries, error, .. })) => (
+            StatusCode::OK,
+            Json(json!({ "entries": entries, "error": error })),
+        )
+            .into_response(),
+        Ok(Ok(_)) => err(
+            StatusCode::BAD_GATEWAY,
+            "unexpected_reply",
+            "agent returned an unexpected frame",
+        ),
+        Ok(Err(_)) => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent_offline",
+            "agent disconnected before reply",
+        ),
+        Err(_) => err(
+            StatusCode::BAD_GATEWAY,
+            "agent_timeout",
+            "agent did not reply in time",
+        ),
+    }
+}
+
+/// Build a safe `Content-Disposition` header value for a download.
+/// Uses the RFC 6266 / RFC 5987 syntax with a `filename*=UTF-8''…`
+/// parameter so non-ASCII names ("中文文件.txt") survive intact; the
+/// plain `filename=` parameter falls back to a sanitised ASCII form
+/// for legacy clients. Control chars / quotes / CR-LF that would
+/// break the header are stripped from both.
+fn content_disposition_for(path: &str) -> String {
+    let basename = path
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("download");
+
+    // Strip header-breaking bytes from the literal-ASCII fallback.
+    // Quote, semicolon and backslash terminate / escape the filename
+    // parameter in RFC 6266; CR/LF inject header smuggling; control
+    // chars are forbidden in header values outright.
+    let safe_ascii: String = basename
+        .chars()
+        .filter(|c| {
+            !c.is_control()
+                && *c != '"'
+                && *c != '\\'
+                && *c != ';'
+                && *c != '\r'
+                && *c != '\n'
+                // Non-ASCII would also be unsafe inside the literal
+                // `filename=`; the RFC 5987 form handles them
+                // instead.
+                && c.is_ascii()
+        })
+        .collect();
+    let safe_ascii = if safe_ascii.is_empty() {
+        "download".to_string()
+    } else {
+        safe_ascii
+    };
+
+    // RFC 5987 percent-encodes everything outside the small attr-char
+    // set. Strip control chars *before* encoding so they can't slip
+    // through as %XX in the header.
+    let cleaned: String = basename
+        .chars()
+        .filter(|c| !c.is_control() && *c != '\r' && *c != '\n')
+        .collect();
+    let encoded = percent_encode_rfc5987(&cleaned);
+
+    format!(
+        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        safe_ascii, encoded
+    )
+}
+
+/// RFC 5987 percent-encoding for `value-chars`. Encodes anything
+/// that isn't an attr-char (`A-Z a-z 0-9 ! # $ & + - . ^ _ ` | ~`).
+fn percent_encode_rfc5987(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for b in input.as_bytes() {
+        let c = *b;
+        let is_attr_char = c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                b'!' | b'#' | b'$' | b'&' | b'+' | b'-' | b'.'
+                    | b'^' | b'_' | b'`' | b'|' | b'~'
+            );
+        if is_attr_char {
+            out.push(c as char);
+        } else {
+            out.push_str(&format!("%{:02X}", c));
+        }
+    }
+    out
+}
+
+/// `GET /api/files/download?agent=A&workspace=W&path=src/main.rs`
+///
+/// Streams a workspace file back to the browser as
+/// `application/octet-stream`. Backpressure is end-to-end: the agent
+/// awaits on its WS send when this handler's mpsc fills, so a slow
+/// HTTP consumer doesn't blow up agent memory.
+///
+/// Failure semantics:
+///   - Auth / availability: non-2xx JSON envelope.
+///   - Agent error mid-stream: response body is short — there's no
+///     way to retroactively change the HTTP status once headers
+///     have been sent. Clients should sha256 / size-check the result
+///     against `/api/files/list` if integrity matters.
+pub async fn files_download(
+    State(state): State<Arc<AppState>>,
+    Extension(account): Extension<AuthedAccount>,
+    Query(q): Query<FsDownloadQuery>,
+) -> Response {
+    let account = account.0;
+    if let Err(resp) = authorize_workspace(&state, &account, &q.agent, &q.workspace).await {
+        return resp;
+    }
+    let Some(conn) = state.registry.get(&q.agent) else {
+        return err(StatusCode::NOT_FOUND, "agent_offline", "agent is not connected");
+    };
+
+    let request_id = Uuid::new_v4();
+    let (tx, rx) = mpsc::channel::<ClientMsg>(FS_READ_CHANNEL_CAP);
+    conn.register_fs_read_stream(request_id, tx);
+
+    if conn
+        .send(ServerMsg::FsRead {
+            request_id,
+            account: account.clone(),
+            workspace: q.workspace.clone(),
+            path: q.path.clone(),
+        })
+        .await
+        .is_err()
+    {
+        conn.unregister_fs_read_stream(request_id);
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent_offline",
+            "agent disconnected before request was sent",
+        );
+    }
+
+    // Build the body stream. We carry the conn handle + request_id
+    // into the stream so the mpsc entry is cleaned up when the
+    // stream terminates (EOF, error, drop). Without this, an HTTP
+    // client that hangs up mid-download would leak the entry until
+    // the agent next sent a terminal frame.
+    let body_stream = futures::stream::unfold(
+        (rx, false),
+        move |(mut rx, done)| async move {
+            if done {
+                return None;
+            }
+            match tokio::time::timeout(FS_READ_IDLE_TIMEOUT, rx.recv()).await {
+                Ok(Some(ClientMsg::FsReadChunk {
+                    data_b64,
+                    eof,
+                    error,
+                    ..
+                })) => {
+                    if let Some(msg) = error {
+                        tracing::warn!(error = %msg, "fs read agent error; short-reading");
+                        return None;
+                    }
+                    // Decode this chunk. Empty data_b64 + eof = true
+                    // is a valid "no tail bytes" terminator.
+                    let decoded = if data_b64.is_empty() {
+                        Bytes::new()
+                    } else {
+                        match base64::engine::general_purpose::STANDARD.decode(&data_b64) {
+                            Ok(bytes) => Bytes::from(bytes),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "agent sent invalid base64; short-reading");
+                                return None;
+                            }
+                        }
+                    };
+                    let next_done = eof;
+                    if decoded.is_empty() && next_done {
+                        // Don't bother yielding an empty final chunk —
+                        // the stream end alone tells axum to flush.
+                        return None;
+                    }
+                    Some((
+                        Ok::<Bytes, std::io::Error>(decoded),
+                        (rx, next_done),
+                    ))
+                }
+                Ok(Some(_)) => {
+                    tracing::warn!("unexpected frame on fs read stream");
+                    None
+                }
+                Ok(None) => None,
+                Err(_) => {
+                    tracing::warn!("fs read idle timeout; short-reading");
+                    None
+                }
+            }
+        },
+    );
+    // After the stream ends (for any reason), drop the routing
+    // entry. Chain a no-op final step that runs cleanup as a side
+    // effect of polling the stream to completion.
+    let conn_for_cleanup = conn.clone();
+    let cleanup = futures::stream::once(async move {
+        conn_for_cleanup.unregister_fs_read_stream(request_id);
+        // Yield no bytes — this entry exists purely for the side
+        // effect of running the cleanup closure on stream poll.
+        Ok::<Bytes, std::io::Error>(Bytes::new())
+    });
+    let body_stream = body_stream.chain(cleanup);
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, "application/octet-stream".parse().unwrap());
+    let disposition = content_disposition_for(&q.path);
+    match disposition.parse() {
+        Ok(v) => {
+            headers.insert(CONTENT_DISPOSITION, v);
+        }
+        Err(e) => {
+            // Should be impossible given the sanitiser, but if it
+            // happens we'd rather drop the disposition than crash.
+            tracing::warn!(error = %e, "could not encode Content-Disposition; falling back");
+        }
+    }
+
+    (StatusCode::OK, headers, Body::from_stream(body_stream)).into_response()
+}
+
+/// `GET /api/files/archive?agent=A&workspace=W&paths=src,Cargo.toml`
+///
+/// Bundles one or more workspace paths (files and/or directories) into a
+/// zip archive and streams it back to the browser. The agent produces
+/// `FsReadChunk` frames identical to a single-file download, so the
+/// hub's existing `fs_read_streams` routing handles both without changes.
+///
+/// Failure semantics match `files_download` — once the 200 headers are
+/// sent, a mid-stream agent error simply truncates the body.
+pub async fn files_archive(
+    State(state): State<Arc<AppState>>,
+    Extension(account): Extension<AuthedAccount>,
+    Query(q): Query<FsArchiveQuery>,
+) -> Response {
+    let account = account.0;
+    if let Err(resp) = authorize_workspace(&state, &account, &q.agent, &q.workspace).await {
+        return resp;
+    }
+
+    let paths: Vec<String> = q
+        .paths
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if paths.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "at least one path is required",
+        );
+    }
+
+    let Some(conn) = state.registry.get(&q.agent) else {
+        return err(StatusCode::NOT_FOUND, "agent_offline", "agent is not connected");
+    };
+
+    let request_id = Uuid::new_v4();
+    let (tx, rx) = mpsc::channel::<ClientMsg>(FS_READ_CHANNEL_CAP);
+    conn.register_fs_read_stream(request_id, tx);
+
+    if conn
+        .send(ServerMsg::FsArchive {
+            request_id,
+            account: account.clone(),
+            workspace: q.workspace.clone(),
+            paths: paths.clone(),
+        })
+        .await
+        .is_err()
+    {
+        conn.unregister_fs_read_stream(request_id);
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent_offline",
+            "agent disconnected before request was sent",
+        );
+    }
+
+    // Body stream — identical to files_download; FsReadChunk frames
+    // carry the zip bytes instead of raw file bytes.
+    let body_stream = futures::stream::unfold(
+        (rx, false),
+        move |(mut rx, done)| async move {
+            if done {
+                return None;
+            }
+            match tokio::time::timeout(FS_READ_IDLE_TIMEOUT, rx.recv()).await {
+                Ok(Some(ClientMsg::FsReadChunk {
+                    data_b64,
+                    eof,
+                    error,
+                    ..
+                })) => {
+                    if let Some(msg) = error {
+                        tracing::warn!(error = %msg, "fs archive agent error; short-reading");
+                        return None;
+                    }
+                    let decoded = if data_b64.is_empty() {
+                        Bytes::new()
+                    } else {
+                        match base64::engine::general_purpose::STANDARD.decode(&data_b64) {
+                            Ok(bytes) => Bytes::from(bytes),
+                            Err(e) => {
+                                tracing::warn!(error = %e, "agent sent invalid base64; short-reading");
+                                return None;
+                            }
+                        }
+                    };
+                    let next_done = eof;
+                    if decoded.is_empty() && next_done {
+                        return None;
+                    }
+                    Some((
+                        Ok::<Bytes, std::io::Error>(decoded),
+                        (rx, next_done),
+                    ))
+                }
+                Ok(Some(_)) => {
+                    tracing::warn!("unexpected frame on fs archive stream");
+                    None
+                }
+                Ok(None) => None,
+                Err(_) => {
+                    tracing::warn!("fs archive idle timeout; short-reading");
+                    None
+                }
+            }
+        },
+    );
+    let conn_for_cleanup = conn.clone();
+    let cleanup = futures::stream::once(async move {
+        conn_for_cleanup.unregister_fs_read_stream(request_id);
+        Ok::<Bytes, std::io::Error>(Bytes::new())
+    });
+    let body_stream = body_stream.chain(cleanup);
+
+    // Derive the zip filename from the requested paths.
+    let zip_filename = if paths.len() == 1 {
+        let basename = paths[0]
+            .rsplit(|c| c == '/' || c == '\\')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("archive");
+        format!("{}.zip", basename)
+    } else {
+        "archive.zip".to_string()
+    };
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, "application/zip".parse().unwrap());
+    let disposition = content_disposition_for(&zip_filename);
+    match disposition.parse() {
+        Ok(v) => {
+            headers.insert(CONTENT_DISPOSITION, v);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not encode Content-Disposition; falling back");
+        }
+    }
+
+    (StatusCode::OK, headers, Body::from_stream(body_stream)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_disposition_plain_ascii() {
+        let v = content_disposition_for("src/main.rs");
+        assert!(
+            v.contains("filename=\"main.rs\""),
+            "ASCII fallback should be the bare basename: {v}"
+        );
+        assert!(
+            v.contains("filename*=UTF-8''main.rs"),
+            "RFC 5987 form should also carry the bare name: {v}"
+        );
+    }
+
+    #[test]
+    fn content_disposition_utf8() {
+        let v = content_disposition_for("中文文件.txt");
+        // RFC 5987-encoded form must use percent-encoding for UTF-8
+        // bytes; the literal CJK chars must not appear inside the
+        // ASCII `filename=` parameter.
+        assert!(v.contains("filename*=UTF-8''"), "missing RFC 5987 form: {v}");
+        assert!(
+            v.contains("%E4%B8%AD%E6%96%87%E6%96%87%E4%BB%B6.txt"),
+            "percent-encoding wrong for CJK basename: {v}"
+        );
+        // ASCII fallback should be a non-empty placeholder, not the
+        // raw CJK (which would break parsers that only honor the
+        // literal `filename=`).
+        let ascii_part = v
+            .split(';')
+            .map(str::trim)
+            .find(|p| p.starts_with("filename=\""))
+            .expect("ASCII filename= param present");
+        assert!(
+            !ascii_part.contains('中'),
+            "ASCII fallback leaked non-ASCII chars: {ascii_part}"
+        );
+    }
+
+    #[test]
+    fn content_disposition_strips_control_chars() {
+        // CR / LF / NUL / quotes / semicolons all need to vanish so
+        // an attacker controlling the path can't inject header
+        // continuations or terminate the filename parameter early.
+        let v = content_disposition_for("evil\r\n\"; X-Injected: 1.txt");
+        for needle in ["\r", "\n", "\"; X-Injected", "\0"] {
+            assert!(
+                !v.contains(needle),
+                "Content-Disposition leaked dangerous char {:?}: {v}",
+                needle
+            );
+        }
+        // Should also still be a valid HeaderValue (parseable).
+        let parsed: Result<axum::http::HeaderValue, _> = v.parse();
+        assert!(parsed.is_ok(), "result didn't parse as HeaderValue: {v}");
+    }
+
+    #[test]
+    fn content_disposition_basename_only() {
+        let v = content_disposition_for("a/b/c/deep/file.bin");
+        assert!(
+            v.contains("filename=\"file.bin\""),
+            "basename extraction failed: {v}"
+        );
+        assert!(!v.contains("a/b/c"), "ancestors leaked: {v}");
+    }
+
+    #[test]
+    fn content_disposition_empty_basename_falls_back() {
+        // Trailing slash → no basename → "download" placeholder.
+        let v = content_disposition_for("foo/");
+        assert!(
+            v.contains("filename=\"download\""),
+            "fallback missing: {v}"
+        );
+    }
+
+    #[test]
+    fn truthy_accepts_common_forms() {
+        assert!(truthy("1"));
+        assert!(truthy("true"));
+        assert!(truthy("TRUE"));
+        assert!(truthy("yes"));
+        assert!(!truthy("0"));
+        assert!(!truthy("false"));
+        assert!(!truthy(""));
+    }
 }

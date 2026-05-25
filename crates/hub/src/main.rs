@@ -205,6 +205,18 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
                 .put(app::api::put_preferences)
                 .route_layer(user_gate.clone()),
         )
+        .route(
+            "/api/files/list",
+            get(app::api::files_list).route_layer(user_gate.clone()),
+        )
+        .route(
+            "/api/files/download",
+            get(app::api::files_download).route_layer(user_gate.clone()),
+        )
+        .route(
+            "/api/files/archive",
+            get(app::api::files_archive).route_layer(user_gate.clone()),
+        )
         .route("/", get(app::assets::serve_index))
         .route("/assets/*path", get(app::assets::serve_asset))
         .route("/*spa", get(app::assets::serve_spa));

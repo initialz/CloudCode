@@ -40,6 +40,7 @@ import { DEFAULT_TOOL, KNOWN_TOOLS } from '@/lib/tools';
 import Sidebar from '@/components/Sidebar';
 import TabBar from '@/components/TabBar';
 import SettingsDialog from '@/components/SettingsDialog';
+import FilesModal from '@/components/FilesModal';
 
 // ── xterm theme helpers ──────────────────────────────────────────────────────
 
@@ -125,6 +126,9 @@ export default function Workbench() {
 
   // Settings dialog
   const [showSettings, setShowSettings] = useState(false);
+
+  // File manager modal
+  const [filesModal, setFilesModal] = useState<{ agent: string; workspace: string } | null>(null);
 
   // Per-user preferences (default args per tool, future things). Loaded
   // from the hub on mount; kept in a ref so non-reactive callbacks
@@ -1052,6 +1056,7 @@ export default function Workbench() {
         onCreateWorkspace={handleCreateWorkspace}
         onResetWorkspace={handleResetWorkspace}
         onDeleteWorkspace={handleDeleteWorkspace}
+        onOpenFiles={(a, w) => setFilesModal({ agent: a, workspace: w })}
         onSettings={() => setShowSettings(true)}
         onLogout={handleLogout}
       />
@@ -1129,6 +1134,15 @@ export default function Workbench() {
           onThemeChange={handleThemeChange}
           preferences={preferences}
           onSavePreferences={savePreferences}
+        />
+      )}
+
+      {/* File manager modal */}
+      {filesModal && (
+        <FilesModal
+          agent={filesModal.agent}
+          workspace={filesModal.workspace}
+          onClose={() => setFilesModal(null)}
         />
       )}
 
