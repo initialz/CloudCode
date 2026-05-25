@@ -5,12 +5,23 @@ use crate::proto::{ClientToHub, HubToClient, PTY_PROTOCOL_VERSION};
 use anyhow::{anyhow, Context, Result};
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 const OUT_QUEUE: usize = 256;
 const IN_TEXT_QUEUE: usize = 64;
 const IN_BIN_QUEUE: usize = 1024;
+/// Maximum gap between frames from the hub before we declare the WS
+/// dead and let the channels close. The hub pings every 25s on user
+/// WSes (see `crates/hub/src/pty_session.rs::USER_PING_INTERVAL`); 45s
+/// gives a 2× jitter margin without making the silent-drop UX
+/// noticeably sluggish. Without this the OS-level TCP keepalive
+/// (default ~2h on macOS) is the only signal, so a network blip or
+/// hub restart freezes the relay invisibly — input goes nowhere, no
+/// banner appears, the user only notices because typing has stopped
+/// echoing through claude's UI.
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub enum OutFrame {
     Text(ClientToHub),
@@ -59,7 +70,21 @@ pub async fn connect(hub_url: &str, token: &str) -> Result<Wire> {
     });
 
     tokio::spawn(async move {
-        while let Some(item) = stream.next().await {
+        loop {
+            let next = match tokio::time::timeout(READ_IDLE_TIMEOUT, stream.next()).await {
+                Ok(opt) => opt,
+                Err(_) => {
+                    // No frame from hub for READ_IDLE_TIMEOUT — TCP is
+                    // wedged silently. Drop the channels to trigger the
+                    // relay's HubLost path so the reconnect banner can
+                    // come up. The writer task's next send (or the
+                    // outer reconnect's wire::connect) will also see
+                    // the dead socket.
+                    tracing::debug!("hub silent for {:?}; declaring wire dead", READ_IDLE_TIMEOUT);
+                    break;
+                }
+            };
+            let Some(item) = next else { break };
             match item {
                 Ok(Message::Text(s)) => match serde_json::from_str::<HubToClient>(&s) {
                     Ok(frame) => {

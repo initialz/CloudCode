@@ -13,7 +13,24 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::io::Write;
 use tokio::sync::mpsc;
 
-pub async fn run(wire: &mut Wire, bytes: &mut ByteRx) -> Result<()> {
+/// What ended the relay loop.
+#[derive(Debug)]
+pub enum RelayOutcome {
+    /// Hub closed the session cleanly (`SessionClosed` frame, or `Close`
+    /// from the local side). Caller should leave alt-screen + return to
+    /// the menu.
+    Closed,
+    /// One of the wire channels went `None` — the underlying WS is dead.
+    /// Caller is expected to attempt reconnect; terminal state is left
+    /// untouched (still in alt-screen + raw mode) so a status banner can
+    /// paint on top.
+    HubLost,
+}
+
+/// Enter alt-screen + raw mode. Idempotent against an already-set
+/// terminal in the sense that running it twice is harmless (the second
+/// `?1049h` is a no-op when we're already on alt-screen).
+pub fn enter_session_mode() -> Result<()> {
     enable_raw_mode()?;
     // Wipe the main screen + scrollback FIRST, then enter alt-screen
     // and clear it. Background: claude (v2.x) dumps its chat UI to
@@ -34,21 +51,31 @@ pub async fn run(wire: &mut Wire, bytes: &mut ByteRx) -> Result<()> {
     //   ?1049h  — switch to alt-screen, save cursor, clear it
     //   [H      — cursor home in alt-screen
     //   [2J     — defensive re-clear in case ?1049h didn't
-    {
-        let mut stdout = std::io::stdout();
-        let _ = stdout.write_all(b"\x1b[H\x1b[2J\x1b[3J\x1b[?1049h\x1b[H\x1b[2J");
-        let _ = stdout.flush();
-    }
-    let result = relay_loop(wire, bytes).await;
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(b"\x1b[H\x1b[2J\x1b[3J\x1b[?1049h\x1b[H\x1b[2J");
+    let _ = stdout.flush();
+    Ok(())
+}
+
+/// Leave alt-screen + raw mode. Always called by the caller once the
+/// reconnect loop gives up or the session ends cleanly.
+pub fn leave_session_mode() {
     disable_raw_mode().ok();
     let mut stdout = std::io::stdout();
     // Best-effort reset of alt-screen / cursor / mouse modes.
     let _ = stdout.write_all(b"\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1006l\r\n");
     let _ = stdout.flush();
-    result
 }
 
-async fn relay_loop(wire: &mut Wire, bytes: &mut ByteRx) -> Result<()> {
+/// Run the raw PTY relay once. Caller must have already set up the
+/// terminal via `enter_session_mode()`. Returns `RelayOutcome::Closed`
+/// for clean exits and `RelayOutcome::HubLost` when the WS dies — that
+/// distinction lets the outer loop decide whether to reconnect.
+pub async fn run(wire: &mut Wire, bytes: &mut ByteRx) -> Result<RelayOutcome> {
+    relay_loop(wire, bytes).await
+}
+
+async fn relay_loop(wire: &mut Wire, bytes: &mut ByteRx) -> Result<RelayOutcome> {
     if let Some((cols, rows)) = current_terminal_size() {
         let _ = wire
             .out_tx
@@ -60,24 +87,27 @@ async fn relay_loop(wire: &mut Wire, bytes: &mut ByteRx) -> Result<()> {
     loop {
         tokio::select! {
             chunk = bytes.recv() => {
-                let Some(chunk) = chunk else { return Ok(()); };
+                // ByteRx (stdin reader) ending is "user closed stdin",
+                // not a hub failure — close cleanly so the outer loop
+                // returns to the menu instead of reconnecting forever.
+                let Some(chunk) = chunk else { return Ok(RelayOutcome::Closed); };
                 if wire.out_tx.send(OutFrame::Binary(chunk)).await.is_err() {
-                    return Ok(());
+                    return Ok(RelayOutcome::HubLost);
                 }
             }
             bin = wire.in_bin_rx.recv() => {
-                let Some(bytes) = bin else { return Ok(()); };
+                let Some(bytes) = bin else { return Ok(RelayOutcome::HubLost); };
                 let mut stdout = std::io::stdout();
-                if stdout.write_all(&bytes).is_err() { return Ok(()); }
-                if stdout.flush().is_err() { return Ok(()); }
+                if stdout.write_all(&bytes).is_err() { return Ok(RelayOutcome::Closed); }
+                if stdout.flush().is_err() { return Ok(RelayOutcome::Closed); }
             }
             text = wire.in_text_rx.recv() => {
-                let Some(frame) = text else { return Ok(()); };
+                let Some(frame) = text else { return Ok(RelayOutcome::HubLost); };
                 match frame {
                     HubToClient::Ping => {
                         let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
                     }
-                    HubToClient::SessionClosed { .. } => return Ok(()),
+                    HubToClient::SessionClosed { .. } => return Ok(RelayOutcome::Closed),
                     HubToClient::SessionError { message } => {
                         tracing::warn!(%message, "session error during relay");
                     }
