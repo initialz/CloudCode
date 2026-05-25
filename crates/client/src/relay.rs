@@ -6,6 +6,7 @@
 //! the remote PTY exactly as the terminal produced it.
 
 use crate::input::ByteRx;
+use crate::mouse_filter::MouseModeStripper;
 use crate::proto::{ClientToHub, HubToClient};
 use crate::wire::{OutFrame, Wire};
 use anyhow::Result;
@@ -32,27 +33,44 @@ pub enum RelayOutcome {
 /// `?1049h` is a no-op when we're already on alt-screen).
 pub fn enter_session_mode() -> Result<()> {
     enable_raw_mode()?;
-    // Wipe the main screen + scrollback FIRST, then enter alt-screen
-    // and clear it. Background: claude (v2.x) dumps its chat UI to
-    // main-screen scrollback when it exits, so by the time a new
-    // cloudcode invocation enters alt-screen the previous session's
-    // chat is sitting just above in the local terminal's scrollback.
-    // iTerm2's default config keeps that scrollback visible behind
-    // alt-screen, so the user perceives the old chat "stacked on top
-    // of" the new one. Clearing main + scrollback before entering
-    // alt-screen is the only escape-only way to make the duplicate
-    // go away — the cost is the few lines of shell history above
-    // where the user typed `cloudcode`, which is an acceptable
-    // trade for a full-screen TUI client.
+    // (Approach A) Force every mouse-tracking mode OFF before we
+    // hand the terminal over to the remote PTY stream. Reason: an
+    // earlier cloudcode invocation (or a foreign TUI in the same
+    // iTerm2 tab) might have crashed mid-session and left mouse
+    // tracking enabled in the emulator's state. We then proceed to
+    // strip every `?1000h` etc that the remote claude sends — but if
+    // the emulator was already in mouse-tracking mode, our filter
+    // keeps it there forever. The explicit `l` reset gives us a
+    // clean baseline so subsequent strips actually "stick".
     //
-    //   [H      — cursor to top-left of main screen
-    //   [2J     — erase the visible main-screen viewport
-    //   [3J     — erase saved scrollback lines (xterm/iTerm/kitty)
-    //   ?1049h  — switch to alt-screen, save cursor, clear it
-    //   [H      — cursor home in alt-screen
-    //   [2J     — defensive re-clear in case ?1049h didn't
+    // Wipe the main screen + scrollback FIRST, then reset mouse,
+    // then enter alt-screen and clear it. Background: claude (v2.x)
+    // dumps its chat UI to main-screen scrollback when it exits, so
+    // by the time a new cloudcode invocation enters alt-screen the
+    // previous session's chat is sitting just above in the local
+    // terminal's scrollback. iTerm2's default config keeps that
+    // scrollback visible behind alt-screen, so the user perceives
+    // the old chat "stacked on top of" the new one. Clearing main
+    // + scrollback before entering alt-screen is the only escape-
+    // only way to make the duplicate go away — the cost is the few
+    // lines of shell history above where the user typed
+    // `cloudcode`, which is an acceptable trade for a full-screen
+    // TUI client.
+    //
+    //   [H        — cursor to top-left of main screen
+    //   [2J       — erase the visible main-screen viewport
+    //   [3J       — erase saved scrollback lines (xterm/iTerm/kitty)
+    //   ?1000-1016l — reset every X11/SGR mouse-tracking variant
+    //   ?1049h    — switch to alt-screen, save cursor, clear it
+    //   [H        — cursor home in alt-screen
+    //   [2J       — defensive re-clear in case ?1049h didn't
     let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(b"\x1b[H\x1b[2J\x1b[3J\x1b[?1049h\x1b[H\x1b[2J");
+    let _ = stdout.write_all(
+        b"\x1b[H\x1b[2J\x1b[3J\
+          \x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\
+          \x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\
+          \x1b[?1049h\x1b[H\x1b[2J",
+    );
     let _ = stdout.flush();
     Ok(())
 }
@@ -62,8 +80,14 @@ pub fn enter_session_mode() -> Result<()> {
 pub fn leave_session_mode() {
     disable_raw_mode().ok();
     let mut stdout = std::io::stdout();
-    // Best-effort reset of alt-screen / cursor / mouse modes.
-    let _ = stdout.write_all(b"\x1b[?1049l\x1b[?25h\x1b[?1000l\x1b[?1006l\r\n");
+    // Best-effort reset of alt-screen / cursor / every mouse-tracking
+    // variant so the next program in this iTerm2 tab inherits a
+    // clean state.
+    let _ = stdout.write_all(
+        b"\x1b[?1049l\x1b[?25h\
+          \x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\
+          \x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\r\n",
+    );
     let _ = stdout.flush();
 }
 
@@ -76,6 +100,12 @@ pub async fn run(wire: &mut Wire, bytes: &mut ByteRx) -> Result<RelayOutcome> {
 }
 
 async fn relay_loop(wire: &mut Wire, bytes: &mut ByteRx) -> Result<RelayOutcome> {
+    // Strip mouse-mode CSI escapes from the agent → terminal stream
+    // so the local emulator keeps doing its native drag-to-select /
+    // Cmd+C copy. See mouse_filter.rs for the trade-off (claude's
+    // mouse interactions go dark in exchange).
+    let mut mouse_filter = MouseModeStripper::new();
+
     if let Some((cols, rows)) = current_terminal_size() {
         let _ = wire
             .out_tx
@@ -97,8 +127,9 @@ async fn relay_loop(wire: &mut Wire, bytes: &mut ByteRx) -> Result<RelayOutcome>
             }
             bin = wire.in_bin_rx.recv() => {
                 let Some(bytes) = bin else { return Ok(RelayOutcome::HubLost); };
+                let filtered = mouse_filter.filter(&bytes);
                 let mut stdout = std::io::stdout();
-                if stdout.write_all(&bytes).is_err() { return Ok(RelayOutcome::Closed); }
+                if stdout.write_all(&filtered).is_err() { return Ok(RelayOutcome::Closed); }
                 if stdout.flush().is_err() { return Ok(RelayOutcome::Closed); }
             }
             text = wire.in_text_rx.recv() => {

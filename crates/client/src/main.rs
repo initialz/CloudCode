@@ -1,5 +1,6 @@
 mod input;
 mod menu;
+mod mouse_filter;
 mod proto;
 mod relay;
 mod wire;
