@@ -4,7 +4,7 @@ import { useState } from 'react';
 import type { Tab } from '@/lib/tabs';
 import { tabLabel } from '@/lib/tabs';
 import { KNOWN_TOOLS } from '@/lib/tools';
-import type { PaneLayout, SplitDirection } from '@/lib/wire';
+import type { SplitDirection } from '@/lib/wire';
 
 type Props = {
   tabs: Tab[];
@@ -12,20 +12,11 @@ type Props = {
   onSelect: (id: string) => void;
   onClose: (id: string) => void;
   onSplit: (tabId: string, tool: string, direction: SplitDirection) => void;
-  onChangeLayout: (tabId: string, layout: PaneLayout) => void;
 };
 
-// Each direction in the secondary flyout. Keeping these as data instead
-// of inline JSX keeps the row rendering symmetric and easy to extend.
 const SPLIT_DIRECTIONS: { value: SplitDirection; label: string; arrow: string }[] = [
   { value: 'right', label: 'Right', arrow: '→' },
   { value: 'down', label: 'Down', arrow: '↓' },
-];
-
-// Whole-session layout presets exposed via the Layout button.
-const LAYOUT_OPTIONS: { value: PaneLayout; label: string; arrow: string }[] = [
-  { value: 'side_by_side', label: 'Side by side', arrow: '↦' },
-  { value: 'stacked', label: 'Stacked', arrow: '↧' },
 ];
 
 export default function TabBar({
@@ -34,23 +25,15 @@ export default function TabBar({
   onSelect,
   onClose,
   onSplit,
-  onChangeLayout,
 }: Props) {
   const [splitDropdownTabId, setSplitDropdownTabId] = useState<string | null>(null);
   const [splitDropdownPos, setSplitDropdownPos] = useState<{ x: number; y: number } | null>(null);
-  // Which first-level tool item the mouse is currently parked on; drives
-  // the secondary direction submenu.
   const [hoveredTool, setHoveredTool] = useState<string | null>(null);
-  // Layout dropdown (separate from Split because it operates on the
-  // whole session, not on a tool selection).
-  const [layoutDropdownTabId, setLayoutDropdownTabId] = useState<string | null>(null);
-  const [layoutDropdownPos, setLayoutDropdownPos] = useState<{ x: number; y: number } | null>(null);
 
   if (tabs.length === 0) return null;
 
   function handleSplitClick(e: React.MouseEvent, tabId: string) {
     e.stopPropagation();
-    closeLayoutDropdown();
     if (splitDropdownTabId === tabId) {
       setSplitDropdownTabId(null);
       setSplitDropdownPos(null);
@@ -62,26 +45,10 @@ export default function TabBar({
     }
   }
 
-  function handleLayoutClick(e: React.MouseEvent, tabId: string) {
-    e.stopPropagation();
-    closeDropdown();
-    if (layoutDropdownTabId === tabId) {
-      closeLayoutDropdown();
-    } else {
-      setLayoutDropdownTabId(tabId);
-      setLayoutDropdownPos({ x: e.clientX, y: e.clientY });
-    }
-  }
-
   function closeDropdown() {
     setSplitDropdownTabId(null);
     setSplitDropdownPos(null);
     setHoveredTool(null);
-  }
-
-  function closeLayoutDropdown() {
-    setLayoutDropdownTabId(null);
-    setLayoutDropdownPos(null);
   }
 
   return (
@@ -143,37 +110,6 @@ export default function TabBar({
         </>
       )}
 
-      {/* Layout dropdown */}
-      {layoutDropdownTabId && layoutDropdownPos && (
-        <>
-          <div
-            className="fixed inset-0 z-40"
-            onClick={closeLayoutDropdown}
-            onContextMenu={(e) => { e.preventDefault(); closeLayoutDropdown(); }}
-          />
-          <div
-            className="fixed z-50 min-w-[9rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
-            style={{ left: layoutDropdownPos.x, top: layoutDropdownPos.y }}
-          >
-            {LAYOUT_OPTIONS.map(({ value, label, arrow }) => (
-              <button
-                key={value}
-                type="button"
-                onClick={() => {
-                  const tabId = layoutDropdownTabId;
-                  closeLayoutDropdown();
-                  onChangeLayout(tabId, value);
-                }}
-                className="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
-              >
-                <span className="w-3 inline-block text-zinc-500 dark:text-zinc-400">{arrow}</span>
-                <span>{label}</span>
-              </button>
-            ))}
-          </div>
-        </>
-      )}
-
       <div className="flex items-end shrink-0 overflow-x-auto bg-zinc-100 dark:bg-zinc-900 border-b border-zinc-200 dark:border-zinc-800">
         {tabs.map((tab) => {
           const isActive = tab.id === activeTabId;
@@ -201,31 +137,6 @@ export default function TabBar({
               <span className="truncate">{tabLabel(tab)}</span>
 
               {/* Split + Layout buttons — only on active tab, left of close */}
-              {isActive && (
-                <>
-                  <button
-                    className="shrink-0 rounded p-0.5 opacity-60 hover:opacity-100 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
-                    onClick={(e) => handleSplitClick(e, tab.id)}
-                    aria-label={`Split ${tabLabel(tab)}`}
-                    title="Split pane"
-                  >
-                    <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-                      <path d="M5 1v8M1 5h8" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-                    </svg>
-                  </button>
-                  <button
-                    className="shrink-0 rounded p-0.5 opacity-60 hover:opacity-100 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
-                    onClick={(e) => handleLayoutClick(e, tab.id)}
-                    aria-label={`Re-arrange panes in ${tabLabel(tab)}`}
-                    title="Re-arrange panes"
-                  >
-                    <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
-                      <rect x="1" y="1" width="3.5" height="8" stroke="currentColor" strokeWidth="1" />
-                      <rect x="5.5" y="1" width="3.5" height="8" stroke="currentColor" strokeWidth="1" />
-                    </svg>
-                  </button>
-                </>
-              )}
 
               {/* Close button — always visible on active, hover-visible on inactive */}
               <button

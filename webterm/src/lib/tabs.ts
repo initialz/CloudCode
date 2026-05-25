@@ -2,6 +2,7 @@
 
 import type { Terminal } from '@xterm/xterm';
 import type { FitAddon } from '@xterm/addon-fit';
+import type { SerializeAddon } from '@xterm/addon-serialize';
 import type { WireSocket } from './wire';
 
 export type TabStatus =
@@ -27,6 +28,7 @@ export type Tab = {
   ws: WireSocket;
   term: Terminal;
   fitAddon: FitAddon;
+  serializeAddon: SerializeAddon;
   /** Has term.open() been called for this tab yet? Mutated by the
    * container-attach ref callback so we don't re-attach on every
    * render and infinite-loop. */

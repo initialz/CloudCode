@@ -14,11 +14,11 @@ import { useNavigate } from 'react-router-dom';
 import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
-import { CanvasAddon } from '@xterm/addon-canvas';
-import { WebglAddon } from '@xterm/addon-webgl';
+import { SerializeAddon } from '@xterm/addon-serialize';
 import '@xterm/xterm/css/xterm.css';
 
 import { apiClient } from '@/lib/api';
+import { saveTermState, loadTermState, deleteTermState } from '@/lib/termHistory';
 import {
   WireSocket,
   type AgentItem,
@@ -45,11 +45,25 @@ import FilesModal from '@/components/FilesModal';
 // ── xterm theme helpers ──────────────────────────────────────────────────────
 
 function darkXterm() {
-  return { background: '#18181b', foreground: '#fafafa', cursor: '#fafafa' };
+  return {
+    background: '#18181b',
+    foreground: '#fafafa',
+    cursor: '#fafafa',
+    selectionBackground: '#3f638b',
+    selectionForeground: '#ffffff',
+    selectionInactiveBackground: '#3f638b80',
+  };
 }
 
 function lightXterm() {
-  return { background: '#ffffff', foreground: '#18181b', cursor: '#18181b' };
+  return {
+    background: '#ffffff',
+    foreground: '#18181b',
+    cursor: '#18181b',
+    selectionBackground: '#b3d7ff',
+    selectionForeground: '#000000',
+    selectionInactiveBackground: '#b3d7ff80',
+  };
 }
 
 function xtermTheme(dark: boolean) {
@@ -161,13 +175,6 @@ export default function Workbench() {
   // a re-render, or the inline ref creates an infinite loop.
   const containersRef = useRef<Map<string, HTMLDivElement>>(new Map());
 
-  // Per-tab "tmux is sitting in copy-mode with a live selection"
-  // flag, used by the Cmd+C bridge. Lives outside React state
-  // because the tabs reducer rebuilds tab objects on every UPDATE
-  // (e.g. status transitions), which would otherwise discard a
-  // mutation we just made on the old tab reference.
-  const copyModeRef = useRef<Map<string, boolean>>(new Map());
-
   // ── Auth check ─────────────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -181,6 +188,22 @@ export default function Workbench() {
         navigate('/login', { replace: true });
       });
   }, [navigate]);
+
+  // ── Save terminal state on page unload ────────────────────────────────────
+
+  useEffect(() => {
+    const onUnload = () => {
+      for (const tab of tabsRef.current) {
+        try {
+          const state = tab.serializeAddon.serialize({ scrollback: 50000 });
+          const key = tabKey(tab.agent, tab.workspace);
+          saveTermState(key, state);
+        } catch { /* ignore */ }
+      }
+    };
+    window.addEventListener('beforeunload', onUnload);
+    return () => window.removeEventListener('beforeunload', onUnload);
+  }, []);
 
   // ── Preferences load ─────────────────────────────────────────────────────
   // Fire-and-forget once we know the user is authed. Failures are
@@ -352,6 +375,53 @@ export default function Workbench() {
     });
   }
 
+  // ── Escape filter: strip alt-screen + mouse-tracking DEC private modes ──
+  // Same idea as the CLI's MouseModeStripper (v1.14.7), but also strips
+  // alt-screen modes so xterm.js stays in the main screen and its
+  // scrollback works. Without this, tmux reattach / claude's TUI send
+  // DEC private mode escapes that put xterm.js in alt-screen or mouse
+  // tracking mode, breaking native scroll and selection.
+
+  const BLOCKED_MODES = new Set([
+    47, 1047, 1049,
+    1000, 1001, 1002, 1003, 1005, 1006, 1015, 1016,
+  ]);
+
+  function filterEscapes(data: Uint8Array): Uint8Array {
+    if (data.indexOf(0x1b) === -1) return data;
+
+    const out: number[] = [];
+    let i = 0;
+    while (i < data.length) {
+      if (
+        data[i] === 0x1b &&
+        i + 2 < data.length &&
+        data[i + 1] === 0x5b &&
+        data[i + 2] === 0x3f
+      ) {
+        let j = i + 3;
+        let params = '';
+        while (
+          j < data.length &&
+          ((data[j] >= 0x30 && data[j] <= 0x39) || data[j] === 0x3b)
+        ) {
+          params += String.fromCharCode(data[j]);
+          j++;
+        }
+        if (j < data.length && (data[j] === 0x68 || data[j] === 0x6c)) {
+          const modes = params.split(';').map(Number);
+          if (modes.some((m) => BLOCKED_MODES.has(m))) {
+            i = j + 1;
+            continue;
+          }
+        }
+      }
+      out.push(data[i]);
+      i++;
+    }
+    return new Uint8Array(out);
+  }
+
   // ── WS handlers (shared between initial open + reconnect) ────────────────
   //
   // Returning a fresh object each call is intentional: the WireSocket
@@ -370,7 +440,7 @@ export default function Workbench() {
       onMessage: (msg: HubMsg) => handleTabMsg(id, agent, workspace, tool, msg),
       onBinary: (data: Uint8Array) => {
         const tab = tabsRef.current.find((t) => t.id === id);
-        tab?.term.write(data);
+        tab?.term.write(filterEscapes(data));
       },
       onClose: (_code: number, _reason: string) => {
         handleTabWsClose(id, agent, workspace, tool);
@@ -484,7 +554,7 @@ export default function Workbench() {
       const isDark = effectiveTheme(getStoredTheme()) === 'dark';
       const term = new Terminal({
         cursorBlink: true,
-        scrollback: 10000,
+        scrollback: 50000,
         fontFamily: 'ui-monospace, Menlo, Monaco, monospace',
         fontSize: 14,
         theme: xtermTheme(isDark),
@@ -505,39 +575,10 @@ export default function Workbench() {
       });
       const fitAddon = new FitAddon();
       const linksAddon = new WebLinksAddon();
+      const serializeAddon = new SerializeAddon();
       term.loadAddon(fitAddon);
       term.loadAddon(linksAddon);
-      // Renderer ladder: WebGL → Canvas → DOM (xterm's built-in).
-      // WebGL is the fastest by a wide margin (GPU-backed texture
-      // atlas, batched draws) and is the only one that keeps up
-      // smoothly when claude streams a long response while the user
-      // scrolls the buffer. Canvas is a usable middle ground; the
-      // built-in DOM renderer is the last resort.
-      //
-      // The WebGL addon can fail or its GL context can be lost
-      // mid-session (Safari with memory pressure, certain GPU
-      // drivers, virtualized displays). We register a
-      // `contextLoss` handler and demote to Canvas in place
-      // instead of leaving the user with a broken / blank pane.
-      try {
-        const webgl = new WebglAddon();
-        webgl.onContextLoss(() => {
-          webgl.dispose();
-          try {
-            term.loadAddon(new CanvasAddon());
-          } catch {
-            // Final fallback is xterm's DOM renderer, which is
-            // always present and doesn't need loading.
-          }
-        });
-        term.loadAddon(webgl);
-      } catch {
-        try {
-          term.loadAddon(new CanvasAddon());
-        } catch {
-          // Headless / very old browser — DOM renderer takes over.
-        }
-      }
+      term.loadAddon(serializeAddon);
 
       // OSC 52 clipboard write. tmux (with `set -g set-clipboard on`)
       // emits this escape on every drag-select copy: `OSC 52 ; c ;
@@ -611,34 +652,9 @@ export default function Workbench() {
         ws,
         term,
         fitAddon,
+        serializeAddon,
         opened: false,
       };
-
-      // Cmd+C bridge: when we believe tmux is sitting in copy-mode
-      // with an active selection (set by the mouse listeners in
-      // attachContainer), pressing Cmd+C sends 'y' to the PTY. tmux's
-      // conf binds 'y' to copy-pipe-and-cancel with an OSC 52 emit,
-      // which our parser handler then writes to the system clipboard.
-      // When the tracking flag is false we let xterm.js's own
-      // Cmd+C handling run, so plain text inside an xterm-native
-      // selection (rare in this setup) still copies.
-      term.attachCustomKeyEventHandler((ev) => {
-        if (ev.type !== 'keydown') return true;
-        const isCmdC =
-          ev.metaKey &&
-          !ev.ctrlKey &&
-          !ev.shiftKey &&
-          !ev.altKey &&
-          ev.key.toLowerCase() === 'c';
-        if (!isCmdC) return true;
-        if (copyModeRef.current.get(id) !== true) return true;
-        const me = tabsRef.current.find((t) => t.id === id);
-        if (me?.ws.connected) {
-          me.ws.sendBinary(new TextEncoder().encode('y'));
-        }
-        copyModeRef.current.set(id, false);
-        return false;
-      });
 
       dispatchTabs({ type: 'ADD', tab: newTab });
       setActiveTabId(id);
@@ -847,6 +863,11 @@ export default function Workbench() {
         }
       }
       if (tab) {
+        const histKey = tabKey(tab.agent, tab.workspace);
+        try {
+          const state = tab.serializeAddon.serialize({ scrollback: 50000 });
+          saveTermState(histKey, state);
+        } catch { /* ignore */ }
         tab.ws.close();
         tab.term.dispose();
       }
@@ -932,50 +953,13 @@ export default function Workbench() {
         tab.term.open(el);
         tab.fitAddon.fit();
         tab.opened = true;
+        const histKey = tabKey(tab.agent, tab.workspace);
+        loadTermState(histKey).then((saved) => {
+          if (saved) tab.term.write(saved);
+        });
       } catch {
         // StrictMode double-mount — already opened
       }
-
-      // Track whether tmux is currently sitting in copy-mode with a
-      // live selection. Set after a drag-with-movement mouseup;
-      // cleared on any plain mousedown (which also fires tmux's
-      // MouseDown-in-copy-mode → cancel binding) or after a Cmd+C
-      // bridges through to tmux. Capture phase so we see the events
-      // before xterm.js forwards them upstream. The state lives in
-      // copyModeRef (Map<tabId, bool>), not on the Tab object,
-      // because the tabs reducer rebuilds Tab references on every
-      // UPDATE and would otherwise discard our mutation.
-      let downX = 0;
-      let downY = 0;
-      let movedDuringDrag = false;
-
-      el.addEventListener(
-        'mousedown',
-        (ev) => {
-          downX = ev.clientX;
-          downY = ev.clientY;
-          movedDuringDrag = false;
-          copyModeRef.current.set(tabId, false);
-        },
-        true,
-      );
-      el.addEventListener(
-        'mousemove',
-        (ev) => {
-          if (!(ev.buttons & 1)) return;
-          if (Math.abs(ev.clientX - downX) > 4 || Math.abs(ev.clientY - downY) > 4) {
-            movedDuringDrag = true;
-          }
-        },
-        true,
-      );
-      el.addEventListener(
-        'mouseup',
-        () => {
-          if (movedDuringDrag) copyModeRef.current.set(tabId, true);
-        },
-        true,
-      );
     },
     [],
   );

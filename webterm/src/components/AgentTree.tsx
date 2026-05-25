@@ -93,20 +93,17 @@ export default function AgentTree({
           className="fixed z-50 min-w-[10rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
           style={{ left: wsMenu.x, top: wsMenu.y }}
         >
-          {OPEN_WITH_TOOLS.map((tool) => (
-            <button
-              key={tool}
-              type="button"
-              onClick={() => {
-                const { agent, workspace } = wsMenu;
-                setWsMenu(null);
-                onOpenWorkspace(agent, workspace, tool);
-              }}
-              className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
-            >
-              Open with {tool}
-            </button>
-          ))}
+          <button
+            type="button"
+            onClick={() => {
+              const { agent, workspace } = wsMenu;
+              setWsMenu(null);
+              onOpenWorkspace(agent, workspace);
+            }}
+            className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
+          >
+            Open
+          </button>
           <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
           <button
             type="button"
@@ -245,35 +242,6 @@ function WorkspaceRow({
   return (
     <>
       {/* Inline dropdown (hover chevron) */}
-      {dropdownOpen && dropdownPos && (
-        <>
-          <div
-            className="fixed inset-0 z-40"
-            onClick={() => { setDropdownOpen(false); setDropdownPos(null); }}
-            onContextMenu={(e) => { e.preventDefault(); setDropdownOpen(false); setDropdownPos(null); }}
-          />
-          <div
-            className="fixed z-50 min-w-[10rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
-            style={{ left: dropdownPos.x, top: dropdownPos.y }}
-          >
-            {OPEN_WITH_TOOLS.map((tool) => (
-              <button
-                key={tool}
-                type="button"
-                onClick={() => {
-                  setDropdownOpen(false);
-                  setDropdownPos(null);
-                  onOpenWithTool(tool);
-                }}
-                className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
-              >
-                Open with {tool}
-              </button>
-            ))}
-          </div>
-        </>
-      )}
-
       <div
         className={`group flex items-center gap-1 px-2 py-0.5 text-xs font-mono transition-colors ${
           offline
@@ -297,21 +265,6 @@ function WorkspaceRow({
 
         {/* Action buttons — hover-visible */}
         <span className="shrink-0 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-          {/* Tool selector chevron — disabled when offline */}
-          <button
-            onClick={handleChevronClick}
-            className={`p-0.5 rounded transition-colors ${
-              offline
-                ? 'text-zinc-300 dark:text-zinc-700 cursor-not-allowed'
-                : 'text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700'
-            }`}
-            title={offline ? 'Agent is offline' : 'Open with tool...'}
-            aria-label={`Open ${workspace.name} with specific tool`}
-            disabled={offline}
-          >
-            <ChevronDownIcon />
-          </button>
-          {/* Files — always enabled */}
           {onOpenFiles && (
             <button
               onClick={(e) => {

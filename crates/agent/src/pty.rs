@@ -114,53 +114,31 @@ impl PtyManager {
             .join("tmux.conf");
         let tmux_conf = match std::fs::create_dir_all(tmux_conf.parent().unwrap_or(Path::new(".")))
             .and_then(|_| {
-                // mouse on             -> wheel scrolls per-pane scrollback;
-                //                         drag-select enters tmux copy mode
-                //                         and highlights the selection.
-                // history-limit 50000  -> default 2000 lines is way too
-                //                         small for AI chat transcripts.
-                // set-clipboard on +   -> on copy, tmux emits an OSC 52
-                // terminal-features       escape carrying the selected text
-                // *:clipboard             upstream. webterm registers an
-                //                         OSC 52 handler that drops it
-                //                         straight into the browser
-                //                         clipboard, so drag → release =
-                //                         system-clipboard copy without
-                //                         needing a modifier key.
-                // UX we want, matching standard desktop selection:
-                //   drag        -> tmux enters copy-mode, selection visible
-                //   release     -> selection STAYS visible (don't auto-copy)
-                //   click       -> exit copy-mode, drop selection
-                //   y/Enter/c   -> copy + OSC 52 + exit; webterm
-                //                  intercepts Cmd+C and sends 'y' to
-                //                  bridge from desktop-style copy
-                //
-                // The piped shell command stays on one line — tmux's
-                // conf parser doesn't honour backslash continuations
-                // inside bind-key argv. Note the leading comma on
-                // terminal-features: `set -a` is raw string append, so
-                // without the separator tmux silently mangles the
-                // value.
+                // mouse off             -> xterm.js owns mouse: native scroll,
+                //                         native text selection, native copy.
+                // alternate-screen off  -> tmux does NOT propagate alt-screen
+                //                         escapes to the outer terminal, so
+                //                         xterm.js stays in the main screen
+                //                         and its scrollback accumulates all
+                //                         output. This is the same trick
+                //                         iTerm2's "Save lines to scrollback
+                //                         in alternate screen mode" uses.
+                //                         Claude's TUI still works inside
+                //                         tmux's pane — tmux handles
+                //                         alt-screen internally.
+                // history-limit 50000  -> tmux's own scrollback (keyboard
+                //                         copy-mode via Ctrl-b [ still works).
+                // set-clipboard on +   -> keyboard-initiated tmux copies
+                // terminal-features       emit OSC 52 → browser clipboard.
                 let copy_pipe =
                     "send-keys -X copy-pipe-and-cancel 'base64 | tr -d \"\\n\" | (printf \"\\033]52;c;\"; cat; printf \"\\a\")'";
-                let bindings = format!(
-                    // Drag-end: stop the selection but stay in copy
-                    // mode so it remains visible and the user can
-                    // decide what to do next.
-                    //
-                    // Single click in copy-mode → `clear-selection`,
-                    // NOT `cancel`. Difference matters: `cancel` exits
-                    // copy-mode and snaps the viewport back to the
-                    // alt-screen bottom, which on webterm felt like
-                    // "click teleports me to the bottom" while
-                    // scrolled up; `clear-selection` drops the
-                    // highlighted region but keeps the viewport
-                    // exactly where the user scrolled to. Esc remains
-                    // the deliberate exit (default tmux binding).
-                    "bind-key -T copy-mode    MouseDragEnd1Pane send-keys -X stop-selection\n\
-                     bind-key -T copy-mode-vi MouseDragEnd1Pane send-keys -X stop-selection\n\
-                     bind-key -T copy-mode    MouseDown1Pane    send-keys -X clear-selection\n\
-                     bind-key -T copy-mode-vi MouseDown1Pane    send-keys -X clear-selection\n\
+                let conf = format!(
+                    "set -g mouse off\n\
+                     set-window-option -g alternate-screen off\n\
+                     set -g terminal-overrides 'xterm*:smcup@:rmcup@'\n\
+                     set -g history-limit 50000\n\
+                     set -g set-clipboard on\n\
+                     set -as terminal-features ',*:clipboard'\n\
                      bind-key -T copy-mode    Enter {copy_pipe}\n\
                      bind-key -T copy-mode-vi Enter {copy_pipe}\n\
                      bind-key -T copy-mode    y     {copy_pipe}\n\
@@ -168,13 +146,6 @@ impl PtyManager {
                      bind-key -T copy-mode    c     {copy_pipe}\n\
                      bind-key -T copy-mode-vi c     {copy_pipe}\n",
                     copy_pipe = copy_pipe
-                );
-                let conf = format!(
-                    "set -g mouse on\n\
-                     set -g history-limit 50000\n\
-                     set -g set-clipboard on\n\
-                     set -as terminal-features ',*:clipboard'\n\
-                     {bindings}"
                 );
                 std::fs::write(&tmux_conf, conf.as_bytes())
             })
