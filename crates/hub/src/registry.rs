@@ -195,12 +195,20 @@ impl AgentConn {
     }
 
     /// Handle an incoming text JSON frame from the agent.
-    pub async fn handle_text_frame(&self, frame: ClientMsg) {
+    ///
+    /// MUST NOT block: every `.send()` uses `try_send` so a slow
+    /// consumer on one session / download can't stall the per-agent
+    /// read loop and freeze all other sessions on the same agent.
+    pub fn handle_text_frame(&self, frame: ClientMsg) {
         match classify(&frame) {
             Routing::Session(sid) => {
                 let tx = self.sessions.get(&sid).map(|e| e.value().clone());
                 if let Some(tx) = tx {
-                    let _ = tx.send(PtyEventOut::Frame(frame)).await;
+                    if let Err(mpsc::error::TrySendError::Full(_)) =
+                        tx.try_send(PtyEventOut::Frame(frame))
+                    {
+                        tracing::warn!(session = %sid, "session event channel full; dropping frame");
+                    }
                 } else {
                     tracing::warn!(session = %sid, "no session route for frame; dropping");
                 }
@@ -213,42 +221,41 @@ impl AgentConn {
                 }
             }
             Routing::FsStream(rid) => {
-                // Inspect terminal-ness BEFORE forwarding so we can
-                // remove the routing entry first — the receiver may
-                // drop its handle on EOF and we don't want a racing
-                // chunk to log "no route" spuriously.
                 let terminal = matches!(
                     &frame,
                     ClientMsg::FsReadChunk { eof, error, .. } if *eof || error.is_some()
                 );
                 let tx = self.fs_read_streams.get(&rid).map(|e| e.value().clone());
                 if let Some(tx) = tx {
-                    // Backpressure: if the HTTP client is slow, this
-                    // await blocks the per-agent frame loop. That is
-                    // intentional — the agent's chunk emitter is
-                    // similarly bounded so file streaming applies
-                    // end-to-end backpressure.
-                    let _ = tx.send(frame).await;
+                    match tx.try_send(frame) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(request = %rid, "fs read channel full; dropping chunk");
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::debug!(request = %rid, "fs read receiver gone");
+                        }
+                    }
                     if terminal {
                         self.fs_read_streams.remove(&rid);
                     }
                 } else {
                     tracing::warn!(request = %rid, "no fs read stream route");
                     if terminal {
-                        // Already removed; ensure idempotency.
                         self.fs_read_streams.remove(&rid);
                     }
                 }
             }
-            Routing::Discard => {
-                tracing::debug!("discarding unroutable frame");
-            }
+            Routing::Discard => {}
         }
     }
 
     /// Handle an incoming binary frame from the agent. Only TAG_PTY_OUTPUT is
     /// expected; payload is forwarded to the matching session's PTY channel.
-    pub async fn handle_binary_frame(&self, raw: &[u8]) {
+    ///
+    /// Uses `try_send` — a slow webterm consumer drops PTY output
+    /// frames instead of blocking the entire agent read loop.
+    pub fn handle_binary_frame(&self, raw: &[u8]) {
         let Some((tag, sid, payload)) = unpack_pty_frame(raw) else {
             tracing::warn!("malformed binary frame from agent");
             return;
@@ -260,7 +267,11 @@ impl AgentConn {
         let tx = self.sessions.get(&sid).map(|e| e.value().clone());
         if let Some(tx) = tx {
             let bytes = Bytes::copy_from_slice(payload);
-            let _ = tx.send(PtyEventOut::Output(bytes)).await;
+            if let Err(mpsc::error::TrySendError::Full(_)) =
+                tx.try_send(PtyEventOut::Output(bytes))
+            {
+                tracing::warn!(session = %sid, "pty output channel full; dropping frame");
+            }
         } else {
             tracing::trace!(session = %sid, "binary frame for unknown session");
         }
@@ -338,8 +349,7 @@ mod tests {
             data_b64: "aGVsbG8=".into(),
             eof: false,
             error: None,
-        })
-        .await;
+        });
         assert!(conn.fs_read_streams.contains_key(&rid));
         let got = rx.recv().await.expect("first chunk");
         assert!(matches!(
@@ -353,8 +363,7 @@ mod tests {
             data_b64: String::new(),
             eof: true,
             error: None,
-        })
-        .await;
+        });
         assert!(!conn.fs_read_streams.contains_key(&rid));
         let got = rx.recv().await.expect("eof chunk");
         assert!(matches!(got, ClientMsg::FsReadChunk { eof: true, .. }));
@@ -371,9 +380,8 @@ mod tests {
             request_id: rid,
             data_b64: String::new(),
             eof: true,
-            error: Some("boom".into()),
-        })
-        .await;
+            error: Some("boom".to_string()),
+        });
         assert!(!conn.fs_read_streams.contains_key(&rid));
         let got = rx.recv().await.expect("error chunk");
         assert!(matches!(

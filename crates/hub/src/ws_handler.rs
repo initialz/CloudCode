@@ -183,6 +183,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         };
         match msg {
             Message::Text(s) => match serde_json::from_str::<ClientMsg>(&s) {
+                Ok(ClientMsg::Pong) => {}
                 Ok(ClientMsg::Message {
                     session_id,
                     claude_session_id,
@@ -190,19 +191,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     kind,
                     body,
                 }) => {
-                    // Conversation event from the agent's jsonl tail.
-                    // Persisted straight to the admin db; no client
-                    // forwarding needed.
-                    state
-                        .db
-                        .insert_message(&crate::db::MessageRow {
-                            cc_session_id: session_id.to_string(),
-                            claude_session_id,
-                            ts,
-                            kind,
-                            body,
-                        })
-                        .await;
+                    let db = state.db.clone();
+                    let row = crate::db::MessageRow {
+                        cc_session_id: session_id.to_string(),
+                        claude_session_id,
+                        ts,
+                        kind,
+                        body,
+                    };
+                    tokio::spawn(async move { db.insert_message(&row).await });
                 }
                 Ok(ClientMsg::UserInteraction {
                     account,
@@ -216,15 +213,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                     kind,
                     content,
                 }) => {
-                    // Captured user input from the agent's process-level
-                    // audit pipeline. Persisted to its own table for
-                    // the admin audit surface; failures only log so
-                    // a flaky disk can't disrupt the PTY tunnel.
-                    state
-                        .db
-                        .insert_user_interaction(&crate::db::UserInteractionRow {
+                    let db = state.db.clone();
+                    let agent_name = name.clone();
+                    tokio::spawn(async move {
+                        db.insert_user_interaction(&crate::db::UserInteractionRow {
                             account,
-                            agent: name.clone(),
+                            agent: agent_name,
                             workspace,
                             claude_session_id,
                             prompt_id,
@@ -236,11 +230,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                             content,
                         })
                         .await;
+                    });
                 }
-                Ok(frame) => conn.handle_text_frame(frame).await,
+                Ok(frame) => conn.handle_text_frame(frame),
                 Err(e) => tracing::warn!(agent = %name, error = %e, "bad frame"),
             },
-            Message::Binary(b) => conn.handle_binary_frame(&b).await,
+            Message::Binary(b) => conn.handle_binary_frame(&b),
             Message::Close(_) => break,
             Message::Ping(_) | Message::Pong(_) => {}
         }
