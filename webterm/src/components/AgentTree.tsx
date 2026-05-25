@@ -4,13 +4,6 @@
 
 import { useState, useEffect, useMemo } from 'react';
 import type { WorkspaceItem } from '@/lib/wire';
-import { KNOWN_TOOLS } from '@/lib/tools';
-
-// Tools surfaced by the "Open with…" menus. KNOWN_TOOLS stays the
-// source of truth for "can be launched" (tabLabel, preferences
-// schema, default tool); this is a narrower set — codex is hidden
-// from the picker for now alongside the Settings dialog change.
-const OPEN_WITH_TOOLS = KNOWN_TOOLS.filter((t) => t !== 'codex');
 
 type Props = {
   workspaces: WorkspaceItem[];
@@ -158,10 +151,6 @@ export default function AgentTree({
               if (!ws.agent_online) return;
               onOpenWorkspace(ws.agent, ws.name);
             }}
-            onOpenWithTool={(tool) => {
-              if (!ws.agent_online) return;
-              onOpenWorkspace(ws.agent, ws.name, tool);
-            }}
             onReset={() => onResetWorkspace(ws.agent, ws.name)}
             onDelete={() => onDeleteWorkspace(ws.agent, ws.name)}
             onOpenFiles={onOpenFiles ? () => onOpenFiles(ws.agent, ws.name) : undefined}
@@ -205,7 +194,6 @@ function WorkspaceRow({
   isLive,
   isActive,
   onOpen,
-  onOpenWithTool,
   onReset,
   onDelete,
   onOpenFiles,
@@ -216,32 +204,15 @@ function WorkspaceRow({
   isLive: boolean;
   isActive: boolean;
   onOpen: () => void;
-  onOpenWithTool: (tool: string) => void;
   onReset: () => void;
   onDelete: () => void;
   onOpenFiles?: () => void;
   onContextMenu: (x: number, y: number) => void;
 }) {
-  const [dropdownOpen, setDropdownOpen] = useState(false);
-  const [dropdownPos, setDropdownPos] = useState<{ x: number; y: number } | null>(null);
-
   const offline = !workspace.agent_online;
-
-  function handleChevronClick(e: React.MouseEvent) {
-    e.stopPropagation();
-    if (offline) return;
-    if (dropdownOpen) {
-      setDropdownOpen(false);
-      setDropdownPos(null);
-    } else {
-      setDropdownPos({ x: e.clientX, y: e.clientY });
-      setDropdownOpen(true);
-    }
-  }
 
   return (
     <>
-      {/* Inline dropdown (hover chevron) */}
       <div
         className={`group flex items-center gap-1 px-2 py-0.5 text-xs font-mono transition-colors ${
           offline
@@ -315,23 +286,6 @@ function WorkspaceRow({
 
 // ── Icons ────────────────────────────────────────────────────────────────────
 
-function ChevronDownIcon() {
-  return (
-    <svg
-      width="12"
-      height="12"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      aria-hidden
-    >
-      <path d="M6 9l6 6 6-6" />
-    </svg>
-  );
-}
 
 function FolderOpenIcon() {
   return (

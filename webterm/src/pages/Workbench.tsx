@@ -18,14 +18,12 @@ import { SerializeAddon } from '@xterm/addon-serialize';
 import '@xterm/xterm/css/xterm.css';
 
 import { apiClient } from '@/lib/api';
-import { saveTermState, loadTermState, deleteTermState } from '@/lib/termHistory';
+import { saveTermState, loadTermState } from '@/lib/termHistory';
 import {
   WireSocket,
   type AgentItem,
   type WorkspaceItem,
   type HubMsg,
-  type PaneLayout,
-  type SplitDirection,
 } from '@/lib/wire';
 import { effectiveTheme, getStoredTheme, type Theme } from '@/lib/theme';
 import { type Tab, tabKey } from '@/lib/tabs';
@@ -664,31 +662,6 @@ export default function Workbench() {
     [],
   );
 
-  // ── Split pane ────────────────────────────────────────────────────────────
-
-  const handleSplit = useCallback(
-    (tabId: string, tool: string, direction: SplitDirection) => {
-      const tab = tabsRef.current.find((t) => t.id === tabId);
-      if (!tab?.ws.connected) return;
-      const args = (KNOWN_TOOLS as readonly string[]).includes(tool)
-        ? preferencesRef.current.toolArgs[tool as Tool]
-        : [];
-      tab.ws.send({
-        type: 'split_pane',
-        tool,
-        direction,
-        ...(args.length > 0 ? { args } : {}),
-      });
-    },
-    [],
-  );
-
-  const handleChangeLayout = useCallback((tabId: string, layout: PaneLayout) => {
-    const tab = tabsRef.current.find((t) => t.id === tabId);
-    if (!tab?.ws.connected) return;
-    tab.ws.send({ type: 'change_layout', layout });
-  }, []);
-
   // ── PTY WS message handler (per tab) ──────────────────────────────────────
 
   function handleTabMsg(
@@ -1063,8 +1036,6 @@ export default function Workbench() {
           activeTabId={activeTabId}
           onSelect={selectTab}
           onClose={closeTab}
-          onSplit={handleSplit}
-          onChangeLayout={handleChangeLayout}
         />
 
         {/* Terminal containers — all rendered, visibility toggled via class */}
