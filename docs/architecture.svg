@@ -1,8 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 960"
      font-family="system-ui, -apple-system, 'Helvetica Neue', Arial, sans-serif" font-size="16">
-  <!-- Explicit white background so the diagram stays legible on
-       dark-mode GitHub (which otherwise renders the page on black). -->
   <rect width="100%" height="100%" fill="#ffffff"/>
 
   <defs>
@@ -27,90 +25,103 @@
        Row 1 — user touchpoints
        ============================================================ -->
 
-  <!-- Client -->
-  <rect x="180" y="120" width="300" height="180" rx="14" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
-  <text x="330" y="165" text-anchor="middle" font-size="22" font-weight="700" fill="#1e3a8a">Client</text>
-  <text x="330" y="195" text-anchor="middle" font-size="17" fill="#1d4ed8">cloudcode</text>
-  <text x="330" y="235" text-anchor="middle" font-size="15" fill="#1f2937">raw-mode PTY pump</text>
-  <text x="330" y="260" text-anchor="middle" font-size="15" fill="#1f2937">menu picker · Ctrl+\</text>
-  <text x="330" y="290" text-anchor="middle" font-size="14" fill="#475569" font-style="italic">Laptop · phone · SSH</text>
+  <!-- Client (CLI) -->
+  <rect x="60" y="120" width="260" height="180" rx="14" fill="#dbeafe" stroke="#1d4ed8" stroke-width="2"/>
+  <text x="190" y="160" text-anchor="middle" font-size="20" font-weight="700" fill="#1e3a8a">CLI Client</text>
+  <text x="190" y="188" text-anchor="middle" font-size="16" fill="#1d4ed8">cloudcode</text>
+  <text x="190" y="222" text-anchor="middle" font-size="14" fill="#1f2937">raw-mode PTY pump</text>
+  <text x="190" y="244" text-anchor="middle" font-size="14" fill="#1f2937">menu picker · Ctrl+\</text>
+  <text x="190" y="272" text-anchor="middle" font-size="13" fill="#475569" font-style="italic">Laptop · phone · SSH</text>
 
-  <!-- Browser (admin operator) -->
-  <rect x="920" y="120" width="300" height="180" rx="14" fill="#e0e7ff" stroke="#4338ca" stroke-width="2"/>
-  <text x="1070" y="165" text-anchor="middle" font-size="22" font-weight="700" fill="#3730a3">Browser</text>
-  <text x="1070" y="195" text-anchor="middle" font-size="17" fill="#4338ca">admin operator</text>
-  <text x="1070" y="240" text-anchor="middle" font-size="15" fill="#1f2937">cookie-auth session</text>
-  <text x="1070" y="265" text-anchor="middle" font-size="14" font-family="ui-monospace, Menlo, monospace" fill="#1f2937">/admin/ on hub port</text>
+  <!-- Webterm (browser) -->
+  <rect x="400" y="120" width="300" height="180" rx="14" fill="#fae8ff" stroke="#a21caf" stroke-width="2"/>
+  <text x="550" y="160" text-anchor="middle" font-size="20" font-weight="700" fill="#701a75">Webterm</text>
+  <text x="550" y="188" text-anchor="middle" font-size="16" fill="#a21caf">browser SPA</text>
+  <text x="550" y="222" text-anchor="middle" font-size="14" fill="#1f2937">xterm.js · native scroll</text>
+  <text x="550" y="244" text-anchor="middle" font-size="14" fill="#1f2937">file manager · settings</text>
+  <text x="550" y="272" text-anchor="middle" font-size="13" fill="#475569" font-style="italic">Any browser · multi-tab</text>
+
+  <!-- Admin browser -->
+  <rect x="780" y="120" width="260" height="180" rx="14" fill="#e0e7ff" stroke="#4338ca" stroke-width="2"/>
+  <text x="910" y="160" text-anchor="middle" font-size="20" font-weight="700" fill="#3730a3">Admin UI</text>
+  <text x="910" y="188" text-anchor="middle" font-size="16" fill="#4338ca">admin operator</text>
+  <text x="910" y="222" text-anchor="middle" font-size="14" fill="#1f2937">accounts · agents · activity</text>
+  <text x="910" y="244" text-anchor="middle" font-size="14" fill="#1f2937">workspaces · sessions</text>
+  <text x="910" y="272" text-anchor="middle" font-size="13" fill="#475569" font-style="italic">Separate admin listener</text>
 
   <!-- ============================================================
        Row 2 — gateway
        ============================================================ -->
 
   <!-- Hub -->
-  <rect x="200" y="370" width="1000" height="210" rx="14" fill="#d1fae5" stroke="#047857" stroke-width="2"/>
-  <text x="700" y="412" text-anchor="middle" font-size="22" font-weight="700" fill="#065f46">Hub</text>
-  <text x="700" y="442" text-anchor="middle" font-size="17" fill="#047857">cloudcode-hub</text>
+  <rect x="100" y="370" width="1000" height="210" rx="14" fill="#d1fae5" stroke="#047857" stroke-width="2"/>
+  <text x="600" y="412" text-anchor="middle" font-size="22" font-weight="700" fill="#065f46">Hub</text>
+  <text x="600" y="442" text-anchor="middle" font-size="17" fill="#047857">cloudcode-hub</text>
 
   <!-- Hub body bullets (left half) -->
-  <text x="430" y="488" text-anchor="middle" font-size="15" fill="#1f2937">- PTY relay · session router</text>
-  <text x="430" y="513" text-anchor="middle" font-size="15" fill="#1f2937">- account auth + 2-way ACL</text>
-  <text x="430" y="538" text-anchor="middle" font-size="15" fill="#1f2937">- audit · sessions · messages</text>
+  <text x="350" y="488" text-anchor="middle" font-size="15" fill="#1f2937">- PTY relay · session router</text>
+  <text x="350" y="513" text-anchor="middle" font-size="15" fill="#1f2937">- account auth + 2-way ACL</text>
+  <text x="350" y="538" text-anchor="middle" font-size="15" fill="#1f2937">- audit · sessions · messages</text>
 
-  <!-- Admin SPA pill (right half) -->
-  <rect x="830" y="463" width="340" height="100" rx="8" fill="#ffffff" stroke="#047857" stroke-width="1.5" stroke-dasharray="5,4"/>
-  <text x="1000" y="488" text-anchor="middle" font-size="15" font-weight="600" fill="#065f46">embedded admin UI</text>
-  <text x="1000" y="514" text-anchor="middle" font-size="13" font-family="ui-monospace, Menlo, monospace" fill="#1f2937">React SPA · /admin/</text>
-  <text x="1000" y="538" text-anchor="middle" font-size="13" font-family="ui-monospace, Menlo, monospace" fill="#1f2937">SQLite backend</text>
+  <!-- Hub right-side features -->
+  <rect x="730" y="463" width="340" height="100" rx="8" fill="#ffffff" stroke="#047857" stroke-width="1.5" stroke-dasharray="5,4"/>
+  <text x="900" y="488" text-anchor="middle" font-size="15" font-weight="600" fill="#065f46">embedded SPAs + REST</text>
+  <text x="900" y="514" text-anchor="middle" font-size="13" font-family="ui-monospace, Menlo, monospace" fill="#1f2937">webterm / + admin /admin/</text>
+  <text x="900" y="538" text-anchor="middle" font-size="13" font-family="ui-monospace, Menlo, monospace" fill="#1f2937">SQLite · file API · user prefs</text>
 
   <!-- ============================================================
        Row 3 — runtime + upstream
        ============================================================ -->
 
-  <!-- Agent (with internal tmux+claude box) -->
-  <rect x="180" y="660" width="700" height="280" rx="14" fill="#ffedd5" stroke="#c2410c" stroke-width="2"/>
-  <text x="530" y="702" text-anchor="middle" font-size="22" font-weight="700" fill="#7c2d12">Agent</text>
-  <text x="530" y="730" text-anchor="middle" font-size="17" fill="#9a3412">cloudcode-agent</text>
-  <text x="530" y="768" text-anchor="middle" font-size="15" fill="#1f2937">dials hub over WSS</text>
-  <text x="530" y="793" text-anchor="middle" font-size="15" fill="#1f2937">per-workspace tmux server</text>
-  <text x="530" y="818" text-anchor="middle" font-size="15" fill="#1f2937">macOS Seatbelt sandbox (opt-in)</text>
+  <!-- Agent -->
+  <rect x="80" y="660" width="700" height="280" rx="14" fill="#ffedd5" stroke="#c2410c" stroke-width="2"/>
+  <text x="430" y="702" text-anchor="middle" font-size="22" font-weight="700" fill="#7c2d12">Agent</text>
+  <text x="430" y="730" text-anchor="middle" font-size="17" fill="#9a3412">cloudcode-agent</text>
+  <text x="430" y="768" text-anchor="middle" font-size="15" fill="#1f2937">dials hub over WSS · protocol v10</text>
+  <text x="430" y="793" text-anchor="middle" font-size="15" fill="#1f2937">per-workspace tmux + file ops</text>
+  <text x="430" y="818" text-anchor="middle" font-size="15" fill="#1f2937">macOS Seatbelt sandbox (opt-in)</text>
 
   <!-- tmux + claude subprocess pill -->
-  <rect x="220" y="836" width="620" height="92" rx="8" fill="#ffffff" stroke="#c2410c" stroke-width="1.5" stroke-dasharray="5,4"/>
-  <text x="530" y="860" text-anchor="middle" font-size="15" font-weight="600" fill="#7c2d12">tmux + coding CLI (per workspace)</text>
-  <text x="530" y="884" text-anchor="middle" font-size="13" font-family="ui-monospace, Menlo, monospace" fill="#1f2937">tmux -L cc-&lt;acct&gt;-&lt;ws&gt;</text>
-  <text x="530" y="906" text-anchor="middle" font-size="13" font-family="ui-monospace, Menlo, monospace" fill="#1f2937">└─ claude · codex · …</text>
+  <rect x="120" y="836" width="620" height="92" rx="8" fill="#ffffff" stroke="#c2410c" stroke-width="1.5" stroke-dasharray="5,4"/>
+  <text x="430" y="860" text-anchor="middle" font-size="15" font-weight="600" fill="#7c2d12">tmux + coding CLI (per workspace)</text>
+  <text x="430" y="884" text-anchor="middle" font-size="13" font-family="ui-monospace, Menlo, monospace" fill="#1f2937">tmux -L cc-&lt;acct&gt;-&lt;ws&gt;</text>
+  <text x="430" y="906" text-anchor="middle" font-size="13" font-family="ui-monospace, Menlo, monospace" fill="#1f2937">└─ claude · zip archive · file list</text>
 
-  <!-- Upstream provider API (deliberately generic — cloudcode forwards
-       PTY, the inner CLI talks to whichever provider it wants). -->
-  <rect x="970" y="700" width="280" height="200" rx="14" fill="#f3f4f6" stroke="#9ca3af" stroke-width="1.5"/>
-  <text x="1110" y="742" text-anchor="middle" font-size="20" font-weight="700" fill="#4b5563">Provider API</text>
-  <text x="1110" y="772" text-anchor="middle" font-size="15" fill="#6b7280">Anthropic · OpenAI · …</text>
-  <text x="1110" y="820" text-anchor="middle" font-size="13" fill="#6b7280" font-style="italic">each coding CLI talks</text>
-  <text x="1110" y="840" text-anchor="middle" font-size="13" fill="#6b7280" font-style="italic">to its own upstream</text>
+  <!-- Upstream provider API -->
+  <rect x="870" y="700" width="280" height="200" rx="14" fill="#f3f4f6" stroke="#9ca3af" stroke-width="1.5"/>
+  <text x="1010" y="742" text-anchor="middle" font-size="20" font-weight="700" fill="#4b5563">Provider API</text>
+  <text x="1010" y="772" text-anchor="middle" font-size="15" fill="#6b7280">Anthropic · OpenAI · …</text>
+  <text x="1010" y="820" text-anchor="middle" font-size="13" fill="#6b7280" font-style="italic">each coding CLI talks</text>
+  <text x="1010" y="840" text-anchor="middle" font-size="13" fill="#6b7280" font-style="italic">to its own upstream</text>
 
   <!-- ============================================================
        Edges
        ============================================================ -->
 
   <!-- Client -> Hub (PTY frames, bidirectional WSS) -->
-  <line x1="330" y1="300" x2="330" y2="370" stroke="#374151" stroke-width="2.5"
+  <line x1="190" y1="300" x2="190" y2="370" stroke="#374151" stroke-width="2.5"
         marker-end="url(#arrow)" marker-start="url(#arrow-start)"/>
-  <text x="346" y="328" font-size="13" fill="#374151">WSS</text>
-  <text x="346" y="348" font-size="13" fill="#6b7280">PTY frames</text>
+  <text x="206" y="328" font-size="13" fill="#374151">WSS</text>
+  <text x="206" y="348" font-size="13" fill="#6b7280">PTY frames</text>
 
-  <!-- Browser -> Hub (HTTPS admin) -->
-  <line x1="1070" y1="300" x2="1070" y2="370" stroke="#374151" stroke-width="2.5"
+  <!-- Webterm -> Hub (PTY + REST) -->
+  <line x1="550" y1="300" x2="550" y2="370" stroke="#374151" stroke-width="2.5"
         marker-end="url(#arrow)" marker-start="url(#arrow-start)"/>
-  <text x="1086" y="328" font-size="13" fill="#374151">HTTPS</text>
-  <text x="1086" y="348" font-size="13" fill="#6b7280">admin API</text>
+  <text x="566" y="328" font-size="13" fill="#374151">WSS + REST</text>
+  <text x="566" y="348" font-size="13" fill="#6b7280">PTY + files</text>
+
+  <!-- Admin Browser -> Hub (HTTPS admin) -->
+  <line x1="910" y1="300" x2="910" y2="370" stroke="#374151" stroke-width="2.5"
+        marker-end="url(#arrow)" marker-start="url(#arrow-start)"/>
+  <text x="926" y="328" font-size="13" fill="#374151">HTTPS</text>
+  <text x="926" y="348" font-size="13" fill="#6b7280">admin API</text>
 
   <!-- Hub -> Agent (WSS tunnel, agent dials) -->
-  <line x1="530" y1="580" x2="530" y2="660" stroke="#374151" stroke-width="2.5"
+  <line x1="430" y1="580" x2="430" y2="660" stroke="#374151" stroke-width="2.5"
         marker-end="url(#arrow)" marker-start="url(#arrow-start)"/>
-  <text x="546" y="610" font-size="13" fill="#374151">WSS tunnel</text>
-  <text x="546" y="630" font-size="13" fill="#6b7280">agent dials out</text>
+  <text x="446" y="610" font-size="13" fill="#374151">WSS tunnel</text>
+  <text x="446" y="630" font-size="13" fill="#6b7280">agent dials out</text>
 
-  <!-- Agent -> upstream provider (deliberately unlabeled — cloudcode
-       is provider-agnostic; this edge is "whatever the inner CLI does"). -->
-  <line x1="880" y1="800" x2="970" y2="800" stroke="#9ca3af" stroke-width="1.5" marker-end="url(#arrow-muted)"/>
+  <!-- Agent -> upstream provider -->
+  <line x1="780" y1="800" x2="870" y2="800" stroke="#9ca3af" stroke-width="1.5" marker-end="url(#arrow-muted)"/>
 </svg>

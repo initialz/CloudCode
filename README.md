@@ -6,16 +6,16 @@
 
 **Solo use only.** Subscription plans (Claude Max / Pro) are per-individual under Anthropic's Terms of Service. Sharing one across users violates them and the account may get banned. One user → one subscription → one agent.
 
-![architecture](docs/architecture.svg?v=4)
+![architecture](docs/architecture.svg?v=5)
 
 ## Highlights
 
 - **Native claude TUI, end to end.** No wrapper layer — slash commands, todos, diffs, permission prompts all work because CloudCode forwards raw PTY bytes from `tmux+claude` on the agent.
 - **Persistent workspaces.** Close the laptop, lose Wi-Fi, switch from terminal to phone. tmux + claude keep running on the agent. Reconnect and pick up exactly where you left off, mid-task.
-- **Multi-tool panes.** Run claude and codex side-by-side or stacked in the same workspace via webterm's split UI. Each pane is its own tool, sharing the same project directory.
-- **Browser client too.** Self-hosted SPA at `/` — drag-select-to-clipboard, mouse-wheel scrollback, per-user default args saved on the hub. Same backend as the CLI.
-- **macOS Seatbelt sandbox (opt-in).** Each workspace's claude runs sealed off from `~/.ssh`, Keychain, sibling workspaces, and cross-account state. Network stays open.
-- **Self-hosted admin UI.** Single binary, embedded React SPA at `/admin/`. Manage accounts and agents with **two-way strict-whitelist ACL** (per-account agent access, per-agent account access), browse live & historical workspaces, sessions, and audit events.
+- **Webterm with native UX.** Self-hosted SPA at `/` — DOM-rendered xterm.js with native scroll, native text selection, browser Cmd+C copy, 50k-line scrollback persisted across page refresh via IndexedDB.
+- **File manager.** Browse workspace files in-browser, multi-select, download as zip archive (files and directories).
+- **macOS Seatbelt sandbox (opt-in).** Each workspace's claude runs sealed off from `~/.ssh`, Keychain, sibling workspaces, and cross-account state. Browser automation (Playwright) allowed.
+- **Self-hosted admin UI.** Single binary, embedded React SPA at `/admin/`. Manage accounts (with real names) and agents with **two-way strict-whitelist ACL**, browse live & historical workspaces, sessions, and audit events.
 - **Credentials stay put.** OAuth tokens never leave the agent host. The client only ever sees terminal bytes.
 
 ## Quick start
