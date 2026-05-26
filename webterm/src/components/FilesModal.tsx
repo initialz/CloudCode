@@ -254,31 +254,30 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
     fetchList(path, next);
   }
 
-  function toggleSelection(name: string, shiftKey = false) {
+  function handleSelect(name: string, e: { shiftKey: boolean; metaKey: boolean; ctrlKey: boolean }) {
     setSelected((prev) => {
-      if (shiftKey && lastClickedRef.current && load.status === 'ok') {
-        const names = load.entries.map((e) => e.name);
+      if (e.shiftKey && lastClickedRef.current && load.status === 'ok') {
+        const names = load.entries.map((en) => en.name);
         const from = names.indexOf(lastClickedRef.current);
         const to = names.indexOf(name);
         if (from !== -1 && to !== -1) {
           const lo = Math.min(from, to);
           const hi = Math.max(from, to);
           const next = new Set(prev);
-          for (let i = lo; i <= hi; i++) {
-            next.add(names[i]);
-          }
+          for (let i = lo; i <= hi; i++) next.add(names[i]);
           lastClickedRef.current = name;
           return next;
         }
       }
-      const next = new Set(prev);
-      if (next.has(name)) {
-        next.delete(name);
-      } else {
-        next.add(name);
+      if (e.metaKey || e.ctrlKey) {
+        const next = new Set(prev);
+        if (next.has(name)) next.delete(name);
+        else next.add(name);
+        lastClickedRef.current = name;
+        return next;
       }
       lastClickedRef.current = name;
-      return next;
+      return new Set([name]);
     });
   }
 
@@ -411,10 +410,10 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
               : 'hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-300'
           }`}
           onClick={(e) => {
-            if (isDir && !selectionMode && !e.shiftKey) {
+            if (isDir && !e.shiftKey && !e.metaKey && !e.ctrlKey && !selectionMode) {
               navigate(entryPath);
             } else {
-              toggleSelection(entry.name, e.shiftKey);
+              handleSelect(entry.name, e);
             }
           }}
           onDoubleClick={() => {
@@ -494,7 +493,7 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
     >
       {/* Modal panel */}
       <div
-        className="flex flex-col bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl shadow-2xl w-full max-w-5xl mx-4 overflow-hidden"
+        className="flex flex-col bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl shadow-2xl w-full max-w-5xl mx-4 overflow-hidden select-none"
         style={{ maxHeight: 'calc(100vh - 4rem)', minHeight: '36rem' }}
         onClick={(e) => e.stopPropagation()}
       >
