@@ -1,6 +1,6 @@
 // Theme + per-tool default args modal.
 
-import { getStoredTheme, setStoredTheme, Theme } from '@/lib/theme';
+import { apply, getStoredTheme, setStoredTheme, Theme } from '@/lib/theme';
 import { useState } from 'react';
 import { KNOWN_TOOLS, type Tool } from '@/lib/tools';
 import { argsToText, textToArgs, type Preferences } from '@/lib/preferences';
@@ -44,8 +44,24 @@ export default function SettingsDialog({
 
   function handleTheme(t: Theme) {
     setTheme(t);
-    setStoredTheme(t);
-    onThemeChange?.(t);
+    apply(t);
+  }
+
+  function handleSave() {
+    commitName();
+    for (const tool of CONFIGURABLE_TOOLS) {
+      commitArgs(tool);
+    }
+    setStoredTheme(theme);
+    onThemeChange?.(theme);
+    onClose();
+  }
+
+  function handleClose() {
+    const stored = getStoredTheme();
+    apply(stored);
+    onThemeChange?.(stored);
+    onClose();
   }
 
   function commitName() {
@@ -86,9 +102,8 @@ export default function SettingsDialog({
             placeholder="Your display name"
             value={nameText}
             onChange={(e) => setNameText(e.target.value)}
-            onBlur={() => commitName()}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') commitName();
+              if (e.key === 'Enter') handleSave();
             }}
             className="w-full px-2 py-1.5 text-sm rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-zinc-400 dark:focus:ring-zinc-500"
           />
@@ -139,7 +154,6 @@ export default function SettingsDialog({
                   onChange={(e) =>
                     setArgsText((prev) => ({ ...prev, [tool]: e.target.value }))
                   }
-                  onBlur={() => commitArgs(tool)}
                   className="flex-1 px-2 py-1.5 text-xs font-mono rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-zinc-400 dark:focus:ring-zinc-500"
                 />
               </label>
@@ -147,12 +161,18 @@ export default function SettingsDialog({
           </div>
         </div>
 
-        <div className="flex justify-end">
+        <div className="flex justify-end gap-2">
           <button
-            onClick={onClose}
+            onClick={handleClose}
             className="text-sm px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors"
           >
-            Close
+            Cancel
+          </button>
+          <button
+            onClick={handleSave}
+            className="text-sm px-3 py-1.5 rounded-lg bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:opacity-90 transition-colors"
+          >
+            Save
           </button>
         </div>
       </div>
