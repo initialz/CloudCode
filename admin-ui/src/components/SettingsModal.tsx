@@ -5,7 +5,7 @@ import {
   guessHubUrl,
   setStoredHubUrl,
 } from '@/lib/hubUrl';
-import { getStoredTheme, setStoredTheme, type Theme } from '@/lib/theme';
+import { apply, getStoredTheme, setStoredTheme, type Theme } from '@/lib/theme';
 
 export function SettingsModal({
   open,
@@ -25,6 +25,11 @@ export function SettingsModal({
     }
   }, [open]);
 
+  function handleClose() {
+    apply(getStoredTheme());
+    onClose();
+  }
+
   function save() {
     setStoredHubUrl(hubUrl);
     setStoredTheme(theme);
@@ -34,14 +39,15 @@ export function SettingsModal({
   function reset() {
     setStoredHubUrl('');
     setHubUrl('');
-    setStoredTheme('system');
-    setTheme('system');
+    const t = 'system' as Theme;
+    setStoredTheme(t);
+    setTheme(t);
   }
 
   return (
     <Modal
       open={open}
-      onClose={onClose}
+      onClose={handleClose}
       title="Admin settings"
       footer={
         <>
@@ -52,7 +58,7 @@ export function SettingsModal({
             Reset to default
           </button>
           <button
-            onClick={onClose}
+            onClick={handleClose}
             className="px-3 py-1.5 text-sm rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
           >
             Cancel
@@ -101,7 +107,7 @@ export function SettingsModal({
                   name="theme"
                   value={opt}
                   checked={theme === opt}
-                  onChange={() => setTheme(opt)}
+                  onChange={() => { setTheme(opt); apply(opt); }}
                   className="sr-only"
                 />
                 <span className="capitalize">{opt}</span>
