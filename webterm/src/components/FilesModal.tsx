@@ -496,6 +496,7 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
         className="flex flex-col bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl shadow-2xl w-full max-w-5xl mx-4 overflow-hidden select-none"
         style={{ maxHeight: 'calc(100vh - 4rem)', minHeight: '36rem' }}
         onClick={(e) => e.stopPropagation()}
+        onContextMenu={(e) => e.preventDefault()}
       >
         {/* Header */}
         <div className="flex items-center gap-2 px-4 py-3 border-b border-zinc-200 dark:border-zinc-800 shrink-0">
