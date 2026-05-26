@@ -416,6 +416,12 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
               handleSelect(entry.name, e);
             }
           }}
+          onContextMenu={(e) => {
+            e.preventDefault();
+            if (e.ctrlKey) {
+              handleSelect(entry.name, { shiftKey: false, metaKey: true, ctrlKey: true });
+            }
+          }}
           onDoubleClick={() => {
             if (isFile) triggerDownload(entryPath);
           }}
