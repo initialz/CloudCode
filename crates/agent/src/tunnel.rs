@@ -211,6 +211,14 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+
+    FsDeleteResult {
+        request_id: Uuid,
+        #[serde(default)]
+        deleted: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// One entry returned in a `FsListResult`. Directory entries have
@@ -448,6 +456,16 @@ pub enum ServerMsg {
         data_b64: String,
         #[serde(default)]
         eof: bool,
+    },
+
+    /// Delete one or more workspace-relative paths (files and/or
+    /// directories). Directories are removed recursively. Each path
+    /// goes through `resolve_safe` before deletion.
+    FsDelete {
+        request_id: Uuid,
+        account: String,
+        workspace: String,
+        paths: Vec<String>,
     },
 }
 

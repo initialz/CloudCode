@@ -135,6 +135,33 @@ export function archiveUrl(
   return `/api/files/archive?${qs.toString()}`;
 }
 
+// ── File delete API ─────────────────────────────────────────────────────────
+
+export async function deleteFiles(
+  agent: string,
+  workspace: string,
+  paths: string[],
+): Promise<{ deleted: string[]; error: string | null }> {
+  const qs = new URLSearchParams({
+    agent,
+    workspace,
+    paths: paths.join(','),
+  });
+  const res = await fetch(`/api/files/delete?${qs.toString()}`, {
+    method: 'DELETE',
+    credentials: 'same-origin',
+  });
+  if (!res.ok) {
+    let errMsg = `HTTP ${res.status}`;
+    try {
+      const body = await res.json() as { error?: string };
+      if (body.error) errMsg = body.error;
+    } catch { /* ignore */ }
+    throw new Error(errMsg);
+  }
+  return res.json();
+}
+
 // ── File upload API ──────────────────────────────────────────────────────────
 
 export type UploadResult = {

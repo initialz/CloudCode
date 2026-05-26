@@ -16,7 +16,7 @@ use anyhow::{anyhow, Context};
 use axum::{
     extract::DefaultBodyLimit,
     middleware,
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use clap::{Parser, Subcommand};
@@ -225,6 +225,10 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
             post(app::api::files_upload)
                 .route_layer(user_gate.clone())
                 .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)), // 1 GiB
+        )
+        .route(
+            "/api/files/delete",
+            delete(app::api::files_delete).route_layer(user_gate.clone()),
         )
         .route("/", get(app::assets::serve_index))
         .route("/assets/*path", get(app::assets::serve_asset))

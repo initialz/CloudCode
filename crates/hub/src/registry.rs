@@ -300,7 +300,8 @@ fn classify(frame: &ClientMsg) -> Routing {
         | ClientMsg::WorkspaceListAllResult { request_id, .. }
         | ClientMsg::UpdateAgentResult { request_id, .. } => Routing::Workspace(*request_id),
         ClientMsg::FsListResult { request_id, .. }
-        | ClientMsg::FsWriteResult { request_id, .. } => Routing::Workspace(*request_id),
+        | ClientMsg::FsWriteResult { request_id, .. }
+        | ClientMsg::FsDeleteResult { request_id, .. } => Routing::Workspace(*request_id),
         ClientMsg::FsReadChunk { request_id, .. } => Routing::FsStream(*request_id),
         ClientMsg::Hello { .. }
         | ClientMsg::Pong

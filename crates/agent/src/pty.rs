@@ -438,6 +438,35 @@ impl PtyManager {
                     }
                 }
             }
+            ServerMsg::FsDelete {
+                request_id,
+                account,
+                workspace,
+                paths,
+            } => {
+                if let Err(e) = validate_name(&account, "account")
+                    .and_then(|_| validate_name(&workspace, "workspace"))
+                {
+                    let _ = tx
+                        .send(OutFrame::Text(ClientMsg::FsDeleteResult {
+                            request_id,
+                            deleted: Vec::new(),
+                            error: Some(e),
+                        }))
+                        .await;
+                } else {
+                    let workspace_root = self.workspace_root();
+                    let (deleted, error) =
+                        crate::fs::delete(&workspace_root, &account, &workspace, &paths).await;
+                    let _ = tx
+                        .send(OutFrame::Text(ClientMsg::FsDeleteResult {
+                            request_id,
+                            deleted,
+                            error,
+                        }))
+                        .await;
+                }
+            }
             ServerMsg::Welcome { .. } | ServerMsg::Rejected { .. } | ServerMsg::Ping => {}
         }
     }

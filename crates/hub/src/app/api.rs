@@ -759,6 +759,93 @@ pub async fn files_archive(
 }
 
 #[derive(Deserialize)]
+pub struct FsDeleteQuery {
+    pub agent: String,
+    pub workspace: String,
+    /// Comma-separated workspace-relative paths (files and/or dirs).
+    pub paths: String,
+}
+
+/// `DELETE /api/files/delete?agent=A&workspace=W&paths=old.txt,tmp/`
+///
+/// Deletes one or more workspace paths (files and/or directories) on the
+/// agent. Returns 200 with `{ "deleted": [...], "error": "..." | null }`
+/// — same envelope style as `files_list` so the SPA can handle both
+/// partial success and transport failures uniformly.
+pub async fn files_delete(
+    State(state): State<Arc<AppState>>,
+    Extension(account): Extension<AuthedAccount>,
+    Query(q): Query<FsDeleteQuery>,
+) -> Response {
+    let account = account.0;
+    if let Err(resp) = authorize_workspace(&state, &account, &q.agent, &q.workspace).await {
+        return resp;
+    }
+
+    let paths: Vec<String> = q
+        .paths
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if paths.is_empty() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "at least one path is required",
+        );
+    }
+
+    let Some(conn) = state.registry.get(&q.agent) else {
+        return err(StatusCode::NOT_FOUND, "agent_offline", "agent is not connected");
+    };
+
+    let request_id = Uuid::new_v4();
+    let (tx, rx) = oneshot::channel();
+    conn.register_workspace_request(request_id, tx);
+
+    if conn
+        .send(ServerMsg::FsDelete {
+            request_id,
+            account: account.clone(),
+            workspace: q.workspace.clone(),
+            paths,
+        })
+        .await
+        .is_err()
+    {
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent_offline",
+            "agent disconnected before request was sent",
+        );
+    }
+
+    match tokio::time::timeout(FS_LIST_TIMEOUT, rx).await {
+        Ok(Ok(ClientMsg::FsDeleteResult { deleted, error, .. })) => (
+            StatusCode::OK,
+            Json(json!({ "deleted": deleted, "error": error })),
+        )
+            .into_response(),
+        Ok(Ok(_)) => err(
+            StatusCode::BAD_GATEWAY,
+            "unexpected_reply",
+            "agent returned an unexpected frame",
+        ),
+        Ok(Err(_)) => err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent_offline",
+            "agent disconnected before reply",
+        ),
+        Err(_) => err(
+            StatusCode::BAD_GATEWAY,
+            "agent_timeout",
+            "agent did not reply in time",
+        ),
+    }
+}
+
+#[derive(Deserialize)]
 pub struct FsUploadQuery {
     pub agent: String,
     pub workspace: String,

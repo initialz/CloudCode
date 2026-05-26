@@ -1,7 +1,7 @@
 // File-manager modal: browse and download files from an agent workspace.
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { listFiles, downloadFileUrl, archiveUrl, uploadFiles, type FsEntry, type UploadResult } from '@/lib/api';
+import { listFiles, downloadFileUrl, archiveUrl, uploadFiles, deleteFiles, type FsEntry, type UploadResult } from '@/lib/api';
 
 // ── Formatting helpers ───────────────────────────────────────────────────────
 
@@ -334,6 +334,27 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
       });
   }
 
+  async function handleDelete() {
+    if (load.status !== 'ok' || selected.size === 0) return;
+    const entries = load.entries;
+    const fullPaths: string[] = [];
+    for (const name of selected) {
+      const entry = entries.find(e => e.name === name);
+      if (!entry) continue;
+      const isDir = entry.kind === 'dir';
+      fullPaths.push(path + name + (isDir ? '/' : ''));
+    }
+    if (!confirm(`Delete ${fullPaths.length} item${fullPaths.length > 1 ? 's' : ''}?`)) return;
+    try {
+      await deleteFiles(agent, workspace, fullPaths);
+      setSelected(new Set());
+      fetchList(path, showHidden);
+    } catch {
+      // Refresh even on error
+      fetchList(path, showHidden);
+    }
+  }
+
   const crumbs = breadcrumbs(path);
   const title = `${workspace}@${agent}`;
 
@@ -515,28 +536,6 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
             />
             Show hidden
           </label>
-
-          {/* Upload button */}
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            className="flex items-center gap-1 shrink-0 text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors"
-          >
-            <UploadIcon />
-            Upload
-          </button>
-
-          {/* Hidden file input */}
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            className="hidden"
-            onChange={(e) => {
-              if (e.target.files?.length) handleUpload(Array.from(e.target.files));
-              e.target.value = '';
-            }}
-          />
         </div>
 
         {/* Column headers */}
@@ -654,7 +653,19 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
           </div>
         )}
 
-        {/* Footer — item count + selection actions + upload progress */}
+        {/* Hidden file input */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          className="hidden"
+          onChange={(e) => {
+            if (e.target.files?.length) handleUpload(Array.from(e.target.files));
+            e.target.value = '';
+          }}
+        />
+
+        {/* Footer — item count + upload + selection actions + upload progress */}
         <div className="shrink-0 h-9 flex items-center gap-2 px-4 border-t border-zinc-200 dark:border-zinc-800 text-xs font-mono">
           {upload ? (
             <>
@@ -685,6 +696,14 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
                   ? 'Loading...'
                   : 'Error'}
               </span>
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                className="flex items-center gap-1 text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 transition-colors"
+              >
+                <UploadIcon />
+                Upload
+              </button>
               {selectionMode && (
                 <>
                   <span className="text-zinc-300 dark:text-zinc-700">·</span>
@@ -693,8 +712,15 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
                   </span>
                   <button
                     type="button"
+                    onClick={handleDelete}
+                    className="ml-auto px-2.5 py-0.5 rounded bg-red-600 hover:bg-red-700 text-white font-medium transition-colors"
+                  >
+                    Delete
+                  </button>
+                  <button
+                    type="button"
                     onClick={downloadSelected}
-                    className="ml-auto px-2.5 py-0.5 rounded bg-blue-600 hover:bg-blue-700 text-white font-medium transition-colors"
+                    className="px-2.5 py-0.5 rounded bg-blue-600 hover:bg-blue-700 text-white font-medium transition-colors"
                   >
                     Download ZIP
                   </button>

@@ -649,6 +649,62 @@ async fn archive_stream_inner(
     }
 }
 
+/// Delete one or more workspace-relative paths (files and/or directories).
+///
+/// Each path is validated via [`resolve_safe`] before deletion. Files are
+/// removed with `tokio::fs::remove_file`; directories with
+/// `tokio::fs::remove_dir_all`. All paths are attempted even if some fail;
+/// the return value carries the list of successfully deleted paths and,
+/// optionally, the first error encountered.
+pub async fn delete(
+    workspace_root: &Path,
+    account: &str,
+    workspace: &str,
+    paths: &[String],
+) -> (Vec<String>, Option<String>) {
+    let mut deleted: Vec<String> = Vec::new();
+    let mut first_error: Option<String> = None;
+
+    for rel in paths {
+        let target = match resolve_safe(workspace_root, account, workspace, rel) {
+            Ok(t) => t,
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(format!("{}: {}", rel, e));
+                }
+                continue;
+            }
+        };
+
+        let meta = match fs::symlink_metadata(&target).await {
+            Ok(m) => m,
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(format!("{}: {}", rel, e));
+                }
+                continue;
+            }
+        };
+
+        let result = if meta.is_dir() {
+            fs::remove_dir_all(&target).await
+        } else {
+            fs::remove_file(&target).await
+        };
+
+        match result {
+            Ok(()) => deleted.push(rel.clone()),
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(format!("{}: {}", rel, e));
+                }
+            }
+        }
+    }
+
+    (deleted, first_error)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -893,5 +949,64 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("no write session"), "got: {}", err);
+    }
+
+    // --- delete tests ---
+
+    #[tokio::test]
+    async fn delete_removes_file() {
+        let (_tmp, root, account, workspace, base) = setup();
+        stdfs::write(base.join("doomed.txt"), b"bye").unwrap();
+        let (deleted, error) = delete(&root, &account, &workspace, &["doomed.txt".into()]).await;
+        assert_eq!(deleted, vec!["doomed.txt"]);
+        assert!(error.is_none(), "unexpected error: {:?}", error);
+        assert!(!base.join("doomed.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_directory_recursively() {
+        let (_tmp, root, account, workspace, base) = setup();
+        stdfs::create_dir_all(base.join("mydir/sub")).unwrap();
+        stdfs::write(base.join("mydir/sub/file.txt"), b"x").unwrap();
+        let (deleted, error) = delete(&root, &account, &workspace, &["mydir".into()]).await;
+        assert_eq!(deleted, vec!["mydir"]);
+        assert!(error.is_none(), "unexpected error: {:?}", error);
+        assert!(!base.join("mydir").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_partial_success() {
+        let (_tmp, root, account, workspace, base) = setup();
+        stdfs::write(base.join("good.txt"), b"ok").unwrap();
+        // "missing.txt" does not exist — resolve_safe will fail.
+        let (deleted, error) = delete(
+            &root,
+            &account,
+            &workspace,
+            &["good.txt".into(), "missing.txt".into()],
+        )
+        .await;
+        assert_eq!(deleted, vec!["good.txt"]);
+        assert!(error.is_some());
+        assert!(!base.join("good.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_path_escape() {
+        let (_tmp, root, account, workspace, _base) = setup();
+        // Create a sibling file outside the workspace.
+        let outside = root.join(&account).join("evil.txt");
+        stdfs::write(&outside, b"secret").unwrap();
+        let (deleted, error) = delete(
+            &root,
+            &account,
+            &workspace,
+            &["../evil.txt".into()],
+        )
+        .await;
+        assert!(deleted.is_empty());
+        assert!(error.is_some());
+        // The file must still exist.
+        assert!(outside.exists());
     }
 }

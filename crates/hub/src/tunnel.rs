@@ -208,6 +208,14 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+
+    FsDeleteResult {
+        request_id: Uuid,
+        #[serde(default)]
+        deleted: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// One entry returned in a `FsListResult`. Directory entries have
@@ -430,6 +438,13 @@ pub enum ServerMsg {
         data_b64: String,
         #[serde(default)]
         eof: bool,
+    },
+
+    FsDelete {
+        request_id: Uuid,
+        account: String,
+        workspace: String,
+        paths: Vec<String>,
     },
 }
 
