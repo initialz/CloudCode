@@ -1,7 +1,7 @@
 // File-manager modal: browse and download files from an agent workspace.
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { listFiles, downloadFileUrl, archiveUrl, type FsEntry } from '@/lib/api';
+import { listFiles, downloadFileUrl, archiveUrl, uploadFiles, type FsEntry, type UploadResult } from '@/lib/api';
 
 // ── Formatting helpers ───────────────────────────────────────────────────────
 
@@ -90,6 +90,17 @@ function DownloadIcon() {
   );
 }
 
+function UploadIcon() {
+  return (
+    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+      strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="17 8 12 3 7 8" />
+      <line x1="12" y1="3" x2="12" y2="15" />
+    </svg>
+  );
+}
+
 function SpinnerIcon() {
   return (
     <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -164,6 +175,23 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
   const [load, setLoad] = useState<LoadState>({ status: 'loading' });
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const abortRef = useRef<AbortController | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Upload state
+  type UploadState = {
+    files: File[];
+    loaded: number;
+    total: number;
+    status: 'uploading' | 'done' | 'error';
+    results?: UploadResult[];
+    errorMsg?: string;
+  };
+  const [upload, setUpload] = useState<UploadState | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+
+  // Conflict detection state
+  type ConflictState = { all: File[]; conflicts: File[] };
+  const [conflictFiles, setConflictFiles] = useState<ConflictState | null>(null);
 
   const selectionMode = selected.size > 0;
 
@@ -267,6 +295,43 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
       fullPaths.push(path + name + (isDir ? '/' : ''));
     }
     triggerArchiveDownload(fullPaths);
+  }
+
+  function handleUpload(files: File[]) {
+    if (load.status !== 'ok') return;
+
+    const existingNames = new Set(load.entries.map(e => e.name));
+    const conflicts = files.filter(f => existingNames.has(f.name));
+
+    if (conflicts.length > 0) {
+      setConflictFiles({ all: files, conflicts });
+      return;
+    }
+
+    startUpload(files);
+  }
+
+  function startUpload(files: File[]) {
+    const total = files.reduce((sum, f) => sum + f.size, 0);
+    setUpload({ files, loaded: 0, total, status: 'uploading' });
+
+    const { promise } = uploadFiles(agent, workspace, path, files, (loaded, t) => {
+      setUpload(prev => prev ? { ...prev, loaded, total: t } : prev);
+    });
+
+    promise
+      .then((results) => {
+        setUpload(prev => prev ? { ...prev, status: 'done', results } : prev);
+        // Refresh file list after short delay
+        setTimeout(() => {
+          setUpload(null);
+          fetchList(path, showHidden);
+        }, 1500);
+      })
+      .catch((err) => {
+        setUpload(prev => prev ? { ...prev, status: 'error', errorMsg: err instanceof Error ? err.message : 'Upload failed' } : prev);
+        setTimeout(() => setUpload(null), 3000);
+      });
   }
 
   const crumbs = breadcrumbs(path);
@@ -450,6 +515,28 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
             />
             Show hidden
           </label>
+
+          {/* Upload button */}
+          <button
+            type="button"
+            onClick={() => fileInputRef.current?.click()}
+            className="flex items-center gap-1 shrink-0 text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 transition-colors"
+          >
+            <UploadIcon />
+            Upload
+          </button>
+
+          {/* Hidden file input */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            className="hidden"
+            onChange={(e) => {
+              if (e.target.files?.length) handleUpload(Array.from(e.target.files));
+              e.target.value = '';
+            }}
+          />
         </div>
 
         {/* Column headers */}
@@ -463,49 +550,102 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
           </div>
         )}
 
-        {/* Body */}
-        {load.status === 'loading' ? (
-          <div className="flex-1 flex items-center justify-center py-12">
-            <SpinnerIcon />
-          </div>
-        ) : load.status === 'error' ? (
-          <div className="flex-1 flex flex-col items-center justify-center gap-3 py-12 px-4">
-            <p className="text-sm text-red-600 dark:text-red-400 text-center">
-              {load.message}
-            </p>
-            <button
-              type="button"
-              onClick={() => fetchList(path, showHidden)}
-              className="text-xs px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors"
-            >
-              Retry
-            </button>
-          </div>
-        ) : load.status === 'ok' && load.entries.length === 0 && path === '' ? (
-          <div className="flex-1 flex items-center justify-center py-12 text-sm text-zinc-400 dark:text-zinc-600">
-            {load.serverErr ?? 'Empty folder'}
-          </div>
-        ) : load.status === 'ok' && load.entries.length === 0 && path !== '' ? (
-          <div className="flex-1 overflow-y-auto">
-            {/* ".." row when dir is empty */}
-            <div
-              className="h-7 flex items-center gap-2 px-3 cursor-pointer hover:bg-zinc-100 dark:hover:bg-zinc-800 text-xs font-mono text-zinc-500 dark:text-zinc-400"
-              onClick={() => navigate(parentPath(path))}
-            >
-              <span className="w-3.5 shrink-0" />
-              <span className="flex-1">../</span>
+        {/* Body — drag & drop area */}
+        <div
+          className="relative flex-1 flex flex-col min-h-0"
+          onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+          onDragLeave={() => setDragOver(false)}
+          onDrop={(e) => {
+            e.preventDefault();
+            setDragOver(false);
+            if (e.dataTransfer.files.length) handleUpload(Array.from(e.dataTransfer.files));
+          }}
+        >
+          {/* Drag overlay */}
+          {dragOver && (
+            <div className="absolute inset-0 z-10 flex items-center justify-center bg-blue-50/80 dark:bg-blue-950/60 border-2 border-dashed border-blue-400 dark:border-blue-600 rounded-lg pointer-events-none">
+              <span className="text-sm font-medium text-blue-600 dark:text-blue-400">Drop files to upload</span>
             </div>
-            <div className="flex items-center justify-center py-8 text-sm text-zinc-400 dark:text-zinc-600">
+          )}
+
+          {/* Conflict dialog */}
+          {conflictFiles && (
+            <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/30">
+              <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg shadow-xl p-4 max-w-sm mx-4 text-sm">
+                <p className="font-medium text-zinc-800 dark:text-zinc-200 mb-2">
+                  {conflictFiles.conflicts.length} file{conflictFiles.conflicts.length > 1 ? 's' : ''} already exist{conflictFiles.conflicts.length === 1 ? 's' : ''}:
+                </p>
+                <ul className="text-xs text-zinc-600 dark:text-zinc-400 mb-3 max-h-32 overflow-y-auto font-mono">
+                  {conflictFiles.conflicts.map(f => <li key={f.name}>{f.name}</li>)}
+                </ul>
+                <div className="flex gap-2 justify-end">
+                  <button onClick={() => setConflictFiles(null)}
+                    className="px-3 py-1.5 rounded border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800">
+                    Skip
+                  </button>
+                  <button onClick={() => {
+                    const nonConflict = conflictFiles.all.filter(f => !conflictFiles.conflicts.some(c => c.name === f.name));
+                    setConflictFiles(null);
+                    if (nonConflict.length > 0) startUpload(nonConflict);
+                  }}
+                    className="px-3 py-1.5 rounded border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800">
+                    Skip conflicts
+                  </button>
+                  <button onClick={() => {
+                    setConflictFiles(null);
+                    startUpload(conflictFiles.all);
+                  }}
+                    className="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white">
+                    Overwrite
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {load.status === 'loading' ? (
+            <div className="flex-1 flex items-center justify-center py-12">
+              <SpinnerIcon />
+            </div>
+          ) : load.status === 'error' ? (
+            <div className="flex-1 flex flex-col items-center justify-center gap-3 py-12 px-4">
+              <p className="text-sm text-red-600 dark:text-red-400 text-center">
+                {load.message}
+              </p>
+              <button
+                type="button"
+                onClick={() => fetchList(path, showHidden)}
+                className="text-xs px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors"
+              >
+                Retry
+              </button>
+            </div>
+          ) : load.status === 'ok' && load.entries.length === 0 && path === '' ? (
+            <div className="flex-1 flex items-center justify-center py-12 text-sm text-zinc-400 dark:text-zinc-600">
               {load.serverErr ?? 'Empty folder'}
             </div>
-          </div>
-        ) : useVirtual ? (
-          <VirtualList items={rows} totalCount={totalRows} />
-        ) : (
-          <div className="flex-1 overflow-y-auto">
-            {rows}
-          </div>
-        )}
+          ) : load.status === 'ok' && load.entries.length === 0 && path !== '' ? (
+            <div className="flex-1 overflow-y-auto">
+              {/* ".." row when dir is empty */}
+              <div
+                className="h-7 flex items-center gap-2 px-3 cursor-pointer hover:bg-zinc-100 dark:hover:bg-zinc-800 text-xs font-mono text-zinc-500 dark:text-zinc-400"
+                onClick={() => navigate(parentPath(path))}
+              >
+                <span className="w-3.5 shrink-0" />
+                <span className="flex-1">../</span>
+              </div>
+              <div className="flex items-center justify-center py-8 text-sm text-zinc-400 dark:text-zinc-600">
+                {load.serverErr ?? 'Empty folder'}
+              </div>
+            </div>
+          ) : useVirtual ? (
+            <VirtualList items={rows} totalCount={totalRows} />
+          ) : (
+            <div className="flex-1 overflow-y-auto">
+              {rows}
+            </div>
+          )}
+        </div>
 
         {/* Server-side warning (non-fatal) */}
         {load.status === 'ok' && load.serverErr && load.entries.length > 0 && (
@@ -514,35 +654,59 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
           </div>
         )}
 
-        {/* Footer — item count + selection actions */}
+        {/* Footer — item count + selection actions + upload progress */}
         <div className="shrink-0 h-9 flex items-center gap-2 px-4 border-t border-zinc-200 dark:border-zinc-800 text-xs font-mono">
-          <span className="text-zinc-400 dark:text-zinc-600">
-            {load.status === 'ok'
-              ? `${load.entries.length} item${load.entries.length === 1 ? '' : 's'}`
-              : load.status === 'loading'
-              ? 'Loading...'
-              : 'Error'}
-          </span>
-          {selectionMode && (
+          {upload ? (
             <>
-              <span className="text-zinc-300 dark:text-zinc-700">·</span>
-              <span className="text-blue-600 dark:text-blue-400">
-                {selected.size} selected
+              {upload.status === 'uploading' && (
+                <>
+                  <div className="flex-1 h-1.5 bg-zinc-200 dark:bg-zinc-700 rounded-full overflow-hidden">
+                    <div className="h-full bg-blue-500 transition-all duration-200 rounded-full"
+                      style={{ width: `${upload.total > 0 ? (upload.loaded / upload.total * 100) : 0}%` }} />
+                  </div>
+                  <span className="text-zinc-500 dark:text-zinc-400 shrink-0">
+                    {upload.total > 0 ? `${Math.round(upload.loaded / upload.total * 100)}%` : 'Uploading...'}
+                  </span>
+                </>
+              )}
+              {upload.status === 'done' && (
+                <span className="text-emerald-600 dark:text-emerald-400">Upload complete</span>
+              )}
+              {upload.status === 'error' && (
+                <span className="text-red-600 dark:text-red-400">{upload.errorMsg}</span>
+              )}
+            </>
+          ) : (
+            <>
+              <span className="text-zinc-400 dark:text-zinc-600">
+                {load.status === 'ok'
+                  ? `${load.entries.length} item${load.entries.length === 1 ? '' : 's'}`
+                  : load.status === 'loading'
+                  ? 'Loading...'
+                  : 'Error'}
               </span>
-              <button
-                type="button"
-                onClick={downloadSelected}
-                className="ml-auto px-2.5 py-0.5 rounded bg-blue-600 hover:bg-blue-700 text-white font-medium transition-colors"
-              >
-                Download ZIP
-              </button>
-              <button
-                type="button"
-                onClick={() => setSelected(new Set())}
-                className="px-2 py-0.5 rounded border border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
-              >
-                Clear
-              </button>
+              {selectionMode && (
+                <>
+                  <span className="text-zinc-300 dark:text-zinc-700">·</span>
+                  <span className="text-blue-600 dark:text-blue-400">
+                    {selected.size} selected
+                  </span>
+                  <button
+                    type="button"
+                    onClick={downloadSelected}
+                    className="ml-auto px-2.5 py-0.5 rounded bg-blue-600 hover:bg-blue-700 text-white font-medium transition-colors"
+                  >
+                    Download ZIP
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setSelected(new Set())}
+                    className="px-2 py-0.5 rounded border border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
+                  >
+                    Clear
+                  </button>
+                </>
+              )}
             </>
           )}
         </div>

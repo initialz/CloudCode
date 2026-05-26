@@ -41,6 +41,7 @@ pub struct PtyManager {
     /// the session still works).
     tmux_conf: Option<PathBuf>,
     sessions: Arc<DashMap<Uuid, Arc<PtyHandle>>>,
+    write_sessions: crate::fs::WriteSessions,
 }
 
 struct PtyHandle {
@@ -171,6 +172,7 @@ impl PtyManager {
             self_exe,
             tmux_conf,
             sessions: Arc::new(DashMap::new()),
+            write_sessions: crate::fs::new_write_sessions(),
         })
     }
 
@@ -359,6 +361,81 @@ impl PtyManager {
                         )
                         .await;
                     });
+                }
+            }
+            ServerMsg::FsWriteInit {
+                request_id,
+                account,
+                workspace,
+                path,
+                size: _,
+            } => {
+                let error = match validate_name(&account, "account")
+                    .and_then(|_| validate_name(&workspace, "workspace"))
+                {
+                    Err(e) => Some(e),
+                    Ok(()) => {
+                        let workspace_root = self.workspace_root();
+                        match crate::fs::write_init(
+                            &self.write_sessions,
+                            &workspace_root,
+                            &account,
+                            &workspace,
+                            &path,
+                            request_id,
+                        )
+                        .await
+                        {
+                            Ok(()) => None,
+                            Err(e) => Some(e),
+                        }
+                    }
+                };
+                if let Some(e) = error {
+                    let _ = tx
+                        .send(OutFrame::Text(ClientMsg::FsWriteResult {
+                            request_id,
+                            bytes_written: 0,
+                            error: Some(e),
+                        }))
+                        .await;
+                }
+            }
+            ServerMsg::FsWriteChunk {
+                request_id,
+                data_b64,
+                eof,
+            } => {
+                match crate::fs::write_chunk(
+                    &self.write_sessions,
+                    request_id,
+                    &data_b64,
+                    eof,
+                )
+                .await
+                {
+                    Ok((bytes_written, true)) => {
+                        // EOF: send the final result.
+                        let _ = tx
+                            .send(OutFrame::Text(ClientMsg::FsWriteResult {
+                                request_id,
+                                bytes_written,
+                                error: None,
+                            }))
+                            .await;
+                    }
+                    Ok((_bytes_written, false)) => {
+                        // Non-eof chunk: no reply needed.
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(OutFrame::Text(ClientMsg::FsWriteResult {
+                                request_id,
+                                bytes_written: 0,
+                                error: Some(e),
+                            }))
+                            .await;
+                    }
                 }
             }
             ServerMsg::Welcome { .. } | ServerMsg::Rejected { .. } | ServerMsg::Ping => {}

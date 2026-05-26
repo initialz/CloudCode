@@ -758,6 +758,188 @@ pub async fn files_archive(
     (StatusCode::OK, headers, Body::from_stream(body_stream)).into_response()
 }
 
+#[derive(Deserialize)]
+pub struct FsUploadQuery {
+    pub agent: String,
+    pub workspace: String,
+    #[serde(default)]
+    pub path: String,
+}
+
+/// `POST /api/files/upload?agent=A&workspace=W&path=target/dir/`
+///
+/// Receives a multipart/form-data body with one or more file fields and
+/// streams each file to the agent via `FsWriteInit` + `FsWriteChunk`
+/// frames. Returns a JSON array of per-file results.
+pub async fn files_upload(
+    State(state): State<Arc<AppState>>,
+    Extension(account): Extension<AuthedAccount>,
+    Query(q): Query<FsUploadQuery>,
+    mut multipart: axum::extract::Multipart,
+) -> Response {
+    let account = account.0;
+    if let Err(resp) = authorize_workspace(&state, &account, &q.agent, &q.workspace).await {
+        return resp;
+    }
+    let Some(conn) = state.registry.get(&q.agent) else {
+        return err(StatusCode::NOT_FOUND, "agent_offline", "agent is not connected");
+    };
+
+    // Normalize target directory: ensure trailing '/' if non-empty.
+    let dir = if q.path.is_empty() {
+        String::new()
+    } else if q.path.ends_with('/') {
+        q.path.clone()
+    } else {
+        format!("{}/", q.path)
+    };
+
+    let mut results: Vec<serde_json::Value> = Vec::new();
+
+    loop {
+        let mut field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    "multipart_error",
+                    format!("failed to read multipart field: {e}"),
+                );
+            }
+        };
+
+        let filename = match field.file_name() {
+            Some(name) => name.to_string(),
+            None => continue, // skip non-file fields
+        };
+
+        let target_path = format!("{dir}{filename}");
+        let request_id = Uuid::new_v4();
+
+        // Register a workspace-request oneshot for the FsWriteResult.
+        let (tx, rx) = oneshot::channel();
+        conn.register_workspace_request(request_id, tx);
+
+        // Send FsWriteInit to agent.
+        if conn
+            .send(ServerMsg::FsWriteInit {
+                request_id,
+                account: account.clone(),
+                workspace: q.workspace.clone(),
+                path: target_path.clone(),
+                size: 0, // content-length unknown from multipart
+            })
+            .await
+            .is_err()
+        {
+            results.push(json!({
+                "name": filename,
+                "bytes_written": 0,
+                "error": "agent disconnected before init was sent",
+            }));
+            continue;
+        }
+
+        // Stream chunks (64 KiB each) from the multipart field to the agent.
+        let mut send_err: Option<String> = None;
+        loop {
+            match field.chunk().await {
+                Ok(Some(chunk_bytes)) => {
+                    let b64 =
+                        base64::engine::general_purpose::STANDARD.encode(&chunk_bytes);
+                    if conn
+                        .send(ServerMsg::FsWriteChunk {
+                            request_id,
+                            data_b64: b64,
+                            eof: false,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        send_err = Some("agent disconnected during upload".into());
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    // End of this file part — send terminal chunk.
+                    if conn
+                        .send(ServerMsg::FsWriteChunk {
+                            request_id,
+                            data_b64: String::new(),
+                            eof: true,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        send_err = Some("agent disconnected at eof".into());
+                    }
+                    break;
+                }
+                Err(e) => {
+                    // Multipart read error — still send eof so agent cleans up.
+                    let _ = conn
+                        .send(ServerMsg::FsWriteChunk {
+                            request_id,
+                            data_b64: String::new(),
+                            eof: true,
+                        })
+                        .await;
+                    send_err = Some(format!("multipart read error: {e}"));
+                    break;
+                }
+            }
+        }
+
+        if let Some(e) = send_err {
+            results.push(json!({
+                "name": filename,
+                "bytes_written": 0,
+                "error": e,
+            }));
+            continue;
+        }
+
+        // Wait for agent FsWriteResult.
+        match tokio::time::timeout(FS_READ_IDLE_TIMEOUT, rx).await {
+            Ok(Ok(ClientMsg::FsWriteResult {
+                bytes_written,
+                error,
+                ..
+            })) => {
+                results.push(json!({
+                    "name": filename,
+                    "bytes_written": bytes_written,
+                    "error": error,
+                }));
+            }
+            Ok(Ok(_)) => {
+                results.push(json!({
+                    "name": filename,
+                    "bytes_written": 0,
+                    "error": "agent returned unexpected frame",
+                }));
+            }
+            Ok(Err(_)) => {
+                results.push(json!({
+                    "name": filename,
+                    "bytes_written": 0,
+                    "error": "agent disconnected before write result",
+                }));
+            }
+            Err(_) => {
+                results.push(json!({
+                    "name": filename,
+                    "bytes_written": 0,
+                    "error": "agent did not reply in time",
+                }));
+            }
+        }
+    }
+
+    (StatusCode::OK, Json(json!({ "results": results }))).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

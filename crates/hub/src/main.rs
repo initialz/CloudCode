@@ -14,6 +14,7 @@ mod ws_handler;
 
 use anyhow::{anyhow, Context};
 use axum::{
+    extract::DefaultBodyLimit,
     middleware,
     routing::{get, post},
     Router,
@@ -218,6 +219,12 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         .route(
             "/api/files/archive",
             get(app::api::files_archive).route_layer(user_gate.clone()),
+        )
+        .route(
+            "/api/files/upload",
+            post(app::api::files_upload)
+                .route_layer(user_gate.clone())
+                .layer(DefaultBodyLimit::max(1024 * 1024 * 1024)), // 1 GiB
         )
         .route("/", get(app::assets::serve_index))
         .route("/assets/*path", get(app::assets::serve_asset))

@@ -134,3 +134,51 @@ export function archiveUrl(
   });
   return `/api/files/archive?${qs.toString()}`;
 }
+
+// ── File upload API ──────────────────────────────────────────────────────────
+
+export type UploadResult = {
+  name: string;
+  bytes_written: number;
+  error: string | null;
+};
+
+export function uploadFiles(
+  agent: string,
+  workspace: string,
+  path: string,
+  files: File[],
+  onProgress?: (loaded: number, total: number) => void,
+): { promise: Promise<UploadResult[]>; abort: () => void } {
+  const xhr = new XMLHttpRequest();
+  const promise = new Promise<UploadResult[]>((resolve, reject) => {
+    const formData = new FormData();
+    for (const f of files) {
+      formData.append('file', f);
+    }
+    const qs = new URLSearchParams({ agent, workspace, path });
+    xhr.open('POST', `/api/files/upload?${qs.toString()}`);
+    xhr.withCredentials = true;
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable && onProgress) {
+        onProgress(e.loaded, e.total);
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          const body = JSON.parse(xhr.responseText);
+          resolve(body.results ?? []);
+        } catch {
+          reject(new Error('Invalid response'));
+        }
+      } else {
+        reject(new Error(`Upload failed: HTTP ${xhr.status}`));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Upload failed: network error'));
+    xhr.onabort = () => reject(new Error('Upload aborted'));
+    xhr.send(formData);
+  });
+  return { promise, abort: () => xhr.abort() };
+}

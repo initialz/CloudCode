@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "10";
+pub const PROTOCOL_VERSION: &str = "11";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
@@ -197,6 +197,17 @@ pub enum ClientMsg {
         data_b64: String,
         #[serde(default)]
         eof: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    /// Result of an `FsWriteInit` + `FsWriteChunk` upload. Sent once
+    /// when the agent has finished writing (eof chunk received and
+    /// flushed) or on any error. New in v1.17 (proto v11).
+    FsWriteResult {
+        request_id: Uuid,
+        #[serde(default)]
+        bytes_written: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -412,6 +423,31 @@ pub enum ServerMsg {
         account: String,
         workspace: String,
         paths: Vec<String>,
+    },
+
+    /// Begin a file upload to the workspace. The hub sends this once
+    /// to create/truncate the target file, followed by one or more
+    /// `FsWriteChunk` frames carrying the payload. `size` is advisory
+    /// (the hub's best knowledge from the Content-Length; 0 if unknown).
+    /// New in v1.17 (proto v11).
+    FsWriteInit {
+        request_id: Uuid,
+        account: String,
+        workspace: String,
+        path: String,
+        #[serde(default)]
+        size: u64,
+    },
+    /// One chunk of an in-progress upload. `eof = true` on the final
+    /// chunk; the agent flushes + closes the file and replies with
+    /// `FsWriteResult`. Empty `data_b64` + `eof = true` is valid
+    /// (zero-byte file or final flush).
+    FsWriteChunk {
+        request_id: Uuid,
+        #[serde(default)]
+        data_b64: String,
+        #[serde(default)]
+        eof: bool,
     },
 }
 

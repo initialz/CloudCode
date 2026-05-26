@@ -172,6 +172,7 @@ dependencies = [
  "matchit",
  "memchr",
  "mime",
+ "multer",
  "percent-encoding",
  "pin-project-lite",
  "rustversion",
@@ -394,7 +395,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cloudcode-agent"
-version = "1.15.5"
+version = "1.17.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -434,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "cloudcode-client"
-version = "1.15.5"
+version = "1.17.2"
 dependencies = [
  "anyhow",
  "bytes",
@@ -456,7 +457,7 @@ dependencies = [
 
 [[package]]
 name = "cloudcode-daemon"
-version = "1.15.5"
+version = "1.17.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -466,7 +467,7 @@ dependencies = [
 
 [[package]]
 name = "cloudcode-hub"
-version = "1.15.5"
+version = "1.17.2"
 dependencies = [
  "anyhow",
  "argon2",
@@ -787,6 +788,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "48c757948c5ede0e46177b7add2e67155f70e33c07fea8284df6576da70b3719"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "encoding_rs"
+version = "0.8.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
+dependencies = [
+ "cfg-if",
 ]
 
 [[package]]
@@ -1723,6 +1733,23 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "multer"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b"
+dependencies = [
+ "bytes",
+ "encoding_rs",
+ "futures-util",
+ "http",
+ "httparse",
+ "memchr",
+ "mime",
+ "spin",
+ "version_check",
 ]
 
 [[package]]

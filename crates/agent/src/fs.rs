@@ -25,11 +25,13 @@
 use crate::pty::OutFrame;
 use crate::tunnel::{ClientMsg, FsEntry, FsKind};
 use base64::Engine;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
 use tokio::fs;
-use tokio::io::AsyncReadExt;
-use tokio::sync::mpsc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{mpsc, Mutex};
 use uuid::Uuid;
 
 /// Hard cap on entries returned in a single `FsList`. Past this point
@@ -86,6 +88,167 @@ pub fn resolve_safe(
         return Err("path escapes workspace".into());
     }
     Ok(target)
+}
+
+/// Like [`resolve_safe`] but for writes: the target file does not need to
+/// exist yet — only the *parent directory* must resolve inside the workspace.
+/// If the parent doesn't exist it is created (mkdir -p). Returns the full
+/// target path with the parent validated.
+///
+/// Security invariants are the same as `resolve_safe`:
+///   - NUL bytes → reject
+///   - leading `/` stripped
+///   - canonicalized parent must be a strict descendant of the workspace base
+pub fn resolve_safe_parent(
+    workspace_root: &Path,
+    account: &str,
+    workspace: &str,
+    requested: &str,
+) -> Result<PathBuf, String> {
+    if requested.as_bytes().contains(&0u8) {
+        return Err("path contains NUL byte".into());
+    }
+    let base_raw = workspace_root.join(account).join(workspace);
+    let base = std::fs::canonicalize(&base_raw)
+        .map_err(|e| format!("workspace not found: {}", e))?;
+
+    let rel = requested.trim_start_matches('/');
+    if rel.is_empty() {
+        return Err("path is empty (cannot write to a directory)".into());
+    }
+
+    let target_raw = base.join(rel);
+
+    // The file itself doesn't exist yet, but the parent directory must
+    // resolve inside the workspace. If it doesn't exist, create it.
+    let parent_raw = target_raw
+        .parent()
+        .ok_or_else(|| "path has no parent".to_string())?;
+
+    if !parent_raw.exists() {
+        std::fs::create_dir_all(parent_raw)
+            .map_err(|e| format!("create parent dir: {}", e))?;
+    }
+
+    let parent = std::fs::canonicalize(parent_raw)
+        .map_err(|e| format!("parent not found: {}", e))?;
+
+    if !parent.starts_with(&base) {
+        return Err("path escapes workspace".into());
+    }
+
+    // Reconstruct the target from the canonicalized parent + the
+    // original filename. This keeps symlink-based escape via the
+    // filename component impossible (the filename itself cannot be a
+    // symlink since the file doesn't exist yet — and the parent has
+    // been proven safe).
+    let filename = target_raw
+        .file_name()
+        .ok_or_else(|| "path has no filename".to_string())?;
+    Ok(parent.join(filename))
+}
+
+// ---------------------------------------------------------------------------
+// Write sessions (stateful upload)
+// ---------------------------------------------------------------------------
+
+/// An open file-write session, created by `FsWriteInit` and appended to
+/// by successive `FsWriteChunk` frames.
+pub struct WriteSession {
+    file: fs::File,
+    bytes_written: u64,
+}
+
+/// Thread-safe map of in-flight write sessions, keyed by request_id.
+pub type WriteSessions = Arc<Mutex<HashMap<Uuid, WriteSession>>>;
+
+pub fn new_write_sessions() -> WriteSessions {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+/// Hard cap on the total bytes we'll accept through a single write
+/// session. Matches `MAX_FILE_BYTES` used for reads.
+const MAX_WRITE_BYTES: u64 = 1 << 30; // 1 GiB
+
+/// Called on `FsWriteInit`: validate the target path and create/truncate
+/// the file. Stores a `WriteSession` in `sessions` so that subsequent
+/// `FsWriteChunk` frames can append data.
+pub async fn write_init(
+    sessions: &WriteSessions,
+    workspace_root: &Path,
+    account: &str,
+    workspace: &str,
+    path: &str,
+    request_id: Uuid,
+) -> Result<(), String> {
+    let target = resolve_safe_parent(workspace_root, account, workspace, path)?;
+
+    let file = fs::File::create(&target)
+        .await
+        .map_err(|e| format!("create file: {}", e))?;
+
+    let mut map = sessions.lock().await;
+    map.insert(request_id, WriteSession {
+        file,
+        bytes_written: 0,
+    });
+    Ok(())
+}
+
+/// Called on `FsWriteChunk`: decode the base64 payload and append it to
+/// the open file. Returns `(bytes_written_total, is_eof)`.
+///
+/// - On non-eof chunks: writes data, returns running total + `false`.
+/// - On eof: flushes, closes (removes from map), returns final total + `true`.
+/// - On error: removes the session from the map and returns Err.
+pub async fn write_chunk(
+    sessions: &WriteSessions,
+    request_id: Uuid,
+    data_b64: &str,
+    eof: bool,
+) -> Result<(u64, bool), String> {
+    let decoded = if data_b64.is_empty() {
+        Vec::new()
+    } else {
+        base64::engine::general_purpose::STANDARD
+            .decode(data_b64)
+            .map_err(|e| format!("base64 decode: {}", e))?
+    };
+
+    let mut map = sessions.lock().await;
+    if !map.contains_key(&request_id) {
+        return Err("no write session for this request_id".into());
+    }
+
+    // Write data if present.
+    if !decoded.is_empty() {
+        let session = map.get(&request_id).unwrap();
+        let new_total = session.bytes_written + decoded.len() as u64;
+        if new_total > MAX_WRITE_BYTES {
+            map.remove(&request_id);
+            return Err("upload exceeds 1 GiB limit".into());
+        }
+        // Need mutable access for write_all; re-borrow.
+        let session = map.get_mut(&request_id).unwrap();
+        if let Err(e) = session.file.write_all(&decoded).await {
+            map.remove(&request_id);
+            return Err(format!("write: {}", e));
+        }
+        session.bytes_written += decoded.len() as u64;
+    }
+
+    if eof {
+        let sess = map.remove(&request_id).unwrap();
+        let total = sess.bytes_written;
+        sess.file
+            .sync_all()
+            .await
+            .map_err(|e| format!("sync: {}", e))?;
+        Ok((total, true))
+    } else {
+        let total = map.get(&request_id).unwrap().bytes_written;
+        Ok((total, false))
+    }
 }
 
 /// List entries directly under `rel_path` (relative to the workspace
@@ -626,5 +789,109 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("not a directory"), "got: {}", err);
+    }
+
+    // --- resolve_safe_parent tests ---
+
+    #[test]
+    fn resolve_safe_parent_creates_missing_parent() {
+        let (_tmp, root, account, workspace, base) = setup();
+        let got = resolve_safe_parent(&root, &account, &workspace, "new_dir/file.txt").unwrap();
+        assert!(got.ends_with("file.txt"));
+        // The parent must have been created.
+        assert!(base.join("new_dir").exists());
+    }
+
+    #[test]
+    fn resolve_safe_parent_rejects_dotdot_escape() {
+        let (_tmp, root, account, workspace, _base) = setup();
+        // Need a sibling dir for canonicalize to succeed on the parent.
+        let outside = root.join(&account);
+        stdfs::create_dir_all(&outside).unwrap();
+        let err = resolve_safe_parent(&root, &account, &workspace, "../evil.txt").unwrap_err();
+        assert!(
+            err.contains("escapes") || err.contains("not found"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_safe_parent_rejects_nul_byte() {
+        let (_tmp, root, account, workspace, _base) = setup();
+        let err = resolve_safe_parent(&root, &account, &workspace, "ok\0bad").unwrap_err();
+        assert!(err.contains("NUL"), "got: {}", err);
+    }
+
+    #[test]
+    fn resolve_safe_parent_rejects_empty_path() {
+        let (_tmp, root, account, workspace, _base) = setup();
+        let err = resolve_safe_parent(&root, &account, &workspace, "").unwrap_err();
+        assert!(err.contains("empty"), "got: {}", err);
+    }
+
+    #[test]
+    fn resolve_safe_parent_strips_leading_slash() {
+        let (_tmp, root, account, workspace, base) = setup();
+        let got = resolve_safe_parent(&root, &account, &workspace, "/newfile.txt").unwrap();
+        let canon_base = stdfs::canonicalize(&base).unwrap();
+        assert_eq!(got, canon_base.join("newfile.txt"));
+    }
+
+    // --- write_init / write_chunk tests ---
+
+    #[tokio::test]
+    async fn write_init_creates_file() {
+        let (_tmp, root, account, workspace, base) = setup();
+        let sessions = new_write_sessions();
+        let rid = Uuid::new_v4();
+        write_init(&sessions, &root, &account, &workspace, "hello.txt", rid)
+            .await
+            .unwrap();
+        // File should exist (empty, truncated).
+        let canon_base = stdfs::canonicalize(&base).unwrap();
+        assert!(canon_base.join("hello.txt").exists());
+        // Session should be tracked.
+        assert!(sessions.lock().await.contains_key(&rid));
+    }
+
+    #[tokio::test]
+    async fn write_full_round_trip() {
+        let (_tmp, root, account, workspace, base) = setup();
+        let sessions = new_write_sessions();
+        let rid = Uuid::new_v4();
+        write_init(&sessions, &root, &account, &workspace, "sub/data.bin", rid)
+            .await
+            .unwrap();
+
+        let payload = b"Hello, world!";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+
+        // Non-eof chunk.
+        let (written, is_eof) = write_chunk(&sessions, rid, &b64, false).await.unwrap();
+        assert!(!is_eof);
+        assert_eq!(written, payload.len() as u64);
+
+        // EOF chunk (empty data).
+        let (total, is_eof) = write_chunk(&sessions, rid, "", true).await.unwrap();
+        assert!(is_eof);
+        assert_eq!(total, payload.len() as u64);
+
+        // Session should be removed.
+        assert!(!sessions.lock().await.contains_key(&rid));
+
+        // File should contain the data.
+        let canon_base = stdfs::canonicalize(&base).unwrap();
+        let content = stdfs::read(canon_base.join("sub").join("data.bin")).unwrap();
+        assert_eq!(content, payload);
+    }
+
+    #[tokio::test]
+    async fn write_chunk_rejects_unknown_request_id() {
+        let sessions = new_write_sessions();
+        let err = write_chunk(&sessions, Uuid::new_v4(), "", true)
+            .await
+            .unwrap_err();
+        assert!(err.contains("no write session"), "got: {}", err);
     }
 }

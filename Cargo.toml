@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/hub", "crates/client", "crates/agent", "crates/daemon"]
 
 [workspace.package]
-version = "1.17.2"
+version = "1.18.0"
 edition = "2021"
 license = "MIT"
 
@@ -19,7 +19,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-axum = { version = "0.7", features = ["ws"] }
+axum = { version = "0.7", features = ["ws", "multipart"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace"] }
 futures = "0.3"

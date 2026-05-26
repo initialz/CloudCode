@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "10";
+pub const PROTOCOL_VERSION: &str = "11";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
@@ -197,6 +197,14 @@ pub enum ClientMsg {
         data_b64: String,
         #[serde(default)]
         eof: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
+    FsWriteResult {
+        request_id: Uuid,
+        #[serde(default)]
+        bytes_written: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -406,6 +414,22 @@ pub enum ServerMsg {
         account: String,
         workspace: String,
         paths: Vec<String>,
+    },
+
+    FsWriteInit {
+        request_id: Uuid,
+        account: String,
+        workspace: String,
+        path: String,
+        #[serde(default)]
+        size: u64,
+    },
+    FsWriteChunk {
+        request_id: Uuid,
+        #[serde(default)]
+        data_b64: String,
+        #[serde(default)]
+        eof: bool,
     },
 }
 
