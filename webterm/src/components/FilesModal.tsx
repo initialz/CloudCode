@@ -237,17 +237,6 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
     });
   }
 
-  function toggleSelectAll() {
-    if (load.status !== 'ok') return;
-    const allNames = load.entries.map((e) => e.name);
-    const allSelected = allNames.length > 0 && allNames.every((n) => selected.has(n));
-    if (allSelected) {
-      setSelected(new Set());
-    } else {
-      setSelected(new Set(allNames));
-    }
-  }
-
   function triggerDownload(filePath: string) {
     const url = downloadFileUrl(agent, workspace, filePath);
     // Use a hidden <a> to avoid navigating the SPA away
@@ -283,11 +272,6 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
   const crumbs = breadcrumbs(path);
   const title = `${workspace}@${agent}`;
 
-  // Compute "select all" checkbox state
-  const allEntryNames = load.status === 'ok' ? load.entries.map((e) => e.name) : [];
-  const allSelected = allEntryNames.length > 0 && allEntryNames.every((n) => selected.has(n));
-  const someSelected = allEntryNames.some((n) => selected.has(n));
-
   // Build row nodes
   function buildRows(): React.ReactNode[] {
     if (load.status !== 'ok') return [];
@@ -302,8 +286,6 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
           className="h-7 flex items-center gap-2 px-3 cursor-pointer hover:bg-zinc-100 dark:hover:bg-zinc-800 text-xs font-mono text-zinc-500 dark:text-zinc-400"
           onClick={() => navigate(parentPath(path))}
         >
-          {/* Checkbox placeholder in selection mode */}
-          {selectionMode && <span className="w-4 shrink-0" />}
           <span className="w-3.5 shrink-0" />
           <span className="flex-1">../</span>
         </div>,
@@ -338,19 +320,6 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
             if (isFile) triggerDownload(entryPath);
           }}
         >
-          {/* Checkbox (visible in selection mode) */}
-          {selectionMode && (
-            <span className="w-4 shrink-0 flex items-center justify-center">
-              <input
-                type="checkbox"
-                checked={isSelected}
-                onChange={() => toggleSelection(entry.name)}
-                onClick={(e) => e.stopPropagation()}
-                className="accent-zinc-600"
-              />
-            </span>
-          )}
-
           {/* Icon */}
           <span className="w-3.5 shrink-0 text-zinc-400 dark:text-zinc-500">
             {isDir ? <FolderIcon /> : isSymlink ? <LinkIcon /> : <FileIcon />}
@@ -424,8 +393,8 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
     >
       {/* Modal panel */}
       <div
-        className="flex flex-col bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl shadow-2xl w-full max-w-2xl mx-4 overflow-hidden"
-        style={{ maxHeight: 'calc(100vh - 6rem)', minHeight: '20rem' }}
+        className="flex flex-col bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl shadow-2xl w-full max-w-5xl mx-4 overflow-hidden"
+        style={{ maxHeight: 'calc(100vh - 4rem)', minHeight: '24rem' }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -486,21 +455,6 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
         {/* Column headers */}
         {load.status === 'ok' && load.entries.length > 0 && (
           <div className="flex items-center gap-2 px-3 py-1 border-b border-zinc-100 dark:border-zinc-800/60 bg-zinc-50 dark:bg-zinc-900/40 shrink-0 text-xs text-zinc-400 dark:text-zinc-600 font-mono">
-            {/* Select All checkbox */}
-            {selectionMode && (
-              <span className="w-4 shrink-0 flex items-center justify-center">
-                <input
-                  type="checkbox"
-                  checked={allSelected}
-                  ref={(el) => {
-                    if (el) el.indeterminate = someSelected && !allSelected;
-                  }}
-                  onChange={toggleSelectAll}
-                  className="accent-zinc-600"
-                  title={allSelected ? 'Deselect All' : 'Select All'}
-                />
-              </span>
-            )}
             <span className="w-3.5 shrink-0" />
             <span className="flex-1">name</span>
             <span className="w-14 text-right shrink-0">size</span>
@@ -560,41 +514,37 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
           </div>
         )}
 
-        {/* Selection action bar */}
-        {selectionMode && (
-          <div className="shrink-0 flex items-center gap-3 px-4 py-2 border-t border-blue-200 dark:border-blue-900 bg-blue-50 dark:bg-blue-950/30 text-xs font-mono">
-            <span className="text-blue-700 dark:text-blue-300 flex-1">
-              {selected.size} item{selected.size === 1 ? '' : 's'} selected
-            </span>
-            <button
-              type="button"
-              onClick={downloadSelected}
-              className="px-3 py-1 rounded-md bg-blue-600 hover:bg-blue-700 text-white font-medium transition-colors"
-            >
-              Download ZIP
-            </button>
-            <button
-              type="button"
-              onClick={() => setSelected(new Set())}
-              className="p-1 rounded text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-blue-100 dark:hover:bg-blue-900/40 transition-colors"
-              aria-label="Cancel selection"
-              title="Cancel selection"
-            >
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                <path d="M18 6 6 18M6 6l12 12" />
-              </svg>
-            </button>
-          </div>
-        )}
-
-        {/* Footer */}
-        <div className="shrink-0 px-4 py-2 border-t border-zinc-200 dark:border-zinc-800 text-xs text-zinc-400 dark:text-zinc-600 font-mono">
-          {load.status === 'ok'
-            ? `${load.entries.length} item${load.entries.length === 1 ? '' : 's'}`
-            : load.status === 'loading'
-            ? 'Loading...'
-            : 'Error'}
+        {/* Footer — item count + selection actions */}
+        <div className="shrink-0 flex items-center gap-2 px-4 py-2 border-t border-zinc-200 dark:border-zinc-800 text-xs font-mono">
+          <span className="text-zinc-400 dark:text-zinc-600">
+            {load.status === 'ok'
+              ? `${load.entries.length} item${load.entries.length === 1 ? '' : 's'}`
+              : load.status === 'loading'
+              ? 'Loading...'
+              : 'Error'}
+          </span>
+          {selectionMode && (
+            <>
+              <span className="text-zinc-300 dark:text-zinc-700">·</span>
+              <span className="text-blue-600 dark:text-blue-400">
+                {selected.size} selected
+              </span>
+              <button
+                type="button"
+                onClick={downloadSelected}
+                className="ml-auto px-2.5 py-0.5 rounded bg-blue-600 hover:bg-blue-700 text-white font-medium transition-colors"
+              >
+                Download ZIP
+              </button>
+              <button
+                type="button"
+                onClick={() => setSelected(new Set())}
+                className="px-2 py-0.5 rounded border border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors"
+              >
+                Clear
+              </button>
+            </>
+          )}
         </div>
       </div>
     </div>
