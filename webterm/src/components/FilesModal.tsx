@@ -193,6 +193,10 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
   type ConflictState = { all: File[]; conflicts: File[] };
   const [conflictFiles, setConflictFiles] = useState<ConflictState | null>(null);
 
+  // Delete confirmation state
+  type DeleteConfirmState = { paths: string[]; names: string[] };
+  const [deleteConfirm, setDeleteConfirm] = useState<DeleteConfirmState | null>(null);
+
   const selectionMode = selected.size > 0;
   const lastClickedRef = useRef<string | null>(null);
 
@@ -350,23 +354,30 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
       });
   }
 
-  async function handleDelete() {
+  function handleDelete() {
     if (load.status !== 'ok' || selected.size === 0) return;
     const entries = load.entries;
     const fullPaths: string[] = [];
+    const names: string[] = [];
     for (const name of selected) {
       const entry = entries.find(e => e.name === name);
       if (!entry) continue;
       const isDir = entry.kind === 'dir';
       fullPaths.push(path + name + (isDir ? '/' : ''));
+      names.push(entry.name + (isDir ? '/' : ''));
     }
-    if (!confirm(`Delete ${fullPaths.length} item${fullPaths.length > 1 ? 's' : ''}?`)) return;
+    setDeleteConfirm({ paths: fullPaths, names });
+  }
+
+  async function confirmDeleteAction() {
+    if (!deleteConfirm) return;
+    const paths = deleteConfirm.paths;
+    setDeleteConfirm(null);
     try {
-      await deleteFiles(agent, workspace, fullPaths);
+      await deleteFiles(agent, workspace, paths);
       setSelected(new Set());
       fetchList(path, showHidden);
     } catch {
-      // Refresh even on error
       fetchList(path, showHidden);
     }
   }
@@ -617,6 +628,30 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
                   }}
                     className="px-3 py-1.5 rounded bg-blue-600 hover:bg-blue-700 text-white">
                     Overwrite
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Delete confirmation dialog */}
+          {deleteConfirm && (
+            <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/30">
+              <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg shadow-xl p-4 max-w-sm mx-4 text-sm">
+                <p className="font-medium text-zinc-800 dark:text-zinc-200 mb-2">
+                  Delete {deleteConfirm.names.length} item{deleteConfirm.names.length > 1 ? 's' : ''}?
+                </p>
+                <ul className="text-xs text-zinc-600 dark:text-zinc-400 mb-3 max-h-32 overflow-y-auto font-mono">
+                  {deleteConfirm.names.map(n => <li key={n}>{n}</li>)}
+                </ul>
+                <div className="flex gap-2 justify-end">
+                  <button onClick={() => setDeleteConfirm(null)}
+                    className="px-3 py-1.5 rounded border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800">
+                    Cancel
+                  </button>
+                  <button onClick={confirmDeleteAction}
+                    className="px-3 py-1.5 rounded bg-red-600 hover:bg-red-700 text-white">
+                    Delete
                   </button>
                 </div>
               </div>
