@@ -48,6 +48,24 @@ function breadcrumbs(path: string): { label: string; path: string }[] {
   }));
 }
 
+/** Rename conflicting files with a numeric suffix: foo.txt → foo (1).txt */
+function renameConflicts(all: File[], conflicts: File[]): File[] {
+  const conflictNames = new Set(conflicts.map(f => f.name));
+  return all.map(f => {
+    if (!conflictNames.has(f.name)) return f;
+    const dot = f.name.lastIndexOf('.');
+    const base = dot > 0 ? f.name.slice(0, dot) : f.name;
+    const ext = dot > 0 ? f.name.slice(dot) : '';
+    let n = 1;
+    let newName: string;
+    do {
+      newName = `${base} (${n})${ext}`;
+      n++;
+    } while (conflictNames.has(newName));
+    return new File([f], newName, { type: f.type, lastModified: f.lastModified });
+  });
+}
+
 // ── Icons ────────────────────────────────────────────────────────────────────
 
 function FolderIcon() {
@@ -615,12 +633,12 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
                     Skip
                   </button>
                   <button onClick={() => {
-                    const nonConflict = conflictFiles.all.filter(f => !conflictFiles.conflicts.some(c => c.name === f.name));
+                    const renamed = renameConflicts(conflictFiles.all, conflictFiles.conflicts);
                     setConflictFiles(null);
-                    if (nonConflict.length > 0) startUpload(nonConflict);
+                    startUpload(renamed);
                   }}
                     className="px-3 py-1.5 rounded border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800">
-                    Skip conflicts
+                    Keep Both
                   </button>
                   <button onClick={() => {
                     setConflictFiles(null);
