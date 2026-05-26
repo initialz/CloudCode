@@ -194,6 +194,7 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
   const [conflictFiles, setConflictFiles] = useState<ConflictState | null>(null);
 
   const selectionMode = selected.size > 0;
+  const lastClickedRef = useRef<string | null>(null);
 
   const fetchList = useCallback(
     (targetPath: string, hidden: boolean) => {
@@ -253,14 +254,30 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
     fetchList(path, next);
   }
 
-  function toggleSelection(name: string) {
+  function toggleSelection(name: string, shiftKey = false) {
     setSelected((prev) => {
+      if (shiftKey && lastClickedRef.current && load.status === 'ok') {
+        const names = load.entries.map((e) => e.name);
+        const from = names.indexOf(lastClickedRef.current);
+        const to = names.indexOf(name);
+        if (from !== -1 && to !== -1) {
+          const lo = Math.min(from, to);
+          const hi = Math.max(from, to);
+          const next = new Set(prev);
+          for (let i = lo; i <= hi; i++) {
+            next.add(names[i]);
+          }
+          lastClickedRef.current = name;
+          return next;
+        }
+      }
       const next = new Set(prev);
       if (next.has(name)) {
         next.delete(name);
       } else {
         next.add(name);
       }
+      lastClickedRef.current = name;
       return next;
     });
   }
@@ -393,13 +410,11 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
               ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100'
               : 'hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-300'
           }`}
-          onClick={() => {
-            if (isDir && !selectionMode) {
-              // Navigate into directory when not in selection mode
+          onClick={(e) => {
+            if (isDir && !selectionMode && !e.shiftKey) {
               navigate(entryPath);
             } else {
-              // Toggle selection for files always, and for dirs when in selection mode
-              toggleSelection(entry.name);
+              toggleSelection(entry.name, e.shiftKey);
             }
           }}
           onDoubleClick={() => {
