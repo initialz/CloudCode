@@ -515,7 +515,7 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
         )}
 
         {/* Footer — item count + selection actions */}
-        <div className="shrink-0 flex items-center gap-2 px-4 py-2 border-t border-zinc-200 dark:border-zinc-800 text-xs font-mono">
+        <div className="shrink-0 h-9 flex items-center gap-2 px-4 border-t border-zinc-200 dark:border-zinc-800 text-xs font-mono">
           <span className="text-zinc-400 dark:text-zinc-600">
             {load.status === 'ok'
               ? `${load.entries.length} item${load.entries.length === 1 ? '' : 's'}`
