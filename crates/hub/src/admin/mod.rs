@@ -22,7 +22,7 @@ use axum::{
     http::{header::COOKIE, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Redirect, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use serde_json::json;
@@ -146,6 +146,10 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/admin/api/accounts/:name/disconnect",
             post(api::accounts_disconnect).route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/api/accounts/:name/real-name",
+            put(api::accounts_update_real_name).route_layer(gate.clone()),
         )
         .route(
             "/admin/api/accounts/:name",

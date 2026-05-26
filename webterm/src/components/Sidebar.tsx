@@ -8,6 +8,7 @@ import type { AgentItem, WorkspaceItem } from '@/lib/wire';
 
 type Props = {
   account: string;
+  realName?: string | null;
   agents: AgentItem[];
   agentsLoading: boolean;
   workspaces: WorkspaceItem[];
@@ -32,6 +33,7 @@ type ConfirmState = {
 
 export default function Sidebar({
   account,
+  realName,
   agents,
   agentsLoading,
   workspaces,
@@ -147,9 +149,20 @@ export default function Sidebar({
 
         {/* Account / actions footer */}
         <div className="shrink-0 px-3 py-2.5 border-t border-zinc-200 dark:border-zinc-800">
-          <div className="text-xs text-zinc-600 dark:text-zinc-400 font-mono truncate mb-1.5">
-            {account}
-          </div>
+          {realName ? (
+            <div className="mb-1.5">
+              <div className="text-xs font-medium text-zinc-700 dark:text-zinc-300 truncate">
+                {realName}
+              </div>
+              <div className="text-[10px] text-zinc-400 dark:text-zinc-500 font-mono truncate">
+                {account}
+              </div>
+            </div>
+          ) : (
+            <div className="text-xs text-zinc-600 dark:text-zinc-400 font-mono truncate mb-1.5">
+              {account}
+            </div>
+          )}
           <div className="flex gap-2">
             <button
               onClick={onSettings}

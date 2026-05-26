@@ -197,7 +197,9 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         .route("/api/logout", post(app::api::logout))
         .route(
             "/api/me",
-            get(app::api::me).route_layer(user_gate.clone()),
+            get(app::api::me)
+                .put(app::api::update_me)
+                .route_layer(user_gate.clone()),
         )
         .route(
             "/api/preferences",
@@ -276,7 +278,7 @@ async fn migrate_accounts_from_toml(db: &Db, config: &Config) -> anyhow::Result<
     }
     let mut imported = 0;
     for a in &config.accounts {
-        if let Err(e) = db.insert_account(&a.name, &a.token_hash, None).await {
+        if let Err(e) = db.insert_account(&a.name, &a.token_hash, None, None).await {
             tracing::warn!(account = %a.name, error = %e, "import account skipped");
             continue;
         }

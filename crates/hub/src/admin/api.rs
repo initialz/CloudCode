@@ -232,6 +232,7 @@ pub async fn sessions_hourly(
 #[derive(Serialize)]
 struct AccountDto {
     name: String,
+    real_name: Option<String>,
     token_prefix: Option<String>,
     created_at: i64,
     disabled: bool,
@@ -284,6 +285,7 @@ pub async fn accounts_list(State(state): State<AdminState>) -> Response {
         let connected = state.app.user_is_connected(&a.name);
         dto.push(AccountDto {
             name: a.name,
+            real_name: a.real_name,
             token_prefix: a.token_prefix,
             created_at: a.created_at,
             disabled: a.disabled,
@@ -300,6 +302,8 @@ pub async fn accounts_list(State(state): State<AdminState>) -> Response {
 #[derive(Deserialize)]
 pub struct CreateAccountRequest {
     pub name: String,
+    #[serde(default)]
+    pub real_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -340,7 +344,7 @@ pub async fn accounts_create(
     if let Err(e) = state
         .app
         .db
-        .insert_account(&name, &hash, Some(&prefix))
+        .insert_account(&name, &hash, Some(&prefix), req.real_name.as_deref())
         .await
     {
         return internal(e);
@@ -438,6 +442,27 @@ pub async fn accounts_disconnect(
     // send() returns Err(_) when there are no subscribers; that's
     // the "account is currently offline" case and is not an error.
     let _ = state.app.user_kick_sender(&name).send(());
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Deserialize)]
+pub struct UpdateRealNameRequest {
+    pub real_name: Option<String>,
+}
+
+pub async fn accounts_update_real_name(
+    State(state): State<AdminState>,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateRealNameRequest>,
+) -> Response {
+    if let Err(e) = state
+        .app
+        .db
+        .update_account_real_name(&name, req.real_name.as_deref())
+        .await
+    {
+        return err(StatusCode::NOT_FOUND, "not_found", e.to_string());
+    }
     StatusCode::NO_CONTENT.into_response()
 }
 

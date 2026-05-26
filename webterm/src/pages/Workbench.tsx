@@ -136,6 +136,9 @@ export default function Workbench() {
   };
   const reconnectRef = useRef<Map<string, ReconnectState>>(new Map());
 
+  // Real name (from /api/me)
+  const [realName, setRealName] = useState<string | null>(null);
+
   // Settings dialog
   const [showSettings, setShowSettings] = useState(false);
 
@@ -180,6 +183,7 @@ export default function Workbench() {
       .me()
       .then((me) => {
         setAccount(me.account);
+        setRealName(me.real_name ?? null);
         setAuthLoading(false);
       })
       .catch(() => {
@@ -225,6 +229,16 @@ export default function Workbench() {
       await apiClient.putPreferences(serializePreferences(next));
     } catch {
       addToast('Could not save preferences — your change applies to this tab but did not persist.');
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const saveRealName = useCallback(async (name: string | null) => {
+    setRealName(name);
+    try {
+      await apiClient.updateMe({ real_name: name });
+    } catch {
+      addToast('Could not save real name.');
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1014,6 +1028,7 @@ export default function Workbench() {
       {/* Left sidebar */}
       <Sidebar
         account={account}
+        realName={realName}
         agents={agents}
         agentsLoading={agentsLoading}
         workspaces={workspaces}
@@ -1100,6 +1115,8 @@ export default function Workbench() {
           onThemeChange={handleThemeChange}
           preferences={preferences}
           onSavePreferences={savePreferences}
+          realName={realName}
+          onSaveRealName={saveRealName}
         />
       )}
 

@@ -21,6 +21,7 @@ export function Accounts() {
 
   const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState('');
+  const [newRealName, setNewRealName] = useState('');
   const [createErr, setCreateErr] = useState<string | null>(null);
 
   const [tokenModal, setTokenModal] = useState<TokenModal | null>(null);
@@ -28,6 +29,10 @@ export function Accounts() {
   const [confirmDisconnect, setConfirmDisconnect] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const [agentsModal, setAgentsModal] = useState<AgentsModalState | null>(null);
+
+  // Inline real-name editing: account name being edited, plus draft value.
+  const [editingRealName, setEditingRealName] = useState<string | null>(null);
+  const [realNameDraft, setRealNameDraft] = useState('');
 
   async function reload() {
     try {
@@ -46,13 +51,34 @@ export function Accounts() {
     setCreateErr(null);
     setPending(true);
     try {
-      const r = await apiClient.accounts.create(newName.trim());
+      const trimmedRealName = newRealName.trim() || undefined;
+      const r = await apiClient.accounts.create(newName.trim(), trimmedRealName);
       setNewName('');
+      setNewRealName('');
       setCreating(false);
       setTokenModal({ name: r.name, token: r.token, mode: 'created' });
       await reload();
     } catch (e: any) {
       setCreateErr(e?.message ?? 'create failed');
+    } finally {
+      setPending(false);
+    }
+  }
+
+  function startEditRealName(account: AccountDto) {
+    setEditingRealName(account.name);
+    setRealNameDraft(account.real_name ?? '');
+  }
+
+  async function saveRealName(accountName: string) {
+    setPending(true);
+    try {
+      const value = realNameDraft.trim() || null;
+      await apiClient.accounts.updateRealName(accountName, value);
+      setEditingRealName(null);
+      await reload();
+    } catch (e: any) {
+      setErr(e?.message ?? 'update real name failed');
     } finally {
       setPending(false);
     }
@@ -185,6 +211,7 @@ export function Accounts() {
             setCreating(true);
             setCreateErr(null);
             setNewName('');
+            setNewRealName('');
           }}
           className="px-3 py-1.5 rounded bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 text-sm hover:opacity-90"
         >
@@ -206,6 +233,7 @@ export function Accounts() {
             <thead className="bg-zinc-50 dark:bg-zinc-900/50 text-xs uppercase tracking-wide text-zinc-500">
               <tr>
                 <th className="px-3 py-2 text-left">Name</th>
+                <th className="px-3 py-2 text-left">Real Name</th>
                 <th className="px-3 py-2 text-left">Token suffix</th>
                 <th className="px-3 py-2 text-left">Status</th>
                 <th className="px-3 py-2 text-left">Online</th>
@@ -219,7 +247,7 @@ export function Accounts() {
             <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800 bg-white dark:bg-zinc-900">
               {accounts.length === 0 ? (
                 <tr>
-                  <td colSpan={9} className="px-3 py-6 text-center text-zinc-500">
+                  <td colSpan={10} className="px-3 py-6 text-center text-zinc-500">
                     No accounts yet. Create one above.
                   </td>
                 </tr>
@@ -227,6 +255,44 @@ export function Accounts() {
                 accounts.map((a) => (
                   <tr key={a.name}>
                     <td className="px-3 py-2 font-mono">{a.name}</td>
+                    <td className="px-3 py-2">
+                      {editingRealName === a.name ? (
+                        <span className="flex items-center gap-1">
+                          <input
+                            autoFocus
+                            value={realNameDraft}
+                            onChange={(e) => setRealNameDraft(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') saveRealName(a.name);
+                              if (e.key === 'Escape') setEditingRealName(null);
+                            }}
+                            placeholder="—"
+                            className="w-28 px-1.5 py-0.5 text-sm rounded border border-zinc-300 dark:border-zinc-700 bg-transparent focus:outline-none focus:ring-2 focus:ring-zinc-400"
+                          />
+                          <button
+                            disabled={pending}
+                            onClick={() => saveRealName(a.name)}
+                            className="text-xs px-1.5 py-0.5 rounded bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:opacity-90 disabled:opacity-50"
+                          >
+                            Save
+                          </button>
+                          <button
+                            onClick={() => setEditingRealName(null)}
+                            className="text-xs px-1.5 py-0.5 rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                          >
+                            Cancel
+                          </button>
+                        </span>
+                      ) : (
+                        <span
+                          onClick={() => startEditRealName(a)}
+                          title="Click to edit real name"
+                          className="cursor-pointer text-zinc-700 dark:text-zinc-300 hover:underline"
+                        >
+                          {a.real_name ?? <span className="text-zinc-400">—</span>}
+                        </span>
+                      )}
+                    </td>
                     <td className="px-3 py-2 font-mono text-zinc-500">
                       …{a.token_prefix ?? <span className="italic">legacy</span>}
                     </td>
@@ -364,6 +430,12 @@ export function Accounts() {
           value={newName}
           onChange={(e) => setNewName(e.target.value)}
           placeholder="alice"
+          className="w-full px-3 py-2 rounded border border-zinc-300 dark:border-zinc-700 bg-transparent text-sm focus:outline-none focus:ring-2 focus:ring-zinc-400"
+        />
+        <input
+          value={newRealName}
+          onChange={(e) => setNewRealName(e.target.value)}
+          placeholder="Real name (optional)"
           className="w-full px-3 py-2 rounded border border-zinc-300 dark:border-zinc-700 bg-transparent text-sm focus:outline-none focus:ring-2 focus:ring-zinc-400"
         />
       </Modal>

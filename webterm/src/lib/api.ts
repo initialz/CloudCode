@@ -46,6 +46,7 @@ export async function api<T = unknown>(path: string, init: RequestInit = {}): Pr
 export type MeDto = {
   account: string;
   hub_version?: string;
+  real_name?: string | null;
 };
 
 export const apiClient = {
@@ -56,6 +57,11 @@ export const apiClient = {
     }),
   logout: () => api<void>('/logout', { method: 'POST' }),
   me: () => api<MeDto>('/me'),
+  updateMe: (data: { real_name?: string | null }) =>
+    api<void>('/me', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
   // Per-user preferences blob (opaque to the hub). `preferences` is
   // `null` if the user has never saved anything; the SPA then falls
   // back to its built-in defaults.

@@ -17,6 +17,8 @@ type Props = {
   onThemeChange?: (t: Theme) => void;
   preferences: Preferences;
   onSavePreferences: (next: Preferences) => void;
+  realName?: string | null;
+  onSaveRealName?: (name: string | null) => void;
 };
 
 export default function SettingsDialog({
@@ -24,8 +26,11 @@ export default function SettingsDialog({
   onThemeChange,
   preferences,
   onSavePreferences,
+  realName,
+  onSaveRealName,
 }: Props) {
   const [theme, setTheme] = useState<Theme>(getStoredTheme);
+  const [nameText, setNameText] = useState(realName ?? '');
   // Local text-input state per tool. We commit (parse + save) on blur
   // rather than on every keystroke so partial typing like "--mod" doesn't
   // round-trip through the server. Initial value pulls from the prop;
@@ -41,6 +46,13 @@ export default function SettingsDialog({
     setTheme(t);
     setStoredTheme(t);
     onThemeChange?.(t);
+  }
+
+  function commitName() {
+    const trimmed = nameText.trim();
+    const next = trimmed || null;
+    if (next === (realName ?? null)) return;
+    onSaveRealName?.(next);
   }
 
   function commitArgs(tool: Tool) {
@@ -63,6 +75,24 @@ export default function SettingsDialog({
         <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100 mb-4">
           Settings
         </h3>
+
+        <div className="mb-5">
+          <label className="block text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-2 uppercase tracking-wide">
+            Real Name
+          </label>
+          <input
+            type="text"
+            spellCheck={false}
+            placeholder="Your display name"
+            value={nameText}
+            onChange={(e) => setNameText(e.target.value)}
+            onBlur={() => commitName()}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') commitName();
+            }}
+            className="w-full px-2 py-1.5 text-sm rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-zinc-400 dark:focus:ring-zinc-500"
+          />
+        </div>
 
         <div className="mb-5">
           <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-2 uppercase tracking-wide">

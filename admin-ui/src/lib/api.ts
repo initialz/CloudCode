@@ -47,6 +47,7 @@ export async function api<T = unknown>(
 
 export type AccountDto = {
   name: string;
+  real_name: string | null;
   token_prefix: string | null;
   created_at: number;
   disabled: boolean;
@@ -106,10 +107,15 @@ export const apiClient = {
     api<HourlyBucket[]>(`/sessions/hourly?hours=${hours}`),
   accounts: {
     list: () => api<AccountDto[]>('/accounts'),
-    create: (name: string) =>
+    create: (name: string, realName?: string) =>
       api<{ name: string; token: string }>('/accounts', {
         method: 'POST',
-        body: JSON.stringify({ name }),
+        body: JSON.stringify({ name, ...(realName ? { real_name: realName } : {}) }),
+      }),
+    updateRealName: (name: string, realName: string | null) =>
+      api<void>(`/accounts/${encodeURIComponent(name)}/real-name`, {
+        method: 'PUT',
+        body: JSON.stringify({ real_name: realName }),
       }),
     rotate: (name: string) =>
       api<{ name: string; token: string }>(`/accounts/${encodeURIComponent(name)}/rotate`, {

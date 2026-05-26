@@ -24,6 +24,7 @@ pub struct Db {
 #[derive(Debug, Clone)]
 pub struct DbAccount {
     pub name: String,
+    pub real_name: Option<String>,
     pub token_hash: String,
     pub token_prefix: Option<String>,
     pub created_at: i64,
@@ -112,6 +113,7 @@ impl Db {
             // column; the next statement swallows that case via
             // the marker check below.
             "ALTER TABLE accounts ADD COLUMN sandbox_enabled INTEGER NOT NULL DEFAULT 1",
+            "ALTER TABLE accounts ADD COLUMN real_name TEXT",
             "CREATE TABLE IF NOT EXISTS audit_events (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts         INTEGER NOT NULL,
@@ -339,7 +341,7 @@ impl Db {
     /// `authenticate()`. `Ok(None)` means no such name.
     pub async fn get_account(&self, name: &str) -> Result<Option<DbAccount>> {
         let row = sqlx::query(
-            "SELECT name, token_hash, token_prefix, created_at, disabled, sandbox_enabled
+            "SELECT name, token_hash, token_prefix, created_at, disabled, sandbox_enabled, real_name
              FROM accounts WHERE name = ?1",
         )
         .bind(name)
@@ -347,6 +349,7 @@ impl Db {
         .await?;
         Ok(row.map(|r| DbAccount {
             name: r.get("name"),
+            real_name: r.get("real_name"),
             token_hash: r.get("token_hash"),
             token_prefix: r.get("token_prefix"),
             created_at: r.get("created_at"),
@@ -357,7 +360,7 @@ impl Db {
 
     pub async fn list_accounts(&self) -> Result<Vec<DbAccount>> {
         let rows = sqlx::query(
-            "SELECT name, token_hash, token_prefix, created_at, disabled, sandbox_enabled
+            "SELECT name, token_hash, token_prefix, created_at, disabled, sandbox_enabled, real_name
              FROM accounts ORDER BY name",
         )
         .fetch_all(&self.pool)
@@ -366,6 +369,7 @@ impl Db {
             .into_iter()
             .map(|r| DbAccount {
                 name: r.get("name"),
+                real_name: r.get("real_name"),
                 token_hash: r.get("token_hash"),
                 token_prefix: r.get("token_prefix"),
                 created_at: r.get("created_at"),
@@ -410,15 +414,17 @@ impl Db {
         name: &str,
         token_hash: &str,
         token_prefix: Option<&str>,
+        real_name: Option<&str>,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO accounts (name, token_hash, token_prefix, created_at, disabled)
-             VALUES (?1, ?2, ?3, ?4, 0)",
+            "INSERT INTO accounts (name, token_hash, token_prefix, created_at, disabled, real_name)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5)",
         )
         .bind(name)
         .bind(token_hash)
         .bind(token_prefix)
         .bind(chrono::Utc::now().timestamp())
+        .bind(real_name)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -456,6 +462,19 @@ impl Db {
     pub async fn set_account_disabled(&self, name: &str, disabled: bool) -> Result<()> {
         let rows = sqlx::query("UPDATE accounts SET disabled = ?1 WHERE name = ?2")
             .bind(if disabled { 1_i64 } else { 0_i64 })
+            .bind(name)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            anyhow::bail!("account '{}' not found", name);
+        }
+        Ok(())
+    }
+
+    pub async fn update_account_real_name(&self, name: &str, real_name: Option<&str>) -> Result<()> {
+        let rows = sqlx::query("UPDATE accounts SET real_name = ?1 WHERE name = ?2")
+            .bind(real_name)
             .bind(name)
             .execute(&self.pool)
             .await?

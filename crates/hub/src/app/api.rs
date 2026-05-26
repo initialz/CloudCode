@@ -117,17 +117,60 @@ pub async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
 }
 
 /// `GET /api/me` — protected by `require_user`. Returns the
-/// current account name and hub build version so the webterm can show
-/// "you're logged in as X" without re-deriving from cookies.
-pub async fn me(Extension(account): Extension<AuthedAccount>) -> Response {
+/// current account name, hub build version, and optional real_name so
+/// the webterm can show "you're logged in as X" without re-deriving
+/// from cookies.
+pub async fn me(
+    State(state): State<Arc<AppState>>,
+    Extension(account): Extension<AuthedAccount>,
+) -> Response {
+    let real_name = state
+        .db
+        .get_account(&account.0)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|a| a.real_name);
     (
         StatusCode::OK,
         Json(json!({
             "account": account.0,
             "hub_version": env!("CARGO_PKG_VERSION"),
+            "real_name": real_name,
         })),
     )
         .into_response()
+}
+
+/// `PUT /api/me` — lets the logged-in user update their own real_name.
+#[derive(Deserialize)]
+pub struct UpdateMeRequest {
+    pub real_name: Option<String>,
+}
+
+pub async fn update_me(
+    State(state): State<Arc<AppState>>,
+    Extension(account): Extension<AuthedAccount>,
+    Json(req): Json<UpdateMeRequest>,
+) -> Response {
+    if let Some(ref rn) = req.real_name {
+        if rn.len() > 128 {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+                "real_name too long (max 128)",
+            );
+        }
+    }
+    if let Err(e) = state
+        .db
+        .update_account_real_name(&account.0, req.real_name.as_deref())
+        .await
+    {
+        tracing::warn!(error = %e, "update_account_real_name failed");
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", "db error");
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// `GET /api/preferences` — return the raw JSON blob the webterm
