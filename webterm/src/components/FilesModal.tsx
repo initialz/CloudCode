@@ -394,7 +394,7 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
       {/* Modal panel */}
       <div
         className="flex flex-col bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl shadow-2xl w-full max-w-5xl mx-4 overflow-hidden"
-        style={{ maxHeight: 'calc(100vh - 4rem)', minHeight: '30rem' }}
+        style={{ maxHeight: 'calc(100vh - 4rem)', minHeight: '36rem' }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
