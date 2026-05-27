@@ -1242,17 +1242,13 @@ impl PtyManager {
                     let _ = std::process::Command::new(&self.tmux.executable)
                         .args(["-L", &format!("cc-{}-{}", account, name), "kill-server"])
                         .output();
-                    // Canonicalize before computing claude's project
-                    // dir; same reasoning as workspace_delete above
-                    // (workspace_root is typically relative in
-                    // agent.toml, the encoded dir under
-                    // ~/.claude/projects/ is keyed on the absolute
-                    // cwd claude sees).
-                    let dir = std::fs::canonicalize(&dir_raw).unwrap_or(dir_raw);
-                    if let Some(home) = dirs::home_dir() {
-                        let claude_proj = crate::jsonl::project_dir(&home, &dir);
-                        let _ = std::fs::remove_dir_all(&claude_proj);
-                    }
+                    // Keep ~/.claude/projects/<encoded-cwd>/ intact so
+                    // claude's conversation history and project memory
+                    // survive the reset. The next --continue will resume
+                    // the most recent session; older jsonl files are
+                    // harmless. workspace_delete still wipes the project
+                    // dir (a deleted workspace should not resurrect its
+                    // chat on recreate).
                     None
                 }
             }
