@@ -20,13 +20,14 @@
 //!   1015 urxvt mouse encoding
 //!   1016 SGR-pixel mouse encoding
 //!
-//! Other private CSI modes (1049 alt-screen, 25 cursor visibility,
-//! 1004 focus tracking, …) pass through untouched.
+//! Also strips alt-screen modes (47, 1047, 1049) so the local
+//! terminal stays in the main screen and its native scrollback
+//! works. Same approach as webterm's escape filter.
 
-/// Mouse-tracking DEC private mode parameters. Only these trigger a
-/// strip; anything else in a `\x1b[?<n>h|l` slot passes through.
-const MOUSE_MODES: &[&[u8]] = &[
+/// DEC private modes to strip. Mouse-tracking family + alt-screen.
+const STRIPPED_MODES: &[&[u8]] = &[
     b"1000", b"1001", b"1002", b"1003", b"1005", b"1006", b"1015", b"1016",
+    b"47", b"1047", b"1049",
 ];
 
 pub struct MouseModeStripper {
@@ -132,7 +133,7 @@ fn decide(buf: &[u8]) -> Decision {
     // this loss doesn't show up; if it ever did we'd rewrite the CSI
     // with the surviving params.
     for chunk in params.split(|&c| c == b';') {
-        if MOUSE_MODES.contains(&chunk) {
+        if STRIPPED_MODES.contains(&chunk) {
             return Decision::Strip;
         }
     }
@@ -168,11 +169,11 @@ mod tests {
     }
 
     #[test]
-    fn keeps_alt_screen_toggle() {
-        // 1049 is alt-screen save/clear — MUST pass through, or alt-
-        // screen TUIs break entirely.
-        assert_eq!(run(&[b"\x1b[?1049h"]), b"\x1b[?1049h");
-        assert_eq!(run(&[b"\x1b[?1049l"]), b"\x1b[?1049l");
+    fn strips_alt_screen_toggle() {
+        assert_eq!(run(&[b"\x1b[?1049h"]), b"");
+        assert_eq!(run(&[b"\x1b[?1049l"]), b"");
+        assert_eq!(run(&[b"\x1b[?47h"]), b"");
+        assert_eq!(run(&[b"\x1b[?1047h"]), b"");
     }
 
     #[test]
