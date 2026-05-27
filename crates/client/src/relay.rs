@@ -61,15 +61,16 @@ pub fn enter_session_mode() -> Result<()> {
     //   [2J       — erase the visible main-screen viewport
     //   [3J       — erase saved scrollback lines (xterm/iTerm/kitty)
     //   ?1000-1016l — reset every X11/SGR mouse-tracking variant
-    //   ?1049h    — switch to alt-screen, save cursor, clear it
-    //   [H        — cursor home in alt-screen
-    //   [2J       — defensive re-clear in case ?1049h didn't
+    //   ?47l etc  — ensure we're NOT in alt-screen (stay in main
+    //               screen so native scrollback works; the filter
+    //               also strips any alt-screen escapes from the
+    //               agent stream)
     let mut stdout = std::io::stdout();
     let _ = stdout.write_all(
-        b"\x1b[H\x1b[2J\x1b[3J\
+        b"\x1b[?1049l\x1b[?1047l\x1b[?47l\
+          \x1b[H\x1b[2J\x1b[3J\
           \x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\
-          \x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\
-          \x1b[?1049h\x1b[H\x1b[2J",
+          \x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l",
     );
     let _ = stdout.flush();
     Ok(())
@@ -84,7 +85,7 @@ pub fn leave_session_mode() {
     // variant so the next program in this iTerm2 tab inherits a
     // clean state.
     let _ = stdout.write_all(
-        b"\x1b[?1049l\x1b[?25h\
+        b"\x1b[?25h\
           \x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\
           \x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\r\n",
     );
