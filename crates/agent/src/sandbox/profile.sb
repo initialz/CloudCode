@@ -48,9 +48,11 @@
 ;; ---------------------------------------------------------------------
 (allow process-fork)
 (allow process-exec)
-;; Only see processes inside this same sandbox. Can't `ps` into host
-;; processes (whose cmdlines / env may leak tokens or absolute paths).
-(allow process-info* (target same-sandbox))
+;; Full process visibility — dev tools (Codex rollout recorder, ps,
+;; Playwright process management) need cross-sandbox process info.
+;; cmdlines of host processes may leak paths but not bearer tokens
+;; (those live in Keychain / env vars, not argv).
+(allow process-info*)
 ;; Signals: own children only.
 (allow signal (target self))
 (allow signal (target children))
@@ -351,10 +353,3 @@
 ;; writes to secrets, shell init, and persistence vectors.
 (allow mach-register)
 
-;; process-info: allow pidinfo / listpids so `ps`, `pgrep`, and
-;; Playwright's own process-management helpers work across the host.
-;; The same-sandbox restriction above covers the common case; these
-;; two verbs are the minimum needed for cross-sandbox process
-;; visibility (e.g. detecting a pre-existing Chrome instance).
-(allow process-info-pidinfo)
-(allow process-info-listpids)
