@@ -1415,7 +1415,7 @@ while :; do
             fi
         fi
         if [ "$do_resume" = "true" ]; then
-            eval "$RESUME_CMD" || "$TOOL_BIN" "$@"
+            eval "$RESUME_CMD" '"$@"' || "$TOOL_BIN" "$@"
         else
             "$TOOL_BIN" "$@"
         fi
