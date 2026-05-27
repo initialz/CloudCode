@@ -120,6 +120,7 @@
 ;; ---------------------------------------------------------------------
 (allow file-write*
     (subpath (string-append (param "HOME_DIR") "/.claude"))
+    (subpath (string-append (param "HOME_DIR") "/.codex"))
     (subpath (string-append (param "HOME_DIR") "/.cache"))
     (subpath (string-append (param "HOME_DIR") "/.npm"))
     (subpath (string-append (param "HOME_DIR") "/.cargo/registry"))
@@ -341,20 +342,14 @@
 (allow sysctl-read)
 
 ;; ---------------------------------------------------------------------
-;; browser automation (Playwright, Puppeteer, etc.)
+;; Mach port registration — open for all dev tools
 ;; ---------------------------------------------------------------------
-;; Chromium / Chrome / Firefox / WebKit multi-process architectures use
-;; Mach port rendezvous for parent↔child IPC. Without mach-register the
-;; browser hits BOOTSTRAP_NOT_PRIVILEGED (1100) in bootstrap_check_in()
-;; and SIGTRAP-crashes before it can open a page.
-;;
-;; Scoped to known browser vendor prefixes — other processes still
-;; can't register arbitrary Mach services.
-(allow mach-register
-    (global-name-regex #"^org\.chromium\.")
-    (global-name-regex #"^com\.google\.Chrome\.")
-    (global-name-regex #"^com\.apple\.WebKit\.")
-    (global-name-regex #"^org\.mozilla\."))
+;; Browser engines (Chromium, Firefox, WebKit) and other dev tools
+;; (Codex, language servers, etc.) use Mach port rendezvous for IPC.
+;; Without mach-register they hit BOOTSTRAP_NOT_PRIVILEGED (1100).
+;; Allowing globally is safe — the sandbox still denies filesystem
+;; writes to secrets, shell init, and persistence vectors.
+(allow mach-register)
 
 ;; process-info: allow pidinfo / listpids so `ps`, `pgrep`, and
 ;; Playwright's own process-management helpers work across the host.
