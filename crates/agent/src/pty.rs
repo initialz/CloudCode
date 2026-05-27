@@ -604,6 +604,65 @@ impl PtyManager {
         // execing tmux (so tmux + claude inherit the sandbox state).
         let session_name = format!("cloudcode-{}-{}", account, workspace);
         let tmux_label = format!("cc-{}-{}", account, workspace);
+
+        // If the tmux session already exists and claude is idle (no
+        // output for >5s), kill the tool process so the wrapper
+        // restarts with `--continue` on reattach — giving the new
+        // client full conversation history instead of a bare viewport.
+        // If claude is busy (actively generating), leave it alone.
+        let session_exists = std::process::Command::new(&self.tmux.executable)
+            .args(["-L", &tmux_label, "has-session", "-t", &session_name])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if session_exists {
+            let activity = std::process::Command::new(&self.tmux.executable)
+                .args([
+                    "-L", &tmux_label, "display-message", "-t", &session_name,
+                    "-p", "#{pane_last_activity}",
+                ])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+            let now = chrono::Utc::now().timestamp();
+            let idle_secs = now - activity;
+
+            if idle_secs > 5 {
+                tracing::info!(
+                    session = %session_name,
+                    idle_secs,
+                    "claude idle on reattach; killing tool for --continue restart"
+                );
+                let pane_pid = std::process::Command::new(&self.tmux.executable)
+                    .args([
+                        "-L", &tmux_label, "list-panes", "-t", &session_name,
+                        "-F", "#{pane_pid}",
+                    ])
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
+                    .and_then(|s| s.parse::<i32>().ok());
+                if let Some(pid) = pane_pid {
+                    let _ = std::process::Command::new("pkill")
+                        .args(["-TERM", "-P", &pid.to_string()])
+                        .status();
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            } else {
+                tracing::info!(
+                    session = %session_name,
+                    idle_secs,
+                    "claude busy on reattach; attaching to live session"
+                );
+            }
+        }
+
         // Sandbox mode selection:
         //   sandbox = true  → strict profile  (full per-workspace
         //                     secrets/persistence hardening)
