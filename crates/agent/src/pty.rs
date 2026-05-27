@@ -605,11 +605,18 @@ impl PtyManager {
         let session_name = format!("cloudcode-{}-{}", account, workspace);
         let tmux_label = format!("cc-{}-{}", account, workspace);
 
-        // If the tmux session already exists and claude is idle (no
-        // output for >5s), kill the tool process so the wrapper
-        // restarts with `--continue` on reattach — giving the new
-        // client full conversation history instead of a bare viewport.
-        // If claude is busy (actively generating), leave it alone.
+        let home_for_idle = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        let claude_proj_dir = crate::jsonl::project_dir(&home_for_idle, &cwd);
+
+        // If the tmux session already exists, check whether claude is
+        // idle (finished its turn) or busy (thinking / tool-calling).
+        // Idle: kill the tool so the wrapper restarts with --continue,
+        // giving the new client full conversation history.
+        // Busy: attach to the live session without interrupting.
+        //
+        // Detection: read the last assistant entry in the most recent
+        // jsonl under CLOUDCODE_CLAUDE_PROJECT_DIR. If its stop_reason
+        // is "end_turn", claude has finished and is waiting for input.
         let session_exists = std::process::Command::new(&self.tmux.executable)
             .args(["-L", &tmux_label, "has-session", "-t", &session_name])
             .stdout(std::process::Stdio::null())
@@ -619,24 +626,11 @@ impl PtyManager {
             .unwrap_or(false);
 
         if session_exists {
-            let activity = std::process::Command::new(&self.tmux.executable)
-                .args([
-                    "-L", &tmux_label, "display-message", "-t", &session_name,
-                    "-p", "#{pane_last_activity}",
-                ])
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .and_then(|s| s.trim().parse::<i64>().ok())
-                .unwrap_or(0);
-            let now = chrono::Utc::now().timestamp();
-            let idle_secs = now - activity;
-
-            if idle_secs > 60 {
+            let claude_idle = is_claude_idle(&claude_proj_dir);
+            if claude_idle {
                 tracing::info!(
                     session = %session_name,
-                    idle_secs,
-                    "claude idle on reattach; killing tool for --continue restart"
+                    "claude idle (end_turn) on reattach; killing tool for --continue restart"
                 );
                 let pane_pid = std::process::Command::new(&self.tmux.executable)
                     .args([
@@ -657,7 +651,6 @@ impl PtyManager {
             } else {
                 tracing::info!(
                     session = %session_name,
-                    idle_secs,
                     "claude busy on reattach; attaching to live session"
                 );
             }
@@ -1686,4 +1679,70 @@ mod tests {
             assert!(validate_name(&n, "workspace").is_err(), "expected reject: {:?}", n);
         }
     }
+}
+
+/// Check whether claude is idle by reading the most recent jsonl file
+/// in the project dir. Returns true if the last `assistant` entry has
+/// `stop_reason: "end_turn"` — meaning claude finished its response and
+/// is waiting for user input. Returns false (assume busy) on any error
+/// or if the last assistant message has a different stop_reason
+/// (e.g. "tool_use" means claude is mid-chain).
+fn is_claude_idle(claude_proj_dir: &Path) -> bool {
+    use std::io::{BufRead, Seek, SeekFrom};
+
+    let newest = match std::fs::read_dir(claude_proj_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    == Some("jsonl")
+            })
+            .max_by_key(|e| e.metadata().ok().and_then(|m| m.modified().ok())),
+        Err(_) => return false,
+    };
+    let Some(entry) = newest else { return false };
+
+    let file = match std::fs::File::open(entry.path()) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+
+    // Read the tail of the file (last 64KB is enough for several entries).
+    let meta = match file.metadata() {
+        Ok(m) => m,
+        Err(_) => return false,
+    };
+    let tail_start = if meta.len() > 65536 { meta.len() - 65536 } else { 0 };
+    let mut reader = std::io::BufReader::new(file);
+    if reader.seek(SeekFrom::Start(tail_start)).is_err() {
+        return false;
+    }
+    if tail_start > 0 {
+        // Skip partial first line after seeking.
+        let mut discard = String::new();
+        let _ = reader.read_line(&mut discard);
+    }
+
+    let mut last_stop_reason: Option<String> = None;
+    for line in reader.lines() {
+        let Ok(line) = line else { continue };
+        if line.is_empty() { continue; }
+        // Quick pre-filter: only parse lines that look like assistant entries.
+        if !line.contains("\"assistant\"") { continue; }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            if v.get("type").and_then(|t| t.as_str()) == Some("assistant") {
+                if let Some(stop) = v
+                    .get("message")
+                    .and_then(|m| m.get("stop_reason"))
+                    .and_then(|s| s.as_str())
+                {
+                    last_stop_reason = Some(stop.to_string());
+                }
+            }
+        }
+    }
+
+    last_stop_reason.as_deref() == Some("end_turn")
 }
