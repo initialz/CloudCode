@@ -632,7 +632,7 @@ impl PtyManager {
             let now = chrono::Utc::now().timestamp();
             let idle_secs = now - activity;
 
-            if idle_secs > 5 {
+            if idle_secs > 60 {
                 tracing::info!(
                     session = %session_name,
                     idle_secs,
