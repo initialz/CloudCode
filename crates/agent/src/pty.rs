@@ -136,7 +136,7 @@ impl PtyManager {
                 let conf = format!(
                     "set -g mouse off\n\
                      set-window-option -g alternate-screen off\n\
-                     set -g terminal-overrides 'xterm*:smcup@:rmcup@'\n\
+                     set -g terminal-overrides '*:smcup@:rmcup@'\n\
                      set -g history-limit 50000\n\
                      set -g set-clipboard on\n\
                      set -as terminal-features ',*:clipboard'\n\
