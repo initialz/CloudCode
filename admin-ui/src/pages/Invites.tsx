@@ -243,20 +243,14 @@ export function Invites() {
                     inv.max_uses === 0 ? '∞' : String(inv.max_uses);
                   return (
                     <tr key={inv.id}>
-                      <td className="px-3 py-2">
-                        <button
-                          onClick={() => openAcceptances(inv)}
-                          className="text-left hover:underline text-zinc-700 dark:text-zinc-200"
-                          title="Show accepted accounts"
-                        >
-                          {inv.label ? (
-                            inv.label
-                          ) : (
-                            <span className="text-zinc-400 italic">
-                              (unnamed)
-                            </span>
-                          )}
-                        </button>
+                      <td className="px-3 py-2 text-zinc-700 dark:text-zinc-200">
+                        {inv.label ? (
+                          inv.label
+                        ) : (
+                          <span className="text-zinc-400 italic">
+                            (unnamed)
+                          </span>
+                        )}
                       </td>
                       <td className="px-3 py-2">
                         <button
@@ -321,6 +315,13 @@ export function Invites() {
                           className="px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
                         >
                           {copiedId === inv.id ? '✓ Copied' : 'Copy link'}
+                        </button>
+                        <button
+                          disabled={pending}
+                          onClick={() => onToggleActive(inv)}
+                          className="px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-50"
+                        >
+                          {inv.active ? 'Disable' : 'Enable'}
                         </button>
                         <button
                           disabled={pending}
