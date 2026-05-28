@@ -1,7 +1,7 @@
 // File-manager modal: browse and download files from an agent workspace.
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import { listFiles, downloadFileUrl, archiveUrl, uploadFiles, deleteFiles, type FsEntry, type UploadResult } from '@/lib/api';
+import { listFiles, downloadFileUrl, archiveUrl, uploadFiles, deleteFiles, type FsEntry, type UploadResult, type UploadItem } from '@/lib/api';
 
 // ── Formatting helpers ───────────────────────────────────────────────────────
 
@@ -48,22 +48,70 @@ function breadcrumbs(path: string): { label: string; path: string }[] {
   }));
 }
 
-/** Rename conflicting files with a numeric suffix: foo.txt → foo (1).txt */
-function renameConflicts(all: File[], conflicts: File[]): File[] {
-  const conflictNames = new Set(conflicts.map(f => f.name));
-  return all.map(f => {
-    if (!conflictNames.has(f.name)) return f;
-    const dot = f.name.lastIndexOf('.');
-    const base = dot > 0 ? f.name.slice(0, dot) : f.name;
-    const ext = dot > 0 ? f.name.slice(dot) : '';
+/** First segment of a relative path: "a/b/c" → "a", "a.txt" → "a.txt" */
+function topLevelName(relPath: string): string {
+  const i = relPath.indexOf('/');
+  return i < 0 ? relPath : relPath.slice(0, i);
+}
+
+/** Rename conflicting uploads. For files: foo.txt → foo (1).txt.
+ *  For folders: bar/* → bar (1)/* (renames every file under the folder). */
+function renameConflicts(all: UploadItem[], conflictTops: Set<string>): UploadItem[] {
+  const renameMap = new Map<string, string>();
+  const used = new Set(conflictTops);
+  for (const top of conflictTops) {
+    const dot = top.lastIndexOf('.');
+    const base = dot > 0 ? top.slice(0, dot) : top;
+    const ext = dot > 0 ? top.slice(dot) : '';
     let n = 1;
-    let newName: string;
+    let next: string;
     do {
-      newName = `${base} (${n})${ext}`;
+      next = `${base} (${n})${ext}`;
       n++;
-    } while (conflictNames.has(newName));
-    return new File([f], newName, { type: f.type, lastModified: f.lastModified });
+    } while (used.has(next));
+    used.add(next);
+    renameMap.set(top, next);
+  }
+  return all.map(item => {
+    const top = topLevelName(item.relativePath);
+    const newTop = renameMap.get(top);
+    if (!newTop) return item;
+    const newPath = newTop + item.relativePath.slice(top.length);
+    return { file: item.file, relativePath: newPath };
   });
+}
+
+/** Recursively traverse a DataTransferItemList for drag&drop, collecting
+ *  all files (including those inside dropped directories) with relative
+ *  paths. Uses webkitGetAsEntry which is supported in all modern browsers. */
+async function collectDroppedFiles(items: DataTransferItemList): Promise<UploadItem[]> {
+  const entries: FileSystemEntry[] = [];
+  for (let i = 0; i < items.length; i++) {
+    const e = items[i].webkitGetAsEntry?.();
+    if (e) entries.push(e);
+  }
+  const out: UploadItem[] = [];
+  await Promise.all(entries.map(e => walkEntry(e, '', out)));
+  return out;
+}
+
+async function walkEntry(entry: FileSystemEntry, prefix: string, out: UploadItem[]): Promise<void> {
+  if (entry.isFile) {
+    const file = await new Promise<File>((resolve, reject) => {
+      (entry as FileSystemFileEntry).file(resolve, reject);
+    });
+    out.push({ file, relativePath: prefix + entry.name });
+  } else if (entry.isDirectory) {
+    const reader = (entry as FileSystemDirectoryEntry).createReader();
+    // readEntries returns at most ~100 entries per call; loop until empty.
+    while (true) {
+      const batch = await new Promise<FileSystemEntry[]>((resolve, reject) => {
+        reader.readEntries(resolve, reject);
+      });
+      if (batch.length === 0) break;
+      await Promise.all(batch.map(e => walkEntry(e, prefix + entry.name + '/', out)));
+    }
+  }
 }
 
 // ── Icons ────────────────────────────────────────────────────────────────────
@@ -194,10 +242,11 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const abortRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
 
   // Upload state
   type UploadState = {
-    files: File[];
+    items: UploadItem[];
     loaded: number;
     total: number;
     status: 'uploading' | 'done' | 'error';
@@ -207,8 +256,9 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
   const [upload, setUpload] = useState<UploadState | null>(null);
   const [dragOver, setDragOver] = useState(false);
 
-  // Conflict detection state
-  type ConflictState = { all: File[]; conflicts: File[] };
+  // Conflict detection state — conflicts are top-level names
+  // (filenames or folder names) that collide with existing entries.
+  type ConflictState = { all: UploadItem[]; conflictTops: Set<string> };
   const [conflictFiles, setConflictFiles] = useState<ConflictState | null>(null);
 
   // Delete confirmation state
@@ -335,25 +385,31 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
     triggerArchiveDownload(fullPaths);
   }
 
-  function handleUpload(files: File[]) {
-    if (load.status !== 'ok') return;
+  function handleUpload(items: UploadItem[]) {
+    if (load.status !== 'ok' || items.length === 0) return;
 
     const existingNames = new Set(load.entries.map(e => e.name));
-    const conflicts = files.filter(f => existingNames.has(f.name));
+    // Collide on the top-level name (file name for plain uploads,
+    // folder name for directory uploads).
+    const topNames = new Set(items.map(i => topLevelName(i.relativePath)));
+    const conflictTops = new Set<string>();
+    for (const t of topNames) {
+      if (existingNames.has(t)) conflictTops.add(t);
+    }
 
-    if (conflicts.length > 0) {
-      setConflictFiles({ all: files, conflicts });
+    if (conflictTops.size > 0) {
+      setConflictFiles({ all: items, conflictTops });
       return;
     }
 
-    startUpload(files);
+    startUpload(items);
   }
 
-  function startUpload(files: File[]) {
-    const total = files.reduce((sum, f) => sum + f.size, 0);
-    setUpload({ files, loaded: 0, total, status: 'uploading' });
+  function startUpload(items: UploadItem[]) {
+    const total = items.reduce((sum, i) => sum + i.file.size, 0);
+    setUpload({ items, loaded: 0, total, status: 'uploading' });
 
-    const { promise } = uploadFiles(agent, workspace, path, files, (loaded, t) => {
+    const { promise } = uploadFiles(agent, workspace, path, items, (loaded, t) => {
       setUpload(prev => prev ? { ...prev, loaded, total: t } : prev);
     });
 
@@ -607,13 +663,23 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
           onDrop={(e) => {
             e.preventDefault();
             setDragOver(false);
-            if (e.dataTransfer.files.length) handleUpload(Array.from(e.dataTransfer.files));
+            const items = e.dataTransfer.items;
+            if (items && items.length > 0) {
+              collectDroppedFiles(items).then((collected) => {
+                if (collected.length > 0) handleUpload(collected);
+              });
+            } else if (e.dataTransfer.files.length) {
+              // Fallback if items is unavailable.
+              handleUpload(
+                Array.from(e.dataTransfer.files).map(f => ({ file: f, relativePath: f.name }))
+              );
+            }
           }}
         >
           {/* Drag overlay */}
           {dragOver && (
             <div className="absolute inset-0 z-10 flex items-center justify-center bg-blue-50/80 dark:bg-blue-950/60 border-2 border-dashed border-blue-400 dark:border-blue-600 rounded-lg pointer-events-none">
-              <span className="text-sm font-medium text-blue-600 dark:text-blue-400">Drop files to upload</span>
+              <span className="text-sm font-medium text-blue-600 dark:text-blue-400">Drop files or folders to upload</span>
             </div>
           )}
 
@@ -622,10 +688,10 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
             <div className="absolute inset-0 z-20 flex items-center justify-center bg-black/30">
               <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-lg shadow-xl p-4 max-w-sm mx-4 text-sm">
                 <p className="font-medium text-zinc-800 dark:text-zinc-200 mb-2">
-                  {conflictFiles.conflicts.length} file{conflictFiles.conflicts.length > 1 ? 's' : ''} already exist{conflictFiles.conflicts.length === 1 ? 's' : ''}:
+                  {conflictFiles.conflictTops.size} item{conflictFiles.conflictTops.size > 1 ? 's' : ''} already exist{conflictFiles.conflictTops.size === 1 ? 's' : ''}:
                 </p>
                 <ul className="text-xs text-zinc-600 dark:text-zinc-400 mb-3 max-h-32 overflow-y-auto font-mono">
-                  {conflictFiles.conflicts.map(f => <li key={f.name}>{f.name}</li>)}
+                  {Array.from(conflictFiles.conflictTops).map(t => <li key={t}>{t}</li>)}
                 </ul>
                 <div className="flex gap-2 justify-end">
                   <button onClick={() => setConflictFiles(null)}
@@ -633,7 +699,7 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
                     Skip
                   </button>
                   <button onClick={() => {
-                    const renamed = renameConflicts(conflictFiles.all, conflictFiles.conflicts);
+                    const renamed = renameConflicts(conflictFiles.all, conflictFiles.conflictTops);
                     setConflictFiles(null);
                     startUpload(renamed);
                   }}
@@ -727,14 +793,40 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
           </div>
         )}
 
-        {/* Hidden file input */}
+        {/* Hidden file input — multi-file picker */}
         <input
           ref={fileInputRef}
           type="file"
           multiple
           className="hidden"
           onChange={(e) => {
-            if (e.target.files?.length) handleUpload(Array.from(e.target.files));
+            if (e.target.files?.length) {
+              handleUpload(
+                Array.from(e.target.files).map(f => ({ file: f, relativePath: f.name }))
+              );
+            }
+            e.target.value = '';
+          }}
+        />
+
+        {/* Hidden folder input — directory picker (webkitdirectory) */}
+        <input
+          ref={folderInputRef}
+          type="file"
+          // @ts-expect-error: webkitdirectory is non-standard but supported in all major browsers
+          webkitdirectory=""
+          // eslint-disable-next-line react/no-unknown-property
+          directory=""
+          className="hidden"
+          onChange={(e) => {
+            if (e.target.files?.length) {
+              handleUpload(
+                Array.from(e.target.files).map(f => ({
+                  file: f,
+                  relativePath: f.webkitRelativePath || f.name,
+                }))
+              );
+            }
             e.target.value = '';
           }}
         />
@@ -774,9 +866,19 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
                 type="button"
                 onClick={() => fileInputRef.current?.click()}
                 className="flex items-center gap-1 text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 transition-colors"
+                title="Upload files"
               >
                 <UploadIcon />
-                Upload
+                Files
+              </button>
+              <button
+                type="button"
+                onClick={() => folderInputRef.current?.click()}
+                className="flex items-center gap-1 text-zinc-500 dark:text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 transition-colors"
+                title="Upload folder"
+              >
+                <UploadIcon />
+                Folder
               </button>
               {selectionMode && (
                 <>

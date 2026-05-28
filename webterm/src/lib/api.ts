@@ -170,18 +170,22 @@ export type UploadResult = {
   error: string | null;
 };
 
+export type UploadItem = { file: File; relativePath: string };
+
 export function uploadFiles(
   agent: string,
   workspace: string,
   path: string,
-  files: File[],
+  files: UploadItem[],
   onProgress?: (loaded: number, total: number) => void,
 ): { promise: Promise<UploadResult[]>; abort: () => void } {
   const xhr = new XMLHttpRequest();
   const promise = new Promise<UploadResult[]>((resolve, reject) => {
     const formData = new FormData();
-    for (const f of files) {
-      formData.append('file', f);
+    for (const item of files) {
+      // Third arg overrides the filename in multipart Content-Disposition,
+      // so the server sees the relative path (e.g. "src/main.rs").
+      formData.append('file', item.file, item.relativePath);
     }
     const qs = new URLSearchParams({ agent, workspace, path });
     xhr.open('POST', `/api/files/upload?${qs.toString()}`);
