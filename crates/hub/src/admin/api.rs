@@ -2483,6 +2483,228 @@ pub async fn stats_tokens_daily(
     Json(out).into_response()
 }
 
+// ---------------------------------------------------------------------
+// Invite links
+// ---------------------------------------------------------------------
+//
+// Admin-issued shareable URLs that mint a brand-new account on
+// accept. The token lives in the public URL (`/invite/<token>`),
+// the short `id` is the admin-side handle. `share_url` is derived
+// from the Host header so the same hub serves correct URLs across
+// dev / prod without a config knob.
+
+const ADMIN_USERNAME_AS_CREATOR: &str = "admin";
+
+#[derive(Serialize)]
+struct InviteDto {
+    id: String,
+    label: Option<String>,
+    token: String,
+    share_url: String,
+    max_uses: i64,
+    used: i64,
+    allowed_agents: Vec<String>,
+    active: bool,
+    created_at: i64,
+}
+
+/// Build a `https://<host>/invite/<token>` URL from the request's
+/// Host header. Honours `X-Forwarded-Proto` when set by an upstream
+/// proxy so behind-the-LB hubs still produce `https://` links;
+/// falls back to `https://` otherwise (overwhelmingly the right
+/// guess for a publicly-shared invite link).
+fn build_share_url(headers: &HeaderMap, token: &str) -> String {
+    let host = headers
+        .get("host")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            // Some proxies forward a comma-separated list; first
+            // hop is the closest to the client.
+            s.split(',').next().unwrap_or(s).trim().to_string()
+        })
+        .filter(|s| s == "http" || s == "https")
+        .unwrap_or_else(|| "https".to_string());
+    format!("{scheme}://{host}/invite/{token}")
+}
+
+pub async fn invites_list(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Response {
+    let rows = match state.app.db.list_invites().await {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+    let dto: Vec<InviteDto> = rows
+        .into_iter()
+        .map(|r| {
+            let share_url = build_share_url(&headers, &r.token);
+            InviteDto {
+                id: r.id,
+                label: r.label,
+                token: r.token,
+                share_url,
+                max_uses: r.max_uses,
+                used: r.used,
+                allowed_agents: r.allowed_agents,
+                active: r.active,
+                created_at: r.created_at,
+            }
+        })
+        .collect();
+    Json(dto).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CreateInviteRequest {
+    #[serde(default)]
+    pub label: Option<String>,
+    /// 0 (or omitted) means unlimited uses.
+    #[serde(default)]
+    pub max_uses: Option<i64>,
+    /// Agent names the new account is whitelisted for on accept.
+    /// Empty means the user can log in but can't reach any agent
+    /// until an admin grants access — fine for soft-onboarding.
+    pub allowed_agents: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct CreateInviteResponse {
+    id: String,
+    token: String,
+    share_url: String,
+}
+
+pub async fn invites_create(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateInviteRequest>,
+) -> Response {
+    let max_uses = req.max_uses.unwrap_or(0);
+    if max_uses < 0 {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "max_uses must be 0 (unlimited) or a positive integer",
+        );
+    }
+    let label = norm(&req.label);
+    // De-dup + trim agent list. Empty entries get filtered out so
+    // a stray comma in the UI form doesn't produce a phantom
+    // "" agent name down the line.
+    let mut agents: Vec<String> = req
+        .allowed_agents
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    agents.sort();
+    agents.dedup();
+
+    let id = auth::generate_invite_id();
+    let token = auth::generate_invite_token();
+    if let Err(e) = state
+        .app
+        .db
+        .insert_invite(
+            &id,
+            label.as_deref(),
+            &token,
+            max_uses,
+            &agents,
+            ADMIN_USERNAME_AS_CREATOR,
+        )
+        .await
+    {
+        return internal(e);
+    }
+    let share_url = build_share_url(&headers, &token);
+    (
+        StatusCode::CREATED,
+        Json(CreateInviteResponse {
+            id,
+            token,
+            share_url,
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct PatchInviteRequest {
+    pub active: bool,
+}
+
+pub async fn invites_patch(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+    Json(req): Json<PatchInviteRequest>,
+) -> Response {
+    if let Err(e) = state.app.db.update_invite_active(&id, req.active).await {
+        return err(StatusCode::NOT_FOUND, "not_found", e.to_string());
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+pub async fn invites_delete(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(e) = state.app.db.delete_invite(&id).await {
+        return err(StatusCode::NOT_FOUND, "not_found", e.to_string());
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+#[derive(Serialize)]
+struct InviteAcceptanceDto {
+    account: String,
+    accepted_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    real_name: Option<String>,
+}
+
+pub async fn invites_acceptances(
+    State(state): State<AdminState>,
+    Path(id): Path<String>,
+) -> Response {
+    // Confirm the invite still exists so a 404 means "no such invite"
+    // and not "the invite has zero acceptances". Note acceptances
+    // rows survive invite deletion on purpose — but the admin
+    // browses them via the parent invite; if it's gone there's no
+    // entry point anyway.
+    match state.app.db.get_invite(&id).await {
+        Ok(Some(_)) => {}
+        Ok(None) => return err(StatusCode::NOT_FOUND, "not_found", "invite not found"),
+        Err(e) => return internal(e),
+    }
+    let rows = match state.app.db.list_invite_acceptances(&id).await {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+    let mut dto: Vec<InviteAcceptanceDto> = Vec::with_capacity(rows.len());
+    for (account, accepted_at) in rows {
+        let real_name = state
+            .app
+            .db
+            .get_account(&account)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|a| a.real_name);
+        dto.push(InviteAcceptanceDto {
+            account,
+            accepted_at,
+            real_name,
+        });
+    }
+    Json(dto).into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

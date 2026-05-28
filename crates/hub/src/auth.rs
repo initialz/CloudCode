@@ -16,6 +16,29 @@ pub fn generate_admin_token() -> String {
     generate_token_with_prefix("ad_")
 }
 
+/// Token used as the secret in invite-link URLs (e.g.
+/// `https://host/invite/inv_<hex>`). Same entropy as account tokens
+/// (24 random bytes hex-encoded); only the prefix differs so an
+/// invite token is distinguishable from a regular account token
+/// at a glance in logs / DB rows.
+pub fn generate_invite_token() -> String {
+    generate_token_with_prefix("inv_")
+}
+
+/// Short random hex id used as the primary key of `invite_links`.
+/// 16 hex chars (8 random bytes) — collision-resistant enough for
+/// the realistic invite-row count, short enough for nice admin
+/// URLs (`/admin/api/invites/<id>`).
+pub fn generate_invite_id() -> String {
+    let mut bytes = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let mut s = String::with_capacity(16);
+    for b in &bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
 pub fn generate_session_id() -> String {
     let mut bytes = [0u8; 18];
     rand::thread_rng().fill_bytes(&mut bytes);

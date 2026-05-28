@@ -161,6 +161,24 @@ pub fn router(state: AdminState) -> Router {
                 .put(api::account_allowed_agents_set)
                 .route_layer(gate.clone()),
         )
+        // -- invite links (admin issues shareable URLs that mint
+        // brand-new accounts on accept; see api.rs) --
+        .route(
+            "/admin/api/invites",
+            get(api::invites_list)
+                .post(api::invites_create)
+                .route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/api/invites/:id",
+            axum::routing::patch(api::invites_patch)
+                .delete(api::invites_delete)
+                .route_layer(gate.clone()),
+        )
+        .route(
+            "/admin/api/invites/:id/acceptances",
+            get(api::invites_acceptances).route_layer(gate.clone()),
+        )
         .route(
             "/admin/api/agents",
             get(api::agents_list).route_layer(gate.clone()),

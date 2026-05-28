@@ -74,6 +74,34 @@ export const apiClient = {
     }),
 };
 
+// ── Invite API ───────────────────────────────────────────────────────────────
+
+export type InviteInfo =
+  | { valid: true; max_uses: number; used: number; allowed_agents: string[] }
+  | { valid: false; reason: string };
+
+export async function getInviteInfo(token: string): Promise<InviteInfo> {
+  const res = await fetch(`/api/invite/${encodeURIComponent(token)}/info`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function acceptInvite(
+  token: string,
+  username: string,
+): Promise<{ account: string; token: string }> {
+  const res = await fetch(`/api/invite/${encodeURIComponent(token)}/accept`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ username }),
+  });
+  const body = await res.json();
+  if (!res.ok) {
+    throw new Error(body.message || `HTTP ${res.status}`);
+  }
+  return body;
+}
+
 // ── File manager API ─────────────────────────────────────────────────────────
 
 export type FsEntry = {

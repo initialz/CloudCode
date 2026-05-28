@@ -81,6 +81,25 @@ export type SessionDto = {
   ended_reason: string | null;
 };
 
+export type InviteDto = {
+  id: string;
+  label: string | null;
+  token: string;
+  share_url: string;
+  /// 0 = unlimited
+  max_uses: number;
+  used: number;
+  allowed_agents: string[];
+  active: boolean;
+  created_at: number;
+};
+
+export type InviteAcceptanceDto = {
+  account: string;
+  accepted_at: number;
+  real_name?: string | null;
+};
+
 export type AuditEventDto = {
   id: number;
   ts: number;
@@ -140,6 +159,25 @@ export const apiClient = {
         method: 'PUT',
         body: JSON.stringify({ agents }),
       }),
+  },
+  invites: {
+    list: () => api<InviteDto[]>('/invites'),
+    create: (body: { label?: string; max_uses?: number; allowed_agents: string[] }) =>
+      api<{ id: string; token: string; share_url: string }>('/invites', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    setActive: (id: string, active: boolean) =>
+      api<void>(`/invites/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ active }),
+      }),
+    delete: (id: string) =>
+      api<void>(`/invites/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    acceptances: (id: string) =>
+      api<InviteAcceptanceDto[]>(
+        `/invites/${encodeURIComponent(id)}/acceptances`,
+      ),
   },
   agents: {
     list: () => api<AgentRowDto[]>('/agents'),

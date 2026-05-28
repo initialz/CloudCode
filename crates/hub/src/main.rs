@@ -196,6 +196,13 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     let app_router = Router::new()
         .route("/api/login", post(app::api::login))
         .route("/api/logout", post(app::api::logout))
+        // Public invite endpoints — deliberately NOT under user_gate
+        // since invitees don't have an account yet. The token in the
+        // path is the auth: anyone with the URL can read the info /
+        // accept the invite, that's the whole point of a shareable
+        // link.
+        .route("/api/invite/:token/info", get(app::api::invite_info))
+        .route("/api/invite/:token/accept", post(app::api::invite_accept))
         .route(
             "/api/me",
             get(app::api::me)
