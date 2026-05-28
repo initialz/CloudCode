@@ -277,7 +277,19 @@ export function Invites() {
                         </button>
                       </td>
                       <td className="px-3 py-2 font-mono text-zinc-700 dark:text-zinc-300">
-                        {inv.used} / {limitLabel}
+                        {inv.used > 0 ? (
+                          <button
+                            type="button"
+                            onClick={() => openAcceptances(inv)}
+                            className="text-blue-600 dark:text-blue-400 hover:underline"
+                            title="View accepted accounts"
+                          >
+                            {inv.used}
+                          </button>
+                        ) : (
+                          inv.used
+                        )}
+                        {' / '}{limitLabel}
                       </td>
                       <td className="px-3 py-2">
                         {inv.allowed_agents.length === 0 ? (
