@@ -2669,6 +2669,10 @@ pub struct PatchInviteRequest {
     /// Omitting the field leaves it unchanged.
     #[serde(default)]
     pub label: Option<String>,
+    #[serde(default)]
+    pub allowed_agents: Option<Vec<String>>,
+    #[serde(default)]
+    pub sandbox_mode: Option<String>,
 }
 
 pub async fn invites_patch(
@@ -2697,6 +2701,30 @@ pub async fn invites_patch(
         let trimmed = label.trim();
         let to_set = if trimmed.is_empty() { None } else { Some(trimmed) };
         if let Err(e) = state.app.db.update_invite_label(&id, to_set).await {
+            return err(StatusCode::NOT_FOUND, "not_found", e.to_string());
+        }
+    }
+    if let Some(agents) = req.allowed_agents {
+        let mut cleaned: Vec<String> = agents
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        cleaned.sort();
+        cleaned.dedup();
+        if let Err(e) = state.app.db.update_invite_allowed_agents(&id, &cleaned).await {
+            return err(StatusCode::NOT_FOUND, "not_found", e.to_string());
+        }
+    }
+    if let Some(mode) = req.sandbox_mode {
+        if !matches!(mode.as_str(), "strict" | "permissive" | "off") {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+                "sandbox_mode must be one of: strict, permissive, off",
+            );
+        }
+        if let Err(e) = state.app.db.update_invite_sandbox_mode(&id, &mode).await {
             return err(StatusCode::NOT_FOUND, "not_found", e.to_string());
         }
     }

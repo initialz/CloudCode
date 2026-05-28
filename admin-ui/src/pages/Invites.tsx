@@ -51,13 +51,13 @@ export function Invites() {
   // Confirm delete
   const [confirmDelete, setConfirmDelete] = useState<InviteDto | null>(null);
 
-  // Inline edit for max_uses
-  const [editingMaxId, setEditingMaxId] = useState<string | null>(null);
-  const [editingMaxValue, setEditingMaxValue] = useState('');
-
-  // Inline edit for label
-  const [editingLabelId, setEditingLabelId] = useState<string | null>(null);
-  const [editingLabelValue, setEditingLabelValue] = useState('');
+  // Edit modal (label / max_uses / sandbox_mode / allowed_agents)
+  const [editing, setEditing] = useState<InviteDto | null>(null);
+  const [editLabel, setEditLabel] = useState('');
+  const [editMaxUses, setEditMaxUses] = useState('0');
+  const [editAgents, setEditAgents] = useState<Set<string>>(new Set());
+  const [editSandboxMode, setEditSandboxMode] = useState<'strict' | 'permissive' | 'off'>('strict');
+  const [editErr, setEditErr] = useState<string | null>(null);
 
   // Acceptances modal
   const [acceptancesModal, setAcceptancesModal] =
@@ -150,59 +150,45 @@ export function Invites() {
     }
   }
 
-  function beginEditMax(inv: InviteDto) {
-    setEditingMaxId(inv.id);
-    setEditingMaxValue(String(inv.max_uses));
+  function openEdit(inv: InviteDto) {
+    setEditing(inv);
+    setEditLabel(inv.label ?? '');
+    setEditMaxUses(String(inv.max_uses));
+    setEditAgents(new Set(inv.allowed_agents));
+    setEditSandboxMode(inv.sandbox_mode);
+    setEditErr(null);
+    setAgentsPool(null);
+    loadAgents();
   }
-  function cancelEditMax() {
-    setEditingMaxId(null);
-    setEditingMaxValue('');
+  function toggleEditAgent(name: string) {
+    setEditAgents((cur) => {
+      const next = new Set(cur);
+      if (next.has(name)) next.delete(name);
+      else next.add(name);
+      return next;
+    });
   }
-  async function commitEditMax(inv: InviteDto) {
-    const n = Number(editingMaxValue.trim());
-    if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) {
-      setErr('max uses must be a non-negative integer (0 = unlimited)');
-      cancelEditMax();
-      return;
-    }
-    if (n === inv.max_uses) {
-      cancelEditMax();
-      return;
-    }
-    setPending(true);
-    try {
-      await apiClient.invites.setMaxUses(inv.id, n);
-      await reload();
-    } catch (e: any) {
-      setErr(e?.message ?? 'update failed');
-    } finally {
-      cancelEditMax();
-      setPending(false);
-    }
-  }
-
-  function beginEditLabel(inv: InviteDto) {
-    setEditingLabelId(inv.id);
-    setEditingLabelValue(inv.label ?? '');
-  }
-  function cancelEditLabel() {
-    setEditingLabelId(null);
-    setEditingLabelValue('');
-  }
-  async function commitEditLabel(inv: InviteDto) {
-    const trimmed = editingLabelValue.trim();
-    if (trimmed === (inv.label ?? '')) {
-      cancelEditLabel();
+  async function saveEdit() {
+    if (!editing) return;
+    setEditErr(null);
+    const max = Number.parseInt(editMaxUses, 10);
+    if (Number.isNaN(max) || max < 0) {
+      setEditErr('Max uses must be a non-negative integer (0 = unlimited).');
       return;
     }
     setPending(true);
     try {
-      await apiClient.invites.setLabel(inv.id, trimmed);
+      await apiClient.invites.update(editing.id, {
+        label: editLabel.trim(),
+        max_uses: max,
+        allowed_agents: Array.from(editAgents).sort(),
+        sandbox_mode: editSandboxMode,
+      });
+      setEditing(null);
       await reload();
     } catch (e: any) {
-      setErr(e?.message ?? 'update failed');
+      setEditErr(e?.message ?? 'update failed');
     } finally {
-      cancelEditLabel();
       setPending(false);
     }
   }
@@ -313,34 +299,12 @@ export function Invites() {
                   return (
                     <tr key={inv.id}>
                       <td className="px-3 py-2 text-zinc-700 dark:text-zinc-200">
-                        {editingLabelId === inv.id ? (
-                          <input
-                            type="text"
-                            value={editingLabelValue}
-                            onChange={(e) => setEditingLabelValue(e.target.value)}
-                            onBlur={() => commitEditLabel(inv)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') commitEditLabel(inv);
-                              else if (e.key === 'Escape') cancelEditLabel();
-                            }}
-                            autoFocus
-                            className="w-full px-1 py-0 text-sm rounded border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 focus:outline-none focus:ring-1 focus:ring-zinc-500"
-                          />
+                        {inv.label ? (
+                          inv.label
                         ) : (
-                          <button
-                            type="button"
-                            onClick={() => beginEditLabel(inv)}
-                            className="text-left hover:underline"
-                            title="Click to edit"
-                          >
-                            {inv.label ? (
-                              inv.label
-                            ) : (
-                              <span className="text-zinc-400 italic">
-                                (unnamed)
-                              </span>
-                            )}
-                          </button>
+                          <span className="text-zinc-400 italic">
+                            (unnamed)
+                          </span>
                         )}
                       </td>
                       <td className="px-3 py-2">
@@ -374,32 +338,7 @@ export function Invites() {
                         ) : (
                           inv.used
                         )}
-                        {' / '}
-                        {editingMaxId === inv.id ? (
-                          <input
-                            type="number"
-                            min={0}
-                            step={1}
-                            value={editingMaxValue}
-                            onChange={(e) => setEditingMaxValue(e.target.value)}
-                            onBlur={() => commitEditMax(inv)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') commitEditMax(inv);
-                              else if (e.key === 'Escape') cancelEditMax();
-                            }}
-                            autoFocus
-                            className="w-16 px-1 py-0 text-sm rounded border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 focus:outline-none focus:ring-1 focus:ring-zinc-500"
-                          />
-                        ) : (
-                          <button
-                            type="button"
-                            onClick={() => beginEditMax(inv)}
-                            className="text-blue-600 dark:text-blue-400 hover:underline"
-                            title="Click to edit (0 = unlimited)"
-                          >
-                            {limitLabel}
-                          </button>
-                        )}
+                        {' / '}{limitLabel}
                       </td>
                       <td className="px-3 py-2">
                         <span
@@ -444,6 +383,13 @@ export function Invites() {
                           className="px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
                         >
                           {copiedId === inv.id ? '✓ Copied' : 'Copy link'}
+                        </button>
+                        <button
+                          disabled={pending}
+                          onClick={() => openEdit(inv)}
+                          className="px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-50"
+                        >
+                          Edit
                         </button>
                         <button
                           disabled={pending}
@@ -663,6 +609,112 @@ export function Invites() {
             ))}
           </div>
         ) : null}
+      </Modal>
+
+      <Modal
+        open={editing !== null}
+        onClose={() => !pending && setEditing(null)}
+        title="Edit invite"
+        footer={
+          <>
+            <button
+              disabled={pending}
+              onClick={() => setEditing(null)}
+              className="px-3 py-1.5 text-sm rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              disabled={pending}
+              onClick={saveEdit}
+              className="px-3 py-1.5 text-sm rounded bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:opacity-90 disabled:opacity-50"
+            >
+              {pending ? 'Saving…' : 'Save'}
+            </button>
+          </>
+        }
+      >
+        {editErr && (
+          <div className="text-sm rounded border-l-2 border-red-500 bg-red-50 dark:bg-red-950/30 px-3 py-2 text-red-700 dark:text-red-300">
+            {editErr}
+          </div>
+        )}
+        <div className="space-y-1">
+          <label className="text-xs text-zinc-500">Label (optional)</label>
+          <input
+            value={editLabel}
+            onChange={(e) => setEditLabel(e.target.value)}
+            className="w-full px-3 py-2 rounded border border-zinc-300 dark:border-zinc-700 bg-transparent text-sm focus:outline-none focus:ring-2 focus:ring-zinc-400"
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-xs text-zinc-500">
+            Max uses{' '}
+            <span className="text-zinc-400">(0 = unlimited)</span>
+          </label>
+          <input
+            type="number"
+            min={0}
+            value={editMaxUses}
+            onChange={(e) => setEditMaxUses(e.target.value)}
+            className="w-full px-3 py-2 rounded border border-zinc-300 dark:border-zinc-700 bg-transparent text-sm focus:outline-none focus:ring-2 focus:ring-zinc-400"
+          />
+        </div>
+        <div className="space-y-1">
+          <label className="text-xs text-zinc-500">Sandbox mode</label>
+          <select
+            value={editSandboxMode}
+            onChange={(e) =>
+              setEditSandboxMode(e.target.value as 'strict' | 'permissive' | 'off')
+            }
+            className="w-full px-3 py-2 rounded border border-zinc-300 dark:border-zinc-700 bg-transparent text-sm focus:outline-none focus:ring-2 focus:ring-zinc-400"
+          >
+            <option value="strict">strict — full isolation (recommended)</option>
+            <option value="permissive">permissive — cross-account isolation only</option>
+            <option value="off">off — no sandbox</option>
+          </select>
+        </div>
+        <div className="space-y-1">
+          <label className="text-xs text-zinc-500">Allowed agents</label>
+          {agentsErr ? (
+            <div className="text-sm rounded border-l-2 border-red-500 bg-red-50 dark:bg-red-950/30 px-3 py-2 text-red-700 dark:text-red-300">
+              {agentsErr}
+            </div>
+          ) : agentsPool === null ? (
+            <div className="text-sm text-zinc-500">Loading agents…</div>
+          ) : agentsPool.length === 0 ? (
+            <div className="text-sm text-zinc-500">No agents.</div>
+          ) : (
+            <div className="max-h-56 overflow-y-auto rounded border border-zinc-200 dark:border-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-800">
+              {agentsPool.map((a) => {
+                const checked = editAgents.has(a.name);
+                return (
+                  <label
+                    key={a.name}
+                    className="flex items-center gap-3 px-3 py-2 text-sm hover:bg-zinc-50 dark:hover:bg-zinc-900/50 cursor-pointer"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => toggleEditAgent(a.name)}
+                      className="rounded"
+                    />
+                    <span className="font-mono flex-1">{a.name}</span>
+                    {a.online ? (
+                      <span className="text-xs px-2 py-0.5 rounded bg-green-100 dark:bg-green-900/40 text-green-700 dark:text-green-300">
+                        online
+                      </span>
+                    ) : (
+                      <span className="text-xs px-2 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500">
+                        offline
+                      </span>
+                    )}
+                  </label>
+                );
+              })}
+            </div>
+          )}
+        </div>
       </Modal>
 
       <Modal

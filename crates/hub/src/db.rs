@@ -1603,6 +1603,36 @@ impl Db {
         Ok(())
     }
 
+    pub async fn update_invite_allowed_agents(&self, id: &str, agents: &[String]) -> Result<()> {
+        let joined = agents.join(",");
+        let rows = sqlx::query("UPDATE invite_links SET allowed_agents = ?1 WHERE id = ?2")
+            .bind(joined)
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            anyhow::bail!("invite '{}' not found", id);
+        }
+        Ok(())
+    }
+
+    pub async fn update_invite_sandbox_mode(&self, id: &str, mode: &str) -> Result<()> {
+        if !matches!(mode, "strict" | "permissive" | "off") {
+            anyhow::bail!("invalid sandbox mode '{}'", mode);
+        }
+        let rows = sqlx::query("UPDATE invite_links SET sandbox_mode = ?1 WHERE id = ?2")
+            .bind(mode)
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            anyhow::bail!("invite '{}' not found", id);
+        }
+        Ok(())
+    }
+
     pub async fn delete_invite(&self, id: &str) -> Result<()> {
         // Acceptances rows are kept on purpose — they're the audit
         // trail of who got in via this link. Dropping them when the

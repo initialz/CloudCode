@@ -178,15 +178,18 @@ export const apiClient = {
         method: 'PATCH',
         body: JSON.stringify({ active }),
       }),
-    setMaxUses: (id: string, max_uses: number) =>
+    update: (
+      id: string,
+      patch: {
+        label?: string;
+        max_uses?: number;
+        allowed_agents?: string[];
+        sandbox_mode?: SandboxMode;
+      },
+    ) =>
       api<void>(`/invites/${encodeURIComponent(id)}`, {
         method: 'PATCH',
-        body: JSON.stringify({ max_uses }),
-      }),
-    setLabel: (id: string, label: string) =>
-      api<void>(`/invites/${encodeURIComponent(id)}`, {
-        method: 'PATCH',
-        body: JSON.stringify({ label }),
+        body: JSON.stringify(patch),
       }),
     delete: (id: string) =>
       api<void>(`/invites/${encodeURIComponent(id)}`, { method: 'DELETE' }),
