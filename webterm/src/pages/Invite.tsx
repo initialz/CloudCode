@@ -1,7 +1,7 @@
 import { useEffect, useState, FormEvent } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import Logo from '@/components/Logo';
-import { acceptInvite, getInviteInfo, InviteInfo } from '@/lib/api';
+import { acceptInvite, getInviteInfo, type InviteInfo } from '@/lib/api';
 
 const USERNAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
 
@@ -35,6 +35,7 @@ export default function Invite() {
 
   const [state, setState] = useState<LoadState>({ kind: 'loading' });
   const [username, setUsername] = useState('');
+  const [realName, setRealName] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState('');
   const [created, setCreated] = useState<Created | null>(null);
@@ -81,7 +82,12 @@ export default function Invite() {
     setSubmitError('');
     setSubmitting(true);
     try {
-      const result = await acceptInvite(inviteToken, trimmed);
+      const trimmedRealName = realName.trim();
+      const result = await acceptInvite(
+        inviteToken,
+        trimmed,
+        trimmedRealName || null,
+      );
       setCreated(result);
     } catch (err) {
       setSubmitError(
@@ -155,9 +161,10 @@ export default function Invite() {
 
           {state.kind === 'valid' && !created && (
             <ValidInviteForm
-              info={state.info}
               username={username}
               setUsername={setUsername}
+              realName={realName}
+              setRealName={setRealName}
               submitting={submitting}
               submitError={submitError}
               onSubmit={handleSubmit}
@@ -181,23 +188,24 @@ export default function Invite() {
 // ── Subcomponents ───────────────────────────────────────────────────────────
 
 type ValidProps = {
-  info: Extract<InviteInfo, { valid: true }>;
   username: string;
   setUsername: (v: string) => void;
+  realName: string;
+  setRealName: (v: string) => void;
   submitting: boolean;
   submitError: string;
   onSubmit: (e: FormEvent) => void;
 };
 
 function ValidInviteForm({
-  info,
   username,
   setUsername,
+  realName,
+  setRealName,
   submitting,
   submitError,
   onSubmit,
 }: ValidProps) {
-  const spotsLeft = info.max_uses > 0 ? info.max_uses - info.used : null;
   const trimmed = username.trim();
   const canSubmit =
     !submitting && trimmed.length > 0 && USERNAME_RE.test(trimmed);
@@ -209,36 +217,8 @@ function ValidInviteForm({
           You've been invited to cloudcode
         </h2>
         <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-1">
-          Pick a username to create your account.
+          Fill in your details to create your account.
         </p>
-        {spotsLeft !== null && (
-          <p className="text-xs text-zinc-400 dark:text-zinc-500 mt-1">
-            Spots left: {spotsLeft}
-          </p>
-        )}
-      </div>
-
-      {/* Allowed agents */}
-      <div className="mb-5">
-        <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400 mb-2">
-          Agent access
-        </div>
-        {info.allowed_agents.length === 0 ? (
-          <div className="text-xs text-zinc-500 dark:text-zinc-400 italic">
-            No agents pre-granted (admin will assign later)
-          </div>
-        ) : (
-          <div className="flex flex-wrap gap-1.5">
-            {info.allowed_agents.map((agent) => (
-              <span
-                key={agent}
-                className="inline-flex items-center rounded-full bg-zinc-100 dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 px-2.5 py-0.5 text-xs font-mono text-zinc-700 dark:text-zinc-300"
-              >
-                {agent}
-              </span>
-            ))}
-          </div>
-        )}
       </div>
 
       {submitError && (
@@ -248,6 +228,27 @@ function ValidInviteForm({
       )}
 
       <form onSubmit={onSubmit} className="flex flex-col gap-4">
+        <div>
+          <label
+            htmlFor="realName"
+            className="block text-sm font-medium text-zinc-700 dark:text-zinc-300 mb-1.5"
+          >
+            Real name <span className="text-xs text-zinc-400 dark:text-zinc-500 font-normal">(optional)</span>
+          </label>
+          <input
+            id="realName"
+            type="text"
+            autoComplete="name"
+            spellCheck={false}
+            placeholder="Your display name"
+            value={realName}
+            onChange={(e) => setRealName(e.target.value)}
+            disabled={submitting}
+            maxLength={128}
+            className="w-full rounded-lg border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 px-3 py-2 text-sm text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 dark:placeholder-zinc-500 focus:outline-none focus:ring-2 focus:ring-zinc-500 dark:focus:ring-zinc-400 disabled:opacity-50"
+          />
+        </div>
+
         <div>
           <label
             htmlFor="username"

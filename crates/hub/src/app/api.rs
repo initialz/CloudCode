@@ -1110,6 +1110,8 @@ pub async fn invite_info(
 #[derive(Deserialize)]
 pub struct AcceptInviteRequest {
     pub username: String,
+    #[serde(default)]
+    pub real_name: Option<String>,
 }
 
 /// `POST /api/invite/:token/accept` — public, unauthenticated.
@@ -1187,9 +1189,24 @@ pub async fn invite_accept(
         }
     };
     let prefix = token_prefix(&account_token);
+    let real_name = req
+        .real_name
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    if let Some(ref rn) = real_name {
+        if rn.len() > 128 {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+                "real_name too long (max 128)",
+            );
+        }
+    }
     if let Err(e) = state
         .db
-        .insert_account(&username, &hash, Some(&prefix), None)
+        .insert_account(&username, &hash, Some(&prefix), real_name.as_deref())
         .await
     {
         // Could race with a concurrent accept; surface as conflict.

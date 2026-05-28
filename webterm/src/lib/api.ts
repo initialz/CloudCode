@@ -89,11 +89,12 @@ export async function getInviteInfo(token: string): Promise<InviteInfo> {
 export async function acceptInvite(
   token: string,
   username: string,
+  realName?: string | null,
 ): Promise<{ account: string; token: string }> {
   const res = await fetch(`/api/invite/${encodeURIComponent(token)}/accept`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username }),
+    body: JSON.stringify({ username, real_name: realName || null }),
   });
   const body = await res.json();
   if (!res.ok) {
