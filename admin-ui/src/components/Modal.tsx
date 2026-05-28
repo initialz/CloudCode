@@ -6,9 +6,12 @@ interface Props {
   title: string;
   children: ReactNode;
   footer?: ReactNode;
+  /** Close on backdrop click. Default false — input dialogs shouldn't
+   *  dismiss accidentally and lose user input. */
+  closeOnBackdrop?: boolean;
 }
 
-export function Modal({ open, onClose, title, children, footer }: Props) {
+export function Modal({ open, onClose, title, children, footer, closeOnBackdrop = false }: Props) {
   // Close on Escape.
   useEffect(() => {
     if (!open) return;
@@ -23,7 +26,7 @@ export function Modal({ open, onClose, title, children, footer }: Props) {
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/40 backdrop-blur-[2px]"
-      onClick={onClose}
+      onClick={closeOnBackdrop ? onClose : undefined}
     >
       <div
         className="w-full max-w-md rounded-lg bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 shadow-xl"
