@@ -109,13 +109,13 @@ export function Accounts() {
     }
   }
 
-  async function onToggleSandbox(name: string) {
+  async function onSetSandboxMode(name: string, mode: 'strict' | 'permissive' | 'off') {
     setPending(true);
     try {
-      await apiClient.accounts.toggleSandbox(name);
+      await apiClient.accounts.setSandboxMode(name, mode);
       await reload();
     } catch (e: any) {
-      setErr(e?.message ?? 'sandbox toggle failed');
+      setErr(e?.message ?? 'sandbox mode change failed');
     } finally {
       setPending(false);
     }
@@ -322,18 +322,28 @@ export function Accounts() {
                       )}
                     </td>
                     <td className="px-3 py-2">
-                      <button
+                      <select
                         disabled={pending}
-                        onClick={() => onToggleSandbox(a.name)}
-                        title={`Click to turn the workspace sandbox ${a.sandbox_enabled ? 'off' : 'on'}`}
-                        className={`text-xs px-2 py-0.5 rounded transition-colors disabled:opacity-50 ${
-                          a.sandbox_enabled
-                            ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-200 dark:hover:bg-emerald-900/60'
-                            : 'bg-zinc-100 dark:bg-zinc-800 text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-700'
+                        value={a.sandbox_mode}
+                        onChange={(e) =>
+                          onSetSandboxMode(
+                            a.name,
+                            e.target.value as 'strict' | 'permissive' | 'off',
+                          )
+                        }
+                        title="Per-account sandbox mode"
+                        className={`text-xs px-2 py-0.5 rounded border transition-colors disabled:opacity-50 cursor-pointer ${
+                          a.sandbox_mode === 'strict'
+                            ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 border-emerald-200 dark:border-emerald-900'
+                            : a.sandbox_mode === 'permissive'
+                              ? 'bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 border-amber-200 dark:border-amber-900'
+                              : 'bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300 border-red-200 dark:border-red-900'
                         }`}
                       >
-                        {a.sandbox_enabled ? 'on' : 'off'}
-                      </button>
+                        <option value="strict">strict</option>
+                        <option value="permissive">permissive</option>
+                        <option value="off">off</option>
+                      </select>
                     </td>
                     <td className="px-3 py-2">
                       <button

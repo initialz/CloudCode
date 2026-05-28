@@ -60,9 +60,11 @@ export type AccountDto = {
   /// At least one WebSocket connection is open (webterm tab loaded
   /// or CLI dialled in), even before a workspace is opened.
   connected: boolean;
-  /// Per-account sandbox toggle (replaces agent.toml [sandbox]).
-  sandbox_enabled: boolean;
+  /// Per-account sandbox mode: "strict" | "permissive" | "off".
+  sandbox_mode: SandboxMode;
 };
+
+export type SandboxMode = 'strict' | 'permissive' | 'off';
 
 export type DashboardDto = {
   accounts: number;
@@ -142,8 +144,11 @@ export const apiClient = {
       }),
     toggle: (name: string) =>
       api<void>(`/accounts/${encodeURIComponent(name)}/toggle`, { method: 'POST' }),
-    toggleSandbox: (name: string) =>
-      api<void>(`/accounts/${encodeURIComponent(name)}/sandbox`, { method: 'POST' }),
+    setSandboxMode: (name: string, sandbox_mode: SandboxMode) =>
+      api<void>(`/accounts/${encodeURIComponent(name)}/sandbox-mode`, {
+        method: 'PUT',
+        body: JSON.stringify({ sandbox_mode }),
+      }),
     disconnect: (name: string) =>
       api<void>(`/accounts/${encodeURIComponent(name)}/disconnect`, {
         method: 'POST',

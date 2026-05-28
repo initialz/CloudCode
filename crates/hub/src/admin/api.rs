@@ -251,9 +251,8 @@ struct AccountDto {
     /// admin "Disconnect" button (which kicks the WebSocket, not
     /// the PTY).
     connected: bool,
-    /// Whether claude runs inside the workspace sandbox for this
-    /// account. Replaces the agent.toml-level switch.
-    sandbox_enabled: bool,
+    /// Per-account sandbox mode: "strict" / "permissive" / "off".
+    sandbox_mode: String,
 }
 
 pub async fn accounts_list(State(state): State<AdminState>) -> Response {
@@ -293,7 +292,7 @@ pub async fn accounts_list(State(state): State<AdminState>) -> Response {
             last_used_at,
             online: active_count > 0,
             connected,
-            sandbox_enabled: a.sandbox_enabled,
+            sandbox_mode: a.sandbox_mode,
         });
     }
     Json(dto).into_response()
@@ -393,21 +392,27 @@ pub async fn accounts_toggle(
     StatusCode::NO_CONTENT.into_response()
 }
 
-pub async fn accounts_sandbox_toggle(
+#[derive(Deserialize)]
+pub struct SetSandboxModeRequest {
+    pub sandbox_mode: String,
+}
+
+pub async fn accounts_set_sandbox_mode(
     State(state): State<AdminState>,
     Path(name): Path<String>,
+    Json(req): Json<SetSandboxModeRequest>,
 ) -> Response {
-    let accounts = match state.app.db.list_accounts().await {
-        Ok(a) => a,
-        Err(e) => return internal(e),
-    };
-    let Some(current) = accounts.iter().find(|a| a.name == name) else {
-        return err(StatusCode::NOT_FOUND, "not_found", "account not found");
-    };
+    if !matches!(req.sandbox_mode.as_str(), "strict" | "permissive" | "off") {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "sandbox_mode must be one of: strict, permissive, off",
+        );
+    }
     if let Err(e) = state
         .app
         .db
-        .set_account_sandbox(&name, !current.sandbox_enabled)
+        .set_account_sandbox_mode(&name, &req.sandbox_mode)
         .await
     {
         return err(StatusCode::NOT_FOUND, "not_found", e.to_string());

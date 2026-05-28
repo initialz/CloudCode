@@ -140,8 +140,8 @@ pub fn router(state: AdminState) -> Router {
             post(api::accounts_toggle).route_layer(gate.clone()),
         )
         .route(
-            "/admin/api/accounts/:name/sandbox",
-            post(api::accounts_sandbox_toggle).route_layer(gate.clone()),
+            "/admin/api/accounts/:name/sandbox-mode",
+            axum::routing::put(api::accounts_set_sandbox_mode).route_layer(gate.clone()),
         )
         .route(
             "/admin/api/accounts/:name/disconnect",

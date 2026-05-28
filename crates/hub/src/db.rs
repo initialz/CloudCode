@@ -29,10 +29,11 @@ pub struct DbAccount {
     pub token_prefix: Option<String>,
     pub created_at: i64,
     pub disabled: bool,
-    /// Per-account workspace sandbox toggle. Defaults to true on
-    /// fresh installs; existing accounts get true at migration time.
-    /// Replaces the agent.toml-level `[sandbox] enabled` switch.
-    pub sandbox_enabled: bool,
+    /// Per-account sandbox mode: "strict" / "permissive" / "off".
+    /// Replaces the legacy `sandbox_enabled` bool. Defaults to "strict"
+    /// for fresh installs; migration maps the legacy bool to "strict"
+    /// (true) or "permissive" (false).
+    pub sandbox_mode: String,
 }
 
 /// One row in the hub-managed workspace registry. The actual files
@@ -114,6 +115,10 @@ impl Db {
             // the marker check below.
             "ALTER TABLE accounts ADD COLUMN sandbox_enabled INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE accounts ADD COLUMN real_name TEXT",
+            // sandbox_mode replaces sandbox_enabled (kept for back-compat).
+            // Migration: legacy true → "strict", false → "permissive".
+            "ALTER TABLE accounts ADD COLUMN sandbox_mode TEXT NOT NULL DEFAULT 'strict'",
+            "UPDATE accounts SET sandbox_mode = 'permissive' WHERE sandbox_mode = 'strict' AND sandbox_enabled = 0",
             "CREATE TABLE IF NOT EXISTS audit_events (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts         INTEGER NOT NULL,
@@ -372,7 +377,7 @@ impl Db {
     /// `authenticate()`. `Ok(None)` means no such name.
     pub async fn get_account(&self, name: &str) -> Result<Option<DbAccount>> {
         let row = sqlx::query(
-            "SELECT name, token_hash, token_prefix, created_at, disabled, sandbox_enabled, real_name
+            "SELECT name, token_hash, token_prefix, created_at, disabled, sandbox_mode, real_name
              FROM accounts WHERE name = ?1",
         )
         .bind(name)
@@ -385,13 +390,13 @@ impl Db {
             token_prefix: r.get("token_prefix"),
             created_at: r.get("created_at"),
             disabled: r.get::<i64, _>("disabled") != 0,
-            sandbox_enabled: r.get::<i64, _>("sandbox_enabled") != 0,
+            sandbox_mode: r.get("sandbox_mode"),
         }))
     }
 
     pub async fn list_accounts(&self) -> Result<Vec<DbAccount>> {
         let rows = sqlx::query(
-            "SELECT name, token_hash, token_prefix, created_at, disabled, sandbox_enabled, real_name
+            "SELECT name, token_hash, token_prefix, created_at, disabled, sandbox_mode, real_name
              FROM accounts ORDER BY name",
         )
         .fetch_all(&self.pool)
@@ -405,31 +410,31 @@ impl Db {
                 token_prefix: r.get("token_prefix"),
                 created_at: r.get("created_at"),
                 disabled: r.get::<i64, _>("disabled") != 0,
-                sandbox_enabled: r.get::<i64, _>("sandbox_enabled") != 0,
+                sandbox_mode: r.get("sandbox_mode"),
             })
             .collect())
     }
 
-    /// Look up a single account's sandbox toggle. Default true if the
-    /// account is missing (the OpenSession handler still validates the
-    /// account before this is consulted; missing here means the row
-    /// vanished between auth and PtyOpen — better to err on the side
-    /// of more isolation).
-    pub async fn account_sandbox_enabled(&self, name: &str) -> Result<bool> {
+    /// Look up a single account's sandbox mode. Defaults to "strict"
+    /// if missing — err on the side of more isolation.
+    pub async fn account_sandbox_mode(&self, name: &str) -> Result<String> {
         let row = sqlx::query(
-            "SELECT sandbox_enabled FROM accounts WHERE name = ?1",
+            "SELECT sandbox_mode FROM accounts WHERE name = ?1",
         )
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row
-            .map(|r| r.get::<i64, _>("sandbox_enabled") != 0)
-            .unwrap_or(true))
+            .map(|r| r.get::<String, _>("sandbox_mode"))
+            .unwrap_or_else(|| "strict".to_string()))
     }
 
-    pub async fn set_account_sandbox(&self, name: &str, enabled: bool) -> Result<()> {
-        let rows = sqlx::query("UPDATE accounts SET sandbox_enabled = ?1 WHERE name = ?2")
-            .bind(if enabled { 1_i64 } else { 0_i64 })
+    pub async fn set_account_sandbox_mode(&self, name: &str, mode: &str) -> Result<()> {
+        if !matches!(mode, "strict" | "permissive" | "off") {
+            anyhow::bail!("invalid sandbox mode '{}'", mode);
+        }
+        let rows = sqlx::query("UPDATE accounts SET sandbox_mode = ?1 WHERE name = ?2")
+            .bind(mode)
             .bind(name)
             .execute(&self.pool)
             .await?

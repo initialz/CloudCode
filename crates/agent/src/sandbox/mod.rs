@@ -47,8 +47,13 @@ pub struct SandboxParams {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxMode {
+    /// Per-workspace secrets/persistence hardening + cross-account isolation.
     Strict,
+    /// Cross-account isolation only; everything else open.
     Permissive,
+    /// No sandbox-exec wrapper at all. claude runs unconfined under the
+    /// agent's uid.
+    Off,
 }
 
 impl SandboxMode {
@@ -58,6 +63,7 @@ impl SandboxMode {
         match self {
             SandboxMode::Strict => "strict",
             SandboxMode::Permissive => "permissive",
+            SandboxMode::Off => "off",
         }
     }
 
@@ -65,6 +71,7 @@ impl SandboxMode {
         match s {
             "strict" => Some(SandboxMode::Strict),
             "permissive" => Some(SandboxMode::Permissive),
+            "off" => Some(SandboxMode::Off),
             _ => None,
         }
     }
