@@ -40,6 +40,7 @@ export function Invites() {
   const [newLabel, setNewLabel] = useState('');
   const [newMaxUses, setNewMaxUses] = useState('0');
   const [newAgents, setNewAgents] = useState<Set<string>>(new Set());
+  const [newSandboxMode, setNewSandboxMode] = useState<'strict' | 'permissive' | 'off'>('strict');
   const [agentsPool, setAgentsPool] = useState<AgentRowDto[] | null>(null);
   const [agentsErr, setAgentsErr] = useState<string | null>(null);
   const [createErr, setCreateErr] = useState<string | null>(null);
@@ -91,6 +92,7 @@ export function Invites() {
     setNewLabel('');
     setNewMaxUses('0');
     setNewAgents(new Set());
+    setNewSandboxMode('strict');
     setCreateErr(null);
     setAgentsPool(null);
     loadAgents();
@@ -119,6 +121,7 @@ export function Invites() {
         ...(label ? { label } : {}),
         max_uses: max,
         allowed_agents: Array.from(newAgents).sort(),
+        sandbox_mode: newSandboxMode,
       });
       setCreating(false);
       setCreatedInvite(r);
@@ -257,6 +260,7 @@ export function Invites() {
                 <th className="px-3 py-2 text-left">Label</th>
                 <th className="px-3 py-2 text-left">Status</th>
                 <th className="px-3 py-2 text-left">Used</th>
+                <th className="px-3 py-2 text-left">Sandbox</th>
                 <th className="px-3 py-2 text-left">Allowed agents</th>
                 <th className="px-3 py-2 text-left">Created</th>
                 <th className="px-3 py-2 text-right">Actions</th>
@@ -266,7 +270,7 @@ export function Invites() {
               {invites.length === 0 ? (
                 <tr>
                   <td
-                    colSpan={6}
+                    colSpan={7}
                     className="px-3 py-6 text-center text-zinc-500"
                   >
                     No invites yet. Create one above.
@@ -344,6 +348,19 @@ export function Invites() {
                             {limitLabel}
                           </button>
                         )}
+                      </td>
+                      <td className="px-3 py-2">
+                        <span
+                          className={`text-xs px-2 py-0.5 rounded ${
+                            inv.sandbox_mode === 'strict'
+                              ? 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300'
+                              : inv.sandbox_mode === 'permissive'
+                                ? 'bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300'
+                                : 'bg-red-100 dark:bg-red-900/40 text-red-700 dark:text-red-300'
+                          }`}
+                        >
+                          {inv.sandbox_mode}
+                        </span>
                       </td>
                       <td className="px-3 py-2">
                         {inv.allowed_agents.length === 0 ? (
@@ -447,6 +464,23 @@ export function Invites() {
             onChange={(e) => setNewMaxUses(e.target.value)}
             className="w-full px-3 py-2 rounded border border-zinc-300 dark:border-zinc-700 bg-transparent text-sm focus:outline-none focus:ring-2 focus:ring-zinc-400"
           />
+        </div>
+        <div className="space-y-1">
+          <label className="text-xs text-zinc-500">Sandbox mode</label>
+          <select
+            value={newSandboxMode}
+            onChange={(e) =>
+              setNewSandboxMode(e.target.value as 'strict' | 'permissive' | 'off')
+            }
+            className="w-full px-3 py-2 rounded border border-zinc-300 dark:border-zinc-700 bg-transparent text-sm focus:outline-none focus:ring-2 focus:ring-zinc-400"
+          >
+            <option value="strict">strict — full isolation (recommended)</option>
+            <option value="permissive">permissive — cross-account isolation only</option>
+            <option value="off">off — no sandbox</option>
+          </select>
+          <p className="text-xs text-zinc-400">
+            Applied to accounts created via this invite.
+          </p>
         </div>
         <div className="space-y-1">
           <label className="text-xs text-zinc-500">Allowed agents</label>

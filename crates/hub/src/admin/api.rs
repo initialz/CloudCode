@@ -2511,6 +2511,7 @@ struct InviteDto {
     allowed_agents: Vec<String>,
     active: bool,
     created_at: i64,
+    sandbox_mode: String,
 }
 
 /// Build a `https://<host>/invite/<token>` URL from the request's
@@ -2558,6 +2559,7 @@ pub async fn invites_list(
                 allowed_agents: r.allowed_agents,
                 active: r.active,
                 created_at: r.created_at,
+                sandbox_mode: r.sandbox_mode,
             }
         })
         .collect();
@@ -2575,6 +2577,10 @@ pub struct CreateInviteRequest {
     /// Empty means the user can log in but can't reach any agent
     /// until an admin grants access — fine for soft-onboarding.
     pub allowed_agents: Vec<String>,
+    /// Sandbox mode applied to accounts created via this invite.
+    /// Defaults to "strict" when omitted.
+    #[serde(default)]
+    pub sandbox_mode: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2610,6 +2616,19 @@ pub async fn invites_create(
     agents.sort();
     agents.dedup();
 
+    let sandbox_mode = req
+        .sandbox_mode
+        .as_deref()
+        .unwrap_or("strict")
+        .to_string();
+    if !matches!(sandbox_mode.as_str(), "strict" | "permissive" | "off") {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "sandbox_mode must be one of: strict, permissive, off",
+        );
+    }
+
     let id = auth::generate_invite_id();
     let token = auth::generate_invite_token();
     if let Err(e) = state
@@ -2622,6 +2641,7 @@ pub async fn invites_create(
             max_uses,
             &agents,
             ADMIN_USERNAME_AS_CREATOR,
+            &sandbox_mode,
         )
         .await
     {

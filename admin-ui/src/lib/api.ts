@@ -94,6 +94,7 @@ export type InviteDto = {
   allowed_agents: string[];
   active: boolean;
   created_at: number;
+  sandbox_mode: SandboxMode;
 };
 
 export type InviteAcceptanceDto = {
@@ -167,7 +168,7 @@ export const apiClient = {
   },
   invites: {
     list: () => api<InviteDto[]>('/invites'),
-    create: (body: { label?: string; max_uses?: number; allowed_agents: string[] }) =>
+    create: (body: { label?: string; max_uses?: number; allowed_agents: string[]; sandbox_mode?: SandboxMode }) =>
       api<{ id: string; token: string; share_url: string }>('/invites', {
         method: 'POST',
         body: JSON.stringify(body),

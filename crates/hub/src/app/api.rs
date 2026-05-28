@@ -1214,6 +1214,17 @@ pub async fn invite_accept(
         );
     }
 
+    // Apply the invite's sandbox mode (default "strict"). Failures
+    // here are soft — the account still exists; worst case the user
+    // gets the default mode and an admin can flip later.
+    if let Err(e) = state
+        .db
+        .set_account_sandbox_mode(&username, &invite.sandbox_mode)
+        .await
+    {
+        tracing::warn!(error = %e, account = %username, "invite_accept set_sandbox_mode failed");
+    }
+
     // 4. Grant the invite's agent whitelist. Empty list is legal:
     // the user can log in but can't reach any agent until an admin
     // explicitly grants access.

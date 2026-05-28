@@ -278,6 +278,8 @@ impl Db {
                 created_by     TEXT NOT NULL
             )",
             "CREATE INDEX IF NOT EXISTS idx_invite_links_token ON invite_links(token)",
+            // sandbox_mode applied to accounts created via this invite.
+            "ALTER TABLE invite_links ADD COLUMN sandbox_mode TEXT NOT NULL DEFAULT 'strict'",
             // Audit trail of which accounts were minted by which invite.
             // PK is (invite_id, account) so the same account can never
             // be linked to one invite twice (defensive; the accept
@@ -1506,12 +1508,16 @@ impl Db {
         max_uses: i64,
         allowed_agents: &[String],
         created_by: &str,
+        sandbox_mode: &str,
     ) -> Result<()> {
+        if !matches!(sandbox_mode, "strict" | "permissive" | "off") {
+            anyhow::bail!("invalid sandbox mode '{}'", sandbox_mode);
+        }
         let agents_str = allowed_agents.join(",");
         sqlx::query(
             "INSERT INTO invite_links
-                (id, label, token, max_uses, used, allowed_agents, active, created_at, created_by)
-             VALUES (?1, ?2, ?3, ?4, 0, ?5, 1, ?6, ?7)",
+                (id, label, token, max_uses, used, allowed_agents, active, created_at, created_by, sandbox_mode)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, 1, ?6, ?7, ?8)",
         )
         .bind(id)
         .bind(label)
@@ -1520,6 +1526,7 @@ impl Db {
         .bind(agents_str)
         .bind(chrono::Utc::now().timestamp())
         .bind(created_by)
+        .bind(sandbox_mode)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1527,7 +1534,7 @@ impl Db {
 
     pub async fn get_invite(&self, id: &str) -> Result<Option<DbInvite>> {
         let row = sqlx::query(
-            "SELECT id, label, token, max_uses, used, allowed_agents, active, created_at, created_by
+            "SELECT id, label, token, max_uses, used, allowed_agents, active, created_at, created_by, sandbox_mode
                FROM invite_links WHERE id = ?1",
         )
         .bind(id)
@@ -1538,7 +1545,7 @@ impl Db {
 
     pub async fn get_invite_by_token(&self, token: &str) -> Result<Option<DbInvite>> {
         let row = sqlx::query(
-            "SELECT id, label, token, max_uses, used, allowed_agents, active, created_at, created_by
+            "SELECT id, label, token, max_uses, used, allowed_agents, active, created_at, created_by, sandbox_mode
                FROM invite_links WHERE token = ?1",
         )
         .bind(token)
@@ -1549,7 +1556,7 @@ impl Db {
 
     pub async fn list_invites(&self) -> Result<Vec<DbInvite>> {
         let rows = sqlx::query(
-            "SELECT id, label, token, max_uses, used, allowed_agents, active, created_at, created_by
+            "SELECT id, label, token, max_uses, used, allowed_agents, active, created_at, created_by, sandbox_mode
                FROM invite_links ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
@@ -1661,6 +1668,7 @@ pub struct DbInvite {
     pub active: bool,
     pub created_at: i64,
     pub created_by: String,
+    pub sandbox_mode: String,
 }
 
 fn invite_from_row(r: sqlx::sqlite::SqliteRow) -> DbInvite {
@@ -1680,6 +1688,7 @@ fn invite_from_row(r: sqlx::sqlite::SqliteRow) -> DbInvite {
         active: r.get::<i64, _>("active") != 0,
         created_at: r.get("created_at"),
         created_by: r.get("created_by"),
+        sandbox_mode: r.get("sandbox_mode"),
     }
 }
 
