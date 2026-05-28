@@ -7,6 +7,15 @@ import {
 } from '@/lib/api';
 import { Modal } from '@/components/Modal';
 import { formatDate, formatRelative } from '@/lib/time';
+import { resolveHubUrl } from '@/lib/hubUrl';
+
+/** Build the public invite URL using the configured hub URL setting.
+ *  Backend's share_url is ignored — it's built from the admin host which
+ *  is typically a different port than the public webterm. */
+function inviteShareUrl(token: string): string {
+  const base = resolveHubUrl().replace(/\/$/, '');
+  return `${base}/invite/${encodeURIComponent(token)}`;
+}
 
 type CreatedInvite = {
   id: string;
@@ -145,7 +154,7 @@ export function Invites() {
 
   async function copyShareUrl(inv: InviteDto) {
     try {
-      await navigator.clipboard.writeText(inv.share_url);
+      await navigator.clipboard.writeText(inviteShareUrl(inv.token));
       setCopiedId(inv.id);
       setTimeout(
         () => setCopiedId((cur) => (cur === inv.id ? null : cur)),
@@ -159,7 +168,7 @@ export function Invites() {
   async function copyCreatedShareUrl() {
     if (!createdInvite) return;
     try {
-      await navigator.clipboard.writeText(createdInvite.share_url);
+      await navigator.clipboard.writeText(inviteShareUrl(createdInvite.token));
       setCreatedCopied(true);
       setTimeout(() => setCreatedCopied(false), 2000);
     } catch {
@@ -441,7 +450,7 @@ export function Invites() {
           <div className="space-y-1">
             <div className="text-xs text-zinc-500">Share link</div>
             <div className="font-mono text-sm break-all rounded bg-zinc-950 text-zinc-100 px-3 py-2 select-all">
-              {createdInvite.share_url}
+              {inviteShareUrl(createdInvite.token)}
             </div>
             <button
               onClick={copyCreatedShareUrl}
