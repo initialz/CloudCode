@@ -50,6 +50,10 @@ export function Invites() {
   // Confirm delete
   const [confirmDelete, setConfirmDelete] = useState<InviteDto | null>(null);
 
+  // Inline edit for max_uses
+  const [editingMaxId, setEditingMaxId] = useState<string | null>(null);
+  const [editingMaxValue, setEditingMaxValue] = useState('');
+
   // Acceptances modal
   const [acceptancesModal, setAcceptancesModal] =
     useState<AcceptancesModalState | null>(null);
@@ -135,6 +139,37 @@ export function Invites() {
     } catch (e: any) {
       setErr(e?.message ?? 'toggle failed');
     } finally {
+      setPending(false);
+    }
+  }
+
+  function beginEditMax(inv: InviteDto) {
+    setEditingMaxId(inv.id);
+    setEditingMaxValue(String(inv.max_uses));
+  }
+  function cancelEditMax() {
+    setEditingMaxId(null);
+    setEditingMaxValue('');
+  }
+  async function commitEditMax(inv: InviteDto) {
+    const n = Number(editingMaxValue.trim());
+    if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) {
+      setErr('max uses must be a non-negative integer (0 = unlimited)');
+      cancelEditMax();
+      return;
+    }
+    if (n === inv.max_uses) {
+      cancelEditMax();
+      return;
+    }
+    setPending(true);
+    try {
+      await apiClient.invites.setMaxUses(inv.id, n);
+      await reload();
+    } catch (e: any) {
+      setErr(e?.message ?? 'update failed');
+    } finally {
+      cancelEditMax();
       setPending(false);
     }
   }
@@ -283,7 +318,32 @@ export function Invites() {
                         ) : (
                           inv.used
                         )}
-                        {' / '}{limitLabel}
+                        {' / '}
+                        {editingMaxId === inv.id ? (
+                          <input
+                            type="number"
+                            min={0}
+                            step={1}
+                            value={editingMaxValue}
+                            onChange={(e) => setEditingMaxValue(e.target.value)}
+                            onBlur={() => commitEditMax(inv)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') commitEditMax(inv);
+                              else if (e.key === 'Escape') cancelEditMax();
+                            }}
+                            autoFocus
+                            className="w-16 px-1 py-0 text-sm rounded border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 focus:outline-none focus:ring-1 focus:ring-zinc-500"
+                          />
+                        ) : (
+                          <button
+                            type="button"
+                            onClick={() => beginEditMax(inv)}
+                            className="text-blue-600 dark:text-blue-400 hover:underline"
+                            title="Click to edit (0 = unlimited)"
+                          >
+                            {limitLabel}
+                          </button>
+                        )}
                       </td>
                       <td className="px-3 py-2">
                         {inv.allowed_agents.length === 0 ? (

@@ -172,6 +172,11 @@ export const apiClient = {
         method: 'PATCH',
         body: JSON.stringify({ active }),
       }),
+    setMaxUses: (id: string, max_uses: number) =>
+      api<void>(`/invites/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ max_uses }),
+      }),
     delete: (id: string) =>
       api<void>(`/invites/${encodeURIComponent(id)}`, { method: 'DELETE' }),
     acceptances: (id: string) =>

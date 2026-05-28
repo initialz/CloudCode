@@ -2636,7 +2636,10 @@ pub async fn invites_create(
 
 #[derive(Deserialize)]
 pub struct PatchInviteRequest {
-    pub active: bool,
+    #[serde(default)]
+    pub active: Option<bool>,
+    #[serde(default)]
+    pub max_uses: Option<i64>,
 }
 
 pub async fn invites_patch(
@@ -2644,8 +2647,22 @@ pub async fn invites_patch(
     Path(id): Path<String>,
     Json(req): Json<PatchInviteRequest>,
 ) -> Response {
-    if let Err(e) = state.app.db.update_invite_active(&id, req.active).await {
-        return err(StatusCode::NOT_FOUND, "not_found", e.to_string());
+    if let Some(active) = req.active {
+        if let Err(e) = state.app.db.update_invite_active(&id, active).await {
+            return err(StatusCode::NOT_FOUND, "not_found", e.to_string());
+        }
+    }
+    if let Some(max_uses) = req.max_uses {
+        if max_uses < 0 {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+                "max_uses must be >= 0 (0 = unlimited)",
+            );
+        }
+        if let Err(e) = state.app.db.update_invite_max_uses(&id, max_uses).await {
+            return err(StatusCode::NOT_FOUND, "not_found", e.to_string());
+        }
     }
     StatusCode::NO_CONTENT.into_response()
 }
