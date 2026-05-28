@@ -116,7 +116,7 @@ export default function Sidebar({
         <div className="flex items-center gap-2 px-3 py-2.5 border-b border-zinc-200 dark:border-zinc-800 shrink-0">
           <Logo size={18} className="text-zinc-700 dark:text-zinc-300 shrink-0" />
           <span className="text-sm font-semibold text-zinc-800 dark:text-zinc-200 select-none">
-            Cloudcode
+            CloudCode
           </span>
         </div>
 

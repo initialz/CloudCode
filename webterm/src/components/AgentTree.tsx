@@ -91,17 +91,6 @@ export default function AgentTree({
             className="fixed z-50 min-w-[11rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
             style={{ left: wsMenu.x, top: wsMenu.y }}
           >
-            <button
-              type="button"
-              onClick={() => {
-                const { agent, workspace } = wsMenu;
-                setWsMenu(null);
-                onOpenWorkspace(agent, workspace);
-              }}
-              className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
-            >
-              Open
-            </button>
             {onOpenFiles && (
               <button
                 type="button"
@@ -116,7 +105,9 @@ export default function AgentTree({
                 <span>Files</span>
               </button>
             )}
-            <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
+            {onOpenFiles && (
+              <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
+            )}
             <button
               type="button"
               onClick={() => {
