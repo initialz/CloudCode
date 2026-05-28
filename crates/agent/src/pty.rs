@@ -186,6 +186,7 @@ impl PtyManager {
                 rows,
                 claude_args,
                 sandbox,
+                sandbox_mode,
                 tool,
             } => {
                 self.open_session(
@@ -196,6 +197,7 @@ impl PtyManager {
                     rows,
                     claude_args,
                     sandbox,
+                    sandbox_mode,
                     tool,
                     tx,
                 )
@@ -509,6 +511,7 @@ impl PtyManager {
         rows: u16,
         claude_args: Vec<String>,
         sandbox: bool,
+        sandbox_mode: Option<String>,
         tool: Option<String>,
         tx: mpsc::Sender<OutFrame>,
     ) {
@@ -668,22 +671,34 @@ impl PtyManager {
         // per-account toggle. If the platform doesn't support
         // Seatbelt at all (Linux today), surface that as a
         // PtyError; we don't want to silently run unconfined.
-        let Some(self_exe) = self.self_exe.as_ref() else {
-            let _ = tx
-                .send(OutFrame::Text(ClientMsg::PtyError {
-                    session_id,
-                    message: "workspace sandbox is not supported on this agent platform"
-                        .to_string(),
-                }))
-                .await;
-            return;
-        };
-        let sandbox_mode = if sandbox {
-            crate::sandbox::SandboxMode::Strict
+        // Resolve sandbox mode. Prefer the new `sandbox_mode` field;
+        // fall back to legacy bool (strict if true, permissive if false)
+        // for pre-v1.23 hubs.
+        let mode = sandbox_mode
+            .as_deref()
+            .and_then(crate::sandbox::SandboxMode::parse)
+            .unwrap_or(if sandbox {
+                crate::sandbox::SandboxMode::Strict
+            } else {
+                crate::sandbox::SandboxMode::Permissive
+            });
+
+        // When mode == Off, run tmux directly without the sandbox-exec
+        // wrapper. Strict/Permissive need the wrapper, which requires
+        // self_exe to be set (macOS only today).
+        let mut cmd = if mode == crate::sandbox::SandboxMode::Off {
+            CommandBuilder::new(&self.tmux.executable)
         } else {
-            crate::sandbox::SandboxMode::Permissive
-        };
-        let mut cmd = {
+            let Some(self_exe) = self.self_exe.as_ref() else {
+                let _ = tx
+                    .send(OutFrame::Text(ClientMsg::PtyError {
+                        session_id,
+                        message: "workspace sandbox is not supported on this agent platform"
+                            .to_string(),
+                    }))
+                    .await;
+                return;
+            };
             let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
             let ws_root = self.workspace_root();
             let mut c = CommandBuilder::new(self_exe);
@@ -695,7 +710,7 @@ impl PtyManager {
             c.arg("--home");
             c.arg(&home);
             c.arg("--mode");
-            c.arg(sandbox_mode.as_str());
+            c.arg(mode.as_str());
             c.arg("--");
             c.arg(&self.tmux.executable);
             c

@@ -26,7 +26,7 @@ import {
   type HubMsg,
 } from '@/lib/wire';
 import { effectiveTheme, getStoredTheme, type Theme } from '@/lib/theme';
-import { type Tab, tabKey } from '@/lib/tabs';
+import { type Tab, tabKey, termHistoryKey } from '@/lib/tabs';
 import {
   DEFAULT_PREFERENCES,
   parsePreferences,
@@ -193,12 +193,19 @@ export default function Workbench() {
 
   // ── Save terminal state on page unload ────────────────────────────────────
 
+  // Mirror `account` into a ref so the beforeunload handler captures
+  // the current value rather than the initial empty string.
+  const accountRef = useRef('');
+  accountRef.current = account;
+
   useEffect(() => {
     const onUnload = () => {
+      const acct = accountRef.current;
+      if (!acct) return;
       for (const tab of tabsRef.current) {
         try {
           const state = tab.serializeAddon.serialize({ scrollback: 50000 });
-          const key = tabKey(tab.agent, tab.workspace);
+          const key = termHistoryKey(acct, tab.agent, tab.workspace);
           saveTermState(key, state);
         } catch { /* ignore */ }
       }
@@ -850,7 +857,7 @@ export default function Workbench() {
         }
       }
       if (tab) {
-        const histKey = tabKey(tab.agent, tab.workspace);
+        const histKey = termHistoryKey(accountRef.current, tab.agent, tab.workspace);
         try {
           const state = tab.serializeAddon.serialize({ scrollback: 50000 });
           saveTermState(histKey, state);
@@ -940,10 +947,13 @@ export default function Workbench() {
         tab.term.open(el);
         tab.fitAddon.fit();
         tab.opened = true;
-        const histKey = tabKey(tab.agent, tab.workspace);
-        loadTermState(histKey).then((saved) => {
-          if (saved) tab.term.write(saved);
-        });
+        const acct = accountRef.current;
+        if (acct) {
+          const histKey = termHistoryKey(acct, tab.agent, tab.workspace);
+          loadTermState(histKey).then((saved) => {
+            if (saved) tab.term.write(saved);
+          });
+        }
       } catch {
         // StrictMode double-mount — already opened
       }

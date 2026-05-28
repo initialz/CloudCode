@@ -1027,6 +1027,251 @@ pub async fn files_upload(
     (StatusCode::OK, Json(json!({ "results": results }))).into_response()
 }
 
+// ---------------------------------------------------------------------------
+// Public invite-link endpoints (no auth — mounted on the main listener)
+// ---------------------------------------------------------------------------
+//
+// Backs the webterm's `/invite/<token>` landing page. The token in
+// the path is the shareable secret; we never expose the
+// admin-side invite `id` here. `info` is safe to render to anyone
+// who has the URL; `accept` mints a brand-new account using the
+// invite's `allowed_agents` ACL.
+
+/// Mirror of the validator in `admin/api.rs`. Re-implemented here
+/// so the public endpoint doesn't pull on admin code (which lives
+/// behind a separate listener). Keep the rule in sync with the
+/// admin side: `[A-Za-z0-9_-]{1,64}`.
+fn valid_account_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+fn token_prefix(token: &str) -> String {
+    let n = token.chars().count();
+    if n <= 6 {
+        token.to_string()
+    } else {
+        token.chars().skip(n - 6).collect()
+    }
+}
+
+/// `GET /api/invite/:token/info` — public, unauthenticated.
+///
+/// Always returns 200; the SPA renders nicer errors when
+/// `valid:false` than it would for an HTTP error. `reason` is a
+/// short machine-readable code (`not_found`, `inactive`,
+/// `exhausted`) so the SPA can decide its own copy.
+pub async fn invite_info(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+) -> Response {
+    // For all failure modes (token unknown, inactive, exhausted) we
+    // return the same opaque "not_found" so the user can't tell which
+    // case applies. The admin can still see the real state in the
+    // admin UI.
+    let invalid = || {
+        (
+            StatusCode::OK,
+            Json(json!({ "valid": false, "reason": "not_found" })),
+        )
+            .into_response()
+    };
+    let invite = match state.db.get_invite_by_token(&token).await {
+        Ok(Some(i)) => i,
+        Ok(None) => return invalid(),
+        Err(e) => {
+            tracing::warn!(error = %e, "invite_info db lookup failed");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", "db error");
+        }
+    };
+    if !invite.active {
+        return invalid();
+    }
+    if invite.max_uses > 0 && invite.used >= invite.max_uses {
+        return invalid();
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "valid": true,
+            "max_uses": invite.max_uses,
+            "used": invite.used,
+            "allowed_agents": invite.allowed_agents,
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct AcceptInviteRequest {
+    pub username: String,
+    #[serde(default)]
+    pub real_name: Option<String>,
+}
+
+/// `POST /api/invite/:token/accept` — public, unauthenticated.
+///
+/// Validates the invite (active, not exhausted), validates the
+/// requested username, then creates a fresh account with a `cc_`
+/// token, grants the invite's `allowed_agents` via the existing
+/// ACL table, bumps `used`, and records the acceptance. Returns
+/// the account name + plaintext token — the SPA shows them once
+/// and instructs the user to save them.
+pub async fn invite_accept(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(token): axum::extract::Path<String>,
+    Json(req): Json<AcceptInviteRequest>,
+) -> Response {
+    // 1. Resolve + validate the invite. All three failure cases
+    // (unknown, inactive, exhausted) collapse to the same opaque
+    // response so the user can't probe for the real state.
+    let opaque_not_found = || err(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "invite link is invalid or has expired",
+    );
+    let invite = match state.db.get_invite_by_token(&token).await {
+        Ok(Some(i)) => i,
+        Ok(None) => return opaque_not_found(),
+        Err(e) => {
+            tracing::warn!(error = %e, "invite_accept db lookup failed");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", "db error");
+        }
+    };
+    if !invite.active {
+        return opaque_not_found();
+    }
+    if invite.max_uses > 0 && invite.used >= invite.max_uses {
+        return opaque_not_found();
+    }
+
+    // 2. Validate the requested username.
+    let username = req.username.trim().to_string();
+    if !valid_account_name(&username) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_input",
+            "username must match [A-Za-z0-9_-]{1,64}",
+        );
+    }
+    match state.db.account_exists(&username).await {
+        Ok(true) => {
+            return err(
+                StatusCode::CONFLICT,
+                "conflict",
+                format!("username '{}' is already taken", username),
+            );
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "invite_accept account_exists failed");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", "db error");
+        }
+    }
+
+    // 3. Mint a fresh account token.
+    let account_token = auth::generate_token();
+    let hash = match auth::hash_token(&account_token) {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::warn!(error = %e, "invite_accept hash_token failed");
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "could not hash token",
+            );
+        }
+    };
+    let prefix = token_prefix(&account_token);
+    let real_name = req
+        .real_name
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    if let Some(ref rn) = real_name {
+        if rn.len() > 128 {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invalid_input",
+                "real_name too long (max 128)",
+            );
+        }
+    }
+    if let Err(e) = state
+        .db
+        .insert_account(&username, &hash, Some(&prefix), real_name.as_deref())
+        .await
+    {
+        // Could race with a concurrent accept; surface as conflict.
+        tracing::warn!(error = %e, "invite_accept insert_account failed");
+        return err(
+            StatusCode::CONFLICT,
+            "conflict",
+            "could not create account (it may already exist)",
+        );
+    }
+
+    // Apply the invite's sandbox mode (default "strict"). Failures
+    // here are soft — the account still exists; worst case the user
+    // gets the default mode and an admin can flip later.
+    if let Err(e) = state
+        .db
+        .set_account_sandbox_mode(&username, &invite.sandbox_mode)
+        .await
+    {
+        tracing::warn!(error = %e, account = %username, "invite_accept set_sandbox_mode failed");
+    }
+
+    // 4. Grant the invite's agent whitelist. Empty list is legal:
+    // the user can log in but can't reach any agent until an admin
+    // explicitly grants access.
+    if !invite.allowed_agents.is_empty() {
+        if let Err(e) = state
+            .db
+            .set_allowed_agents(&username, &invite.allowed_agents)
+            .await
+        {
+            tracing::warn!(error = %e, "invite_accept set_allowed_agents failed");
+            // Roll back the account — we'd rather the user retry
+            // with a fresh accept than be stuck with an
+            // un-whitelisted account that doesn't match the
+            // invite's promise.
+            let _ = state.db.delete_account(&username).await;
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "db_error",
+                "could not apply invite ACL",
+            );
+        }
+    }
+
+    // 5. Bump `used` + record the acceptance. If this fails after
+    // the account has been created we leave the account in place
+    // (the user already has the token); the worst-case is a
+    // miscounted invite, which the admin can correct.
+    if let Err(e) = state.db.record_invite_acceptance(&invite.id, &username).await {
+        tracing::warn!(error = %e, invite_id = %invite.id, "could not record invite acceptance");
+    }
+
+    state.audit.write(crate::audit::AuditEvent {
+        account: Some(username.clone()),
+        reason: Some(format!("invite_id={}", invite.id)),
+        ..crate::audit::AuditEvent::new("invite_accepted")
+    });
+
+    (
+        StatusCode::CREATED,
+        Json(json!({
+            "account": username,
+            "token": account_token,
+        })),
+    )
+        .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

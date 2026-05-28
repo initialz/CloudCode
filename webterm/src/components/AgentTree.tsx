@@ -81,58 +81,75 @@ export default function AgentTree({
       )}
 
       {/* Workspace right-click context menu */}
-      {wsMenu && (
-        <div
-          className="fixed z-50 min-w-[10rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
-          style={{ left: wsMenu.x, top: wsMenu.y }}
-        >
-          <button
-            type="button"
-            onClick={() => {
-              const { agent, workspace } = wsMenu;
-              setWsMenu(null);
-              onOpenWorkspace(agent, workspace);
-            }}
-            className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
+      {wsMenu && (() => {
+        const item = workspaces.find(
+          (w) => w.agent === wsMenu.agent && w.name === wsMenu.workspace,
+        );
+        const isOnline = item?.agent_online === true;
+        return (
+          <div
+            className="fixed z-50 min-w-[11rem] bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-700 rounded-md shadow-lg py-1 text-xs font-mono"
+            style={{ left: wsMenu.x, top: wsMenu.y }}
           >
-            Open
-          </button>
-          <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
-          <button
-            type="button"
-            onClick={() => {
-              const { agent, workspace } = wsMenu;
-              setWsMenu(null);
-              // offline check: reset disallowed when agent is offline.
-              const item = workspaces.find(
-                (w) => w.agent === agent && w.name === workspace,
-              );
-              if (!item?.agent_online) return;
-              onResetWorkspace(agent, workspace);
-            }}
-            className={`block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 ${
-              workspaces.find(
-                (w) => w.agent === wsMenu.agent && w.name === wsMenu.workspace,
-              )?.agent_online
-                ? 'text-zinc-700 dark:text-zinc-200'
-                : 'text-zinc-400 dark:text-zinc-600 cursor-not-allowed'
-            }`}
-          >
-            Reset
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              const { agent, workspace } = wsMenu;
-              setWsMenu(null);
-              onDeleteWorkspace(agent, workspace);
-            }}
-            className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-red-600 dark:text-red-400"
-          >
-            Delete
-          </button>
-        </div>
-      )}
+            <button
+              type="button"
+              onClick={() => {
+                const { agent, workspace } = wsMenu;
+                setWsMenu(null);
+                onOpenWorkspace(agent, workspace);
+              }}
+              className="block w-full text-left px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
+            >
+              Open
+            </button>
+            {onOpenFiles && (
+              <button
+                type="button"
+                onClick={() => {
+                  const { agent, workspace } = wsMenu;
+                  setWsMenu(null);
+                  onOpenFiles(agent, workspace);
+                }}
+                className="w-full flex items-center gap-2 px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-700 dark:text-zinc-200"
+              >
+                <FolderOpenIcon />
+                <span>Files</span>
+              </button>
+            )}
+            <div className="my-1 border-t border-zinc-200 dark:border-zinc-700" />
+            <button
+              type="button"
+              onClick={() => {
+                const { agent, workspace } = wsMenu;
+                setWsMenu(null);
+                if (!isOnline) return;
+                onResetWorkspace(agent, workspace);
+              }}
+              disabled={!isOnline}
+              className={`w-full flex items-center gap-2 px-3 py-1.5 hover:bg-zinc-100 dark:hover:bg-zinc-800 ${
+                isOnline
+                  ? 'text-zinc-700 dark:text-zinc-200'
+                  : 'text-zinc-400 dark:text-zinc-600 cursor-not-allowed'
+              }`}
+            >
+              <ResetIcon />
+              <span>Reset</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                const { agent, workspace } = wsMenu;
+                setWsMenu(null);
+                onDeleteWorkspace(agent, workspace);
+              }}
+              className="w-full flex items-center gap-2 px-3 py-1.5 hover:bg-red-50 dark:hover:bg-red-950/30 text-red-600 dark:text-red-400"
+            >
+              <TrashIcon />
+              <span>Delete</span>
+            </button>
+          </div>
+        );
+      })()}
 
       {sorted.map((ws) => {
         const label = `${ws.name}@${ws.agent}`;
@@ -151,9 +168,6 @@ export default function AgentTree({
               if (!ws.agent_online) return;
               onOpenWorkspace(ws.agent, ws.name);
             }}
-            onReset={() => onResetWorkspace(ws.agent, ws.name)}
-            onDelete={() => onDeleteWorkspace(ws.agent, ws.name)}
-            onOpenFiles={onOpenFiles ? () => onOpenFiles(ws.agent, ws.name) : undefined}
             onContextMenu={(x, y) => {
               setWsMenu({ x, y, agent: ws.agent, workspace: ws.name });
             }}
@@ -194,9 +208,6 @@ function WorkspaceRow({
   isLive,
   isActive,
   onOpen,
-  onReset,
-  onDelete,
-  onOpenFiles,
   onContextMenu,
 }: {
   workspace: WorkspaceItem;
@@ -204,83 +215,34 @@ function WorkspaceRow({
   isLive: boolean;
   isActive: boolean;
   onOpen: () => void;
-  onReset: () => void;
-  onDelete: () => void;
-  onOpenFiles?: () => void;
   onContextMenu: (x: number, y: number) => void;
 }) {
   const offline = !workspace.agent_online;
+  const tooltip = offline
+    ? `${label} — agent '${workspace.agent}' is offline`
+    : label;
 
   return (
-    <>
-      <div
-        className={`group flex items-center gap-1 px-2 py-0.5 text-xs font-mono transition-colors ${
-          offline
-            ? 'text-zinc-400 dark:text-zinc-600 cursor-not-allowed'
-            : isActive
-              ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 cursor-pointer'
-              : 'text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-900 dark:hover:text-zinc-100 cursor-pointer'
-        }`}
-        onClick={onOpen}
-        title={offline ? `agent '${workspace.agent}' is offline` : undefined}
-        onContextMenu={(e) => {
-          e.preventDefault();
-          onContextMenu(e.clientX, e.clientY);
-        }}
-      >
-        {/* Status badge */}
-        <span className="w-3 text-center shrink-0">
-          <WorkspaceBadge ws={workspace} isLive={isLive} />
-        </span>
-        <span className="flex-1 truncate">{label}</span>
-
-        {/* Action buttons — hover-visible */}
-        <span className="shrink-0 flex gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
-          {onOpenFiles && (
-            <button
-              onClick={(e) => {
-                e.stopPropagation();
-                onOpenFiles();
-              }}
-              className="p-0.5 rounded text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
-              title="Files"
-              aria-label={`Browse files for workspace ${workspace.name}`}
-            >
-              <FolderOpenIcon />
-            </button>
-          )}
-          {/* Reset — disabled when offline */}
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              if (!offline) onReset();
-            }}
-            className={`p-0.5 rounded transition-colors ${
-              offline
-                ? 'text-zinc-300 dark:text-zinc-700 cursor-not-allowed'
-                : 'text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700'
-            }`}
-            title={offline ? 'Agent is offline' : `Reset ${workspace.name}`}
-            aria-label={`Reset workspace ${workspace.name}`}
-            disabled={offline}
-          >
-            <ResetIcon />
-          </button>
-          {/* Delete — always enabled */}
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              onDelete();
-            }}
-            className="p-0.5 rounded text-zinc-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors"
-            title={`Delete ${workspace.name}`}
-            aria-label={`Delete workspace ${workspace.name}`}
-          >
-            <TrashIcon />
-          </button>
-        </span>
-      </div>
-    </>
+    <div
+      className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono transition-colors ${
+        offline
+          ? 'text-zinc-400 dark:text-zinc-600 cursor-not-allowed'
+          : isActive
+            ? 'bg-zinc-200 dark:bg-zinc-700 text-zinc-900 dark:text-zinc-100 cursor-pointer'
+            : 'text-zinc-600 dark:text-zinc-400 hover:bg-zinc-100 dark:hover:bg-zinc-800 hover:text-zinc-900 dark:hover:text-zinc-100 cursor-pointer'
+      }`}
+      onClick={onOpen}
+      title={tooltip}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onContextMenu(e.clientX, e.clientY);
+      }}
+    >
+      <span className="w-3 text-center shrink-0">
+        <WorkspaceBadge ws={workspace} isLive={isLive} />
+      </span>
+      <span className="flex-1 truncate">{label}</span>
+    </div>
   );
 }
 

@@ -29,10 +29,11 @@ pub struct DbAccount {
     pub token_prefix: Option<String>,
     pub created_at: i64,
     pub disabled: bool,
-    /// Per-account workspace sandbox toggle. Defaults to true on
-    /// fresh installs; existing accounts get true at migration time.
-    /// Replaces the agent.toml-level `[sandbox] enabled` switch.
-    pub sandbox_enabled: bool,
+    /// Per-account sandbox mode: "strict" / "permissive" / "off".
+    /// Replaces the legacy `sandbox_enabled` bool. Defaults to "strict"
+    /// for fresh installs; migration maps the legacy bool to "strict"
+    /// (true) or "permissive" (false).
+    pub sandbox_mode: String,
 }
 
 /// One row in the hub-managed workspace registry. The actual files
@@ -114,6 +115,10 @@ impl Db {
             // the marker check below.
             "ALTER TABLE accounts ADD COLUMN sandbox_enabled INTEGER NOT NULL DEFAULT 1",
             "ALTER TABLE accounts ADD COLUMN real_name TEXT",
+            // sandbox_mode replaces sandbox_enabled (kept for back-compat).
+            // Migration: legacy true → "strict", false → "permissive".
+            "ALTER TABLE accounts ADD COLUMN sandbox_mode TEXT NOT NULL DEFAULT 'strict'",
+            "UPDATE accounts SET sandbox_mode = 'permissive' WHERE sandbox_mode = 'strict' AND sandbox_enabled = 0",
             "CREATE TABLE IF NOT EXISTS audit_events (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 ts         INTEGER NOT NULL,
@@ -253,6 +258,39 @@ impl Db {
             "CREATE INDEX IF NOT EXISTS idx_ui_account_ts ON user_interactions(account, ts_ms DESC)",
             "CREATE INDEX IF NOT EXISTS idx_ui_workspace_ts ON user_interactions(workspace, ts_ms DESC)",
             "CREATE INDEX IF NOT EXISTS idx_ui_session ON user_interactions(claude_session_id)",
+            // Invite links — admin-issued shareable URLs that mint a
+            // brand-new account on accept. `token` is the secret in
+            // the public URL (`/invite/<token>`); `id` is the short
+            // admin-side handle. `allowed_agents` is a comma-separated
+            // string (simple to query, no schema for a join table —
+            // expected to be a handful of agents per invite). `used`
+            // tracks accept count for max_uses enforcement; `active`
+            // is the admin's soft disable.
+            "CREATE TABLE IF NOT EXISTS invite_links (
+                id             TEXT PRIMARY KEY,
+                label          TEXT,
+                token          TEXT NOT NULL UNIQUE,
+                max_uses       INTEGER NOT NULL DEFAULT 0,
+                used           INTEGER NOT NULL DEFAULT 0,
+                allowed_agents TEXT NOT NULL DEFAULT '',
+                active         INTEGER NOT NULL DEFAULT 1,
+                created_at     INTEGER NOT NULL,
+                created_by     TEXT NOT NULL
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_invite_links_token ON invite_links(token)",
+            // sandbox_mode applied to accounts created via this invite.
+            "ALTER TABLE invite_links ADD COLUMN sandbox_mode TEXT NOT NULL DEFAULT 'strict'",
+            // Audit trail of which accounts were minted by which invite.
+            // PK is (invite_id, account) so the same account can never
+            // be linked to one invite twice (defensive; the accept
+            // handler refuses duplicate usernames anyway).
+            "CREATE TABLE IF NOT EXISTS invite_acceptances (
+                invite_id   TEXT NOT NULL,
+                account     TEXT NOT NULL,
+                accepted_at INTEGER NOT NULL,
+                PRIMARY KEY (invite_id, account)
+            )",
+            "CREATE INDEX IF NOT EXISTS idx_invite_acceptances_invite ON invite_acceptances(invite_id)",
             // Compat for deployments that already ran the unguarded
             // seed (pre-v1.8.x): if the ACL table is non-empty, assume
             // the seed has logically happened and lock the marker in,
@@ -341,7 +379,7 @@ impl Db {
     /// `authenticate()`. `Ok(None)` means no such name.
     pub async fn get_account(&self, name: &str) -> Result<Option<DbAccount>> {
         let row = sqlx::query(
-            "SELECT name, token_hash, token_prefix, created_at, disabled, sandbox_enabled, real_name
+            "SELECT name, token_hash, token_prefix, created_at, disabled, sandbox_mode, real_name
              FROM accounts WHERE name = ?1",
         )
         .bind(name)
@@ -354,13 +392,13 @@ impl Db {
             token_prefix: r.get("token_prefix"),
             created_at: r.get("created_at"),
             disabled: r.get::<i64, _>("disabled") != 0,
-            sandbox_enabled: r.get::<i64, _>("sandbox_enabled") != 0,
+            sandbox_mode: r.get("sandbox_mode"),
         }))
     }
 
     pub async fn list_accounts(&self) -> Result<Vec<DbAccount>> {
         let rows = sqlx::query(
-            "SELECT name, token_hash, token_prefix, created_at, disabled, sandbox_enabled, real_name
+            "SELECT name, token_hash, token_prefix, created_at, disabled, sandbox_mode, real_name
              FROM accounts ORDER BY name",
         )
         .fetch_all(&self.pool)
@@ -374,31 +412,31 @@ impl Db {
                 token_prefix: r.get("token_prefix"),
                 created_at: r.get("created_at"),
                 disabled: r.get::<i64, _>("disabled") != 0,
-                sandbox_enabled: r.get::<i64, _>("sandbox_enabled") != 0,
+                sandbox_mode: r.get("sandbox_mode"),
             })
             .collect())
     }
 
-    /// Look up a single account's sandbox toggle. Default true if the
-    /// account is missing (the OpenSession handler still validates the
-    /// account before this is consulted; missing here means the row
-    /// vanished between auth and PtyOpen — better to err on the side
-    /// of more isolation).
-    pub async fn account_sandbox_enabled(&self, name: &str) -> Result<bool> {
+    /// Look up a single account's sandbox mode. Defaults to "strict"
+    /// if missing — err on the side of more isolation.
+    pub async fn account_sandbox_mode(&self, name: &str) -> Result<String> {
         let row = sqlx::query(
-            "SELECT sandbox_enabled FROM accounts WHERE name = ?1",
+            "SELECT sandbox_mode FROM accounts WHERE name = ?1",
         )
         .bind(name)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row
-            .map(|r| r.get::<i64, _>("sandbox_enabled") != 0)
-            .unwrap_or(true))
+            .map(|r| r.get::<String, _>("sandbox_mode"))
+            .unwrap_or_else(|| "strict".to_string()))
     }
 
-    pub async fn set_account_sandbox(&self, name: &str, enabled: bool) -> Result<()> {
-        let rows = sqlx::query("UPDATE accounts SET sandbox_enabled = ?1 WHERE name = ?2")
-            .bind(if enabled { 1_i64 } else { 0_i64 })
+    pub async fn set_account_sandbox_mode(&self, name: &str, mode: &str) -> Result<()> {
+        if !matches!(mode, "strict" | "permissive" | "off") {
+            anyhow::bail!("invalid sandbox mode '{}'", mode);
+        }
+        let rows = sqlx::query("UPDATE accounts SET sandbox_mode = ?1 WHERE name = ?2")
+            .bind(mode)
             .bind(name)
             .execute(&self.pool)
             .await?
@@ -1451,6 +1489,249 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    // ---- invite links --------------------------------------------------
+
+    /// Insert a fresh invite row. Caller has already generated `id`
+    /// + `token` (random) and validated the input. `allowed_agents`
+    /// is joined with commas into the column (empty list → empty
+    /// string). `created_by` is the admin name — always literally
+    /// "admin" under the current single-admin model, but plumbed
+    /// through as a parameter so a future per-operator admin schema
+    /// doesn't need a DB layer change.
+    pub async fn insert_invite(
+        &self,
+        id: &str,
+        label: Option<&str>,
+        token: &str,
+        max_uses: i64,
+        allowed_agents: &[String],
+        created_by: &str,
+        sandbox_mode: &str,
+    ) -> Result<()> {
+        if !matches!(sandbox_mode, "strict" | "permissive" | "off") {
+            anyhow::bail!("invalid sandbox mode '{}'", sandbox_mode);
+        }
+        let agents_str = allowed_agents.join(",");
+        sqlx::query(
+            "INSERT INTO invite_links
+                (id, label, token, max_uses, used, allowed_agents, active, created_at, created_by, sandbox_mode)
+             VALUES (?1, ?2, ?3, ?4, 0, ?5, 1, ?6, ?7, ?8)",
+        )
+        .bind(id)
+        .bind(label)
+        .bind(token)
+        .bind(max_uses)
+        .bind(agents_str)
+        .bind(chrono::Utc::now().timestamp())
+        .bind(created_by)
+        .bind(sandbox_mode)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_invite(&self, id: &str) -> Result<Option<DbInvite>> {
+        let row = sqlx::query(
+            "SELECT id, label, token, max_uses, used, allowed_agents, active, created_at, created_by, sandbox_mode
+               FROM invite_links WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(invite_from_row))
+    }
+
+    pub async fn get_invite_by_token(&self, token: &str) -> Result<Option<DbInvite>> {
+        let row = sqlx::query(
+            "SELECT id, label, token, max_uses, used, allowed_agents, active, created_at, created_by, sandbox_mode
+               FROM invite_links WHERE token = ?1",
+        )
+        .bind(token)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(invite_from_row))
+    }
+
+    pub async fn list_invites(&self) -> Result<Vec<DbInvite>> {
+        let rows = sqlx::query(
+            "SELECT id, label, token, max_uses, used, allowed_agents, active, created_at, created_by, sandbox_mode
+               FROM invite_links ORDER BY created_at DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(invite_from_row).collect())
+    }
+
+    pub async fn update_invite_active(&self, id: &str, active: bool) -> Result<()> {
+        let rows = sqlx::query("UPDATE invite_links SET active = ?1 WHERE id = ?2")
+            .bind(if active { 1_i64 } else { 0_i64 })
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            anyhow::bail!("invite '{}' not found", id);
+        }
+        Ok(())
+    }
+
+    pub async fn update_invite_max_uses(&self, id: &str, max_uses: i64) -> Result<()> {
+        let rows = sqlx::query("UPDATE invite_links SET max_uses = ?1 WHERE id = ?2")
+            .bind(max_uses)
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            anyhow::bail!("invite '{}' not found", id);
+        }
+        Ok(())
+    }
+
+    pub async fn update_invite_label(&self, id: &str, label: Option<&str>) -> Result<()> {
+        let rows = sqlx::query("UPDATE invite_links SET label = ?1 WHERE id = ?2")
+            .bind(label)
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            anyhow::bail!("invite '{}' not found", id);
+        }
+        Ok(())
+    }
+
+    pub async fn update_invite_allowed_agents(&self, id: &str, agents: &[String]) -> Result<()> {
+        let joined = agents.join(",");
+        let rows = sqlx::query("UPDATE invite_links SET allowed_agents = ?1 WHERE id = ?2")
+            .bind(joined)
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            anyhow::bail!("invite '{}' not found", id);
+        }
+        Ok(())
+    }
+
+    pub async fn update_invite_sandbox_mode(&self, id: &str, mode: &str) -> Result<()> {
+        if !matches!(mode, "strict" | "permissive" | "off") {
+            anyhow::bail!("invalid sandbox mode '{}'", mode);
+        }
+        let rows = sqlx::query("UPDATE invite_links SET sandbox_mode = ?1 WHERE id = ?2")
+            .bind(mode)
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            anyhow::bail!("invite '{}' not found", id);
+        }
+        Ok(())
+    }
+
+    pub async fn delete_invite(&self, id: &str) -> Result<()> {
+        // Acceptances rows are kept on purpose — they're the audit
+        // trail of who got in via this link. Dropping them when the
+        // admin deletes the link would erase forensic history. The
+        // admin UI can still surface them by joining on invite_id
+        // without needing the parent row.
+        let rows = sqlx::query("DELETE FROM invite_links WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            anyhow::bail!("invite '{}' not found", id);
+        }
+        Ok(())
+    }
+
+    /// Record an acceptance and bump `used` in a single transaction so
+    /// the counter and the audit row never disagree. Caller must have
+    /// already checked `used < max_uses` (or `max_uses == 0`); this
+    /// method enforces the row exists but not the cap.
+    pub async fn record_invite_acceptance(&self, invite_id: &str, account: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO invite_acceptances (invite_id, account, accepted_at)
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(invite_id)
+        .bind(account)
+        .bind(chrono::Utc::now().timestamp())
+        .execute(&mut *tx)
+        .await?;
+        let rows = sqlx::query("UPDATE invite_links SET used = used + 1 WHERE id = ?1")
+            .bind(invite_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            anyhow::bail!("invite '{}' not found", invite_id);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Account name + acceptance timestamp for every account minted
+    /// via this invite. Ordered newest first so the admin UI shows
+    /// the most recent acceptances at the top without an extra sort.
+    pub async fn list_invite_acceptances(&self, invite_id: &str) -> Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT account, accepted_at FROM invite_acceptances
+              WHERE invite_id = ?1
+              ORDER BY accepted_at DESC",
+        )
+        .bind(invite_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<String, _>("account"), r.get::<i64, _>("accepted_at")))
+            .collect())
+    }
+}
+
+/// One row in `invite_links`. `allowed_agents` is exposed as a Vec
+/// (split on commas + empty filter) because the DB layer is the only
+/// place that knows about the comma-separated encoding; every caller
+/// works in terms of agent names.
+#[derive(Debug, Clone)]
+pub struct DbInvite {
+    pub id: String,
+    pub label: Option<String>,
+    pub token: String,
+    pub max_uses: i64,
+    pub used: i64,
+    pub allowed_agents: Vec<String>,
+    pub active: bool,
+    pub created_at: i64,
+    pub created_by: String,
+    pub sandbox_mode: String,
+}
+
+fn invite_from_row(r: sqlx::sqlite::SqliteRow) -> DbInvite {
+    let agents_str: String = r.get("allowed_agents");
+    let allowed_agents: Vec<String> = agents_str
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    DbInvite {
+        id: r.get("id"),
+        label: r.get("label"),
+        token: r.get("token"),
+        max_uses: r.get("max_uses"),
+        used: r.get("used"),
+        allowed_agents,
+        active: r.get::<i64, _>("active") != 0,
+        created_at: r.get("created_at"),
+        created_by: r.get("created_by"),
+        sandbox_mode: r.get("sandbox_mode"),
     }
 }
 

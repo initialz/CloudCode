@@ -60,9 +60,11 @@ export type AccountDto = {
   /// At least one WebSocket connection is open (webterm tab loaded
   /// or CLI dialled in), even before a workspace is opened.
   connected: boolean;
-  /// Per-account sandbox toggle (replaces agent.toml [sandbox]).
-  sandbox_enabled: boolean;
+  /// Per-account sandbox mode: "strict" | "permissive" | "off".
+  sandbox_mode: SandboxMode;
 };
+
+export type SandboxMode = 'strict' | 'permissive' | 'off';
 
 export type DashboardDto = {
   accounts: number;
@@ -79,6 +81,26 @@ export type SessionDto = {
   started_at: number;
   ended_at: number | null;
   ended_reason: string | null;
+};
+
+export type InviteDto = {
+  id: string;
+  label: string | null;
+  token: string;
+  share_url: string;
+  /// 0 = unlimited
+  max_uses: number;
+  used: number;
+  allowed_agents: string[];
+  active: boolean;
+  created_at: number;
+  sandbox_mode: SandboxMode;
+};
+
+export type InviteAcceptanceDto = {
+  account: string;
+  accepted_at: number;
+  real_name?: string | null;
 };
 
 export type AuditEventDto = {
@@ -123,8 +145,11 @@ export const apiClient = {
       }),
     toggle: (name: string) =>
       api<void>(`/accounts/${encodeURIComponent(name)}/toggle`, { method: 'POST' }),
-    toggleSandbox: (name: string) =>
-      api<void>(`/accounts/${encodeURIComponent(name)}/sandbox`, { method: 'POST' }),
+    setSandboxMode: (name: string, sandbox_mode: SandboxMode) =>
+      api<void>(`/accounts/${encodeURIComponent(name)}/sandbox-mode`, {
+        method: 'PUT',
+        body: JSON.stringify({ sandbox_mode }),
+      }),
     disconnect: (name: string) =>
       api<void>(`/accounts/${encodeURIComponent(name)}/disconnect`, {
         method: 'POST',
@@ -140,6 +165,38 @@ export const apiClient = {
         method: 'PUT',
         body: JSON.stringify({ agents }),
       }),
+  },
+  invites: {
+    list: () => api<InviteDto[]>('/invites'),
+    create: (body: { label?: string; max_uses?: number; allowed_agents: string[]; sandbox_mode?: SandboxMode }) =>
+      api<{ id: string; token: string; share_url: string }>('/invites', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    setActive: (id: string, active: boolean) =>
+      api<void>(`/invites/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ active }),
+      }),
+    update: (
+      id: string,
+      patch: {
+        label?: string;
+        max_uses?: number;
+        allowed_agents?: string[];
+        sandbox_mode?: SandboxMode;
+      },
+    ) =>
+      api<void>(`/invites/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify(patch),
+      }),
+    delete: (id: string) =>
+      api<void>(`/invites/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+    acceptances: (id: string) =>
+      api<InviteAcceptanceDto[]>(
+        `/invites/${encodeURIComponent(id)}/acceptances`,
+      ),
   },
   agents: {
     list: () => api<AgentRowDto[]>('/agents'),

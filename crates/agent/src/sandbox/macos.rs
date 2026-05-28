@@ -39,6 +39,12 @@ pub fn apply(params: &SandboxParams) -> Result<()> {
     let profile_src = match params.mode {
         SandboxMode::Strict => PROFILE_STRICT,
         SandboxMode::Permissive => PROFILE_PERMISSIVE,
+        SandboxMode::Off => {
+            // Off should be handled by the caller skipping the entire
+            // sandbox-exec wrapper — we should never get here. If we do,
+            // applying nothing is the safest fallback.
+            return Ok(());
+        }
     };
     let profile = CString::new(profile_src).map_err(|_| anyhow!("sandbox profile contains NUL"))?;
 

@@ -577,10 +577,10 @@ export default function FilesModal({ agent, workspace, onClose }: Props) {
   const totalRows = rows.length;
 
   return (
-    /* Backdrop */
+    /* Backdrop — no onClick: must use the X button to close so
+       in-progress uploads / selections aren't lost on accidental click */
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-      onClick={onClose}
     >
       {/* Modal panel */}
       <div

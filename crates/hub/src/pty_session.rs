@@ -762,15 +762,20 @@ where
                     let _ = conn.send(ServerMsg::PtyClose { session_id: prev }).await;
                 }
             }
-            // Per-account sandbox decision — looked up once per
-            // OpenSession so admin-UI toggles take effect on the
-            // next session without restarting anything.
-            let sandbox = ctx
+            // Per-account sandbox mode — looked up once per OpenSession
+            // so admin-UI changes take effect on the next session.
+            let sandbox_mode = ctx
                 .state
                 .db
-                .account_sandbox_enabled(&ctx.account_name)
+                .account_sandbox_mode(&ctx.account_name)
                 .await
-                .unwrap_or(true);
+                .unwrap_or_else(|_| "strict".to_string());
+            // Legacy bool kept for pre-v1.23 agents that don't read
+            // sandbox_mode. "strict" or "off" both map cleanly; "off"
+            // collapses to false (permissive) for legacy agents — the
+            // user gets one mode worse than they asked for, but it
+            // stays running.
+            let sandbox = sandbox_mode == "strict";
             // Merge in webterm-side default args when the client
             // sent none. webterm already does this on its end before
             // dispatching OpenSession (so its claude_args is
@@ -804,6 +809,7 @@ where
                     rows,
                     claude_args,
                     sandbox,
+                    sandbox_mode: Some(sandbox_mode),
                     tool,
                 })
                 .await

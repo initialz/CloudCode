@@ -196,6 +196,7 @@ export function Layout() {
             <Tab to="/workspaces">Workspaces</Tab>
             <Tab to="/sessions">Sessions</Tab>
             <Tab to="/activity">Activity</Tab>
+            <Tab to="/invites">Invites</Tab>
           </nav>
         </div>
         <div className="flex items-center gap-2">

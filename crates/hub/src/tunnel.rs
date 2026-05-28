@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "11";
+pub const PROTOCOL_VERSION: &str = "12";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
@@ -304,11 +304,14 @@ pub enum ServerMsg {
         rows: u16,
         #[serde(default)]
         claude_args: Vec<String>,
-        /// Wrap the spawned tmux+claude in the workspace sandbox.
-        /// Decided per-account on the hub. Defaults to false for
-        /// back-compat with pre-v1.9 hubs that never sent it.
+        /// Legacy bool kept for back-compat with pre-v1.23 agents.
+        /// New code path is `sandbox_mode` below.
         #[serde(default)]
         sandbox: bool,
+        /// Per-account sandbox mode: "strict" / "permissive" / "off".
+        /// When None, agent derives from the legacy `sandbox` bool.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox_mode: Option<String>,
         /// Which tool to launch in the first pane (claude / codex / …).
         /// `None` means "agent default" — the agent falls back to its
         /// `[tools].default`. Optional for back-compat with pre-v1.10
