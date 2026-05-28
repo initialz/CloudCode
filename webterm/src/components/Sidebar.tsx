@@ -116,17 +116,17 @@ export default function Sidebar({
         <div className="flex items-center gap-2 px-3 py-2.5 border-b border-zinc-200 dark:border-zinc-800 shrink-0">
           <Logo size={18} className="text-zinc-700 dark:text-zinc-300 shrink-0" />
           <span className="text-sm font-semibold text-zinc-800 dark:text-zinc-200 select-none">
-            Workbench
+            Cloudcode
           </span>
         </div>
 
         {/* "+ New workspace" button — pinned below header */}
-        <div className="shrink-0 px-2 pt-2 pb-1">
+        <div className="shrink-0 px-3 pt-3 pb-2">
           <button
             type="button"
             onClick={openCreate}
             disabled={agents.length === 0}
-            className="w-full flex items-center gap-1.5 px-2 py-1.5 rounded-md text-xs font-mono font-medium text-zinc-600 dark:text-zinc-300 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-700 hover:text-zinc-900 dark:hover:text-zinc-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
+            className="w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-xs font-mono font-medium text-zinc-600 dark:text-zinc-300 bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-700 hover:text-zinc-900 dark:hover:text-zinc-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >
             <PlusIcon />
             New workspace

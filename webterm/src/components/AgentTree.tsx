@@ -214,7 +214,7 @@ function WorkspaceRow({
   return (
     <>
       <div
-        className={`group flex items-center gap-1 px-2 py-0.5 text-xs font-mono transition-colors ${
+        className={`group flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono transition-colors ${
           offline
             ? 'text-zinc-400 dark:text-zinc-600 cursor-not-allowed'
             : isActive
@@ -242,7 +242,7 @@ function WorkspaceRow({
                 e.stopPropagation();
                 onOpenFiles();
               }}
-              className="p-0.5 rounded text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
+              className="p-1 rounded text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
               title="Files"
               aria-label={`Browse files for workspace ${workspace.name}`}
             >
@@ -255,7 +255,7 @@ function WorkspaceRow({
               e.stopPropagation();
               if (!offline) onReset();
             }}
-            className={`p-0.5 rounded transition-colors ${
+            className={`p-1 rounded transition-colors ${
               offline
                 ? 'text-zinc-300 dark:text-zinc-700 cursor-not-allowed'
                 : 'text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200 hover:bg-zinc-200 dark:hover:bg-zinc-700'
@@ -272,7 +272,7 @@ function WorkspaceRow({
               e.stopPropagation();
               onDelete();
             }}
-            className="p-0.5 rounded text-zinc-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors"
+            className="p-1 rounded text-zinc-400 hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/40 transition-colors"
             title={`Delete ${workspace.name}`}
             aria-label={`Delete workspace ${workspace.name}`}
           >
