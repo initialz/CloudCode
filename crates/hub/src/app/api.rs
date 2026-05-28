@@ -1067,33 +1067,30 @@ pub async fn invite_info(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(token): axum::extract::Path<String>,
 ) -> Response {
+    // For all failure modes (token unknown, inactive, exhausted) we
+    // return the same opaque "not_found" so the user can't tell which
+    // case applies. The admin can still see the real state in the
+    // admin UI.
+    let invalid = || {
+        (
+            StatusCode::OK,
+            Json(json!({ "valid": false, "reason": "not_found" })),
+        )
+            .into_response()
+    };
     let invite = match state.db.get_invite_by_token(&token).await {
         Ok(Some(i)) => i,
-        Ok(None) => {
-            return (
-                StatusCode::OK,
-                Json(json!({ "valid": false, "reason": "not_found" })),
-            )
-                .into_response();
-        }
+        Ok(None) => return invalid(),
         Err(e) => {
             tracing::warn!(error = %e, "invite_info db lookup failed");
             return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", "db error");
         }
     };
     if !invite.active {
-        return (
-            StatusCode::OK,
-            Json(json!({ "valid": false, "reason": "inactive" })),
-        )
-            .into_response();
+        return invalid();
     }
     if invite.max_uses > 0 && invite.used >= invite.max_uses {
-        return (
-            StatusCode::OK,
-            Json(json!({ "valid": false, "reason": "exhausted" })),
-        )
-            .into_response();
+        return invalid();
     }
     (
         StatusCode::OK,
@@ -1127,28 +1124,27 @@ pub async fn invite_accept(
     axum::extract::Path(token): axum::extract::Path<String>,
     Json(req): Json<AcceptInviteRequest>,
 ) -> Response {
-    // 1. Resolve + validate the invite.
+    // 1. Resolve + validate the invite. All three failure cases
+    // (unknown, inactive, exhausted) collapse to the same opaque
+    // response so the user can't probe for the real state.
+    let opaque_not_found = || err(
+        StatusCode::NOT_FOUND,
+        "not_found",
+        "invite link is invalid or has expired",
+    );
     let invite = match state.db.get_invite_by_token(&token).await {
         Ok(Some(i)) => i,
-        Ok(None) => return err(StatusCode::NOT_FOUND, "not_found", "invite link is invalid"),
+        Ok(None) => return opaque_not_found(),
         Err(e) => {
             tracing::warn!(error = %e, "invite_accept db lookup failed");
             return err(StatusCode::INTERNAL_SERVER_ERROR, "db_error", "db error");
         }
     };
     if !invite.active {
-        return err(
-            StatusCode::FORBIDDEN,
-            "inactive",
-            "this invite link is no longer active",
-        );
+        return opaque_not_found();
     }
     if invite.max_uses > 0 && invite.used >= invite.max_uses {
-        return err(
-            StatusCode::FORBIDDEN,
-            "exhausted",
-            "this invite link has been used up",
-        );
+        return opaque_not_found();
     }
 
     // 2. Validate the requested username.
