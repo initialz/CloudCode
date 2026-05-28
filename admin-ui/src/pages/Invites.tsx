@@ -472,13 +472,10 @@ export function Invites() {
             }
             className="w-full px-3 py-2 rounded border border-zinc-300 dark:border-zinc-700 bg-transparent text-sm focus:outline-none focus:ring-2 focus:ring-zinc-400"
           >
-            <option value="strict">strict — full isolation (recommended)</option>
-            <option value="permissive">permissive — cross-account isolation only</option>
-            <option value="off">off — no sandbox</option>
+            <option value="strict">strict</option>
+            <option value="permissive">permissive</option>
+            <option value="off">off</option>
           </select>
-          <p className="text-xs text-zinc-400">
-            Applied to accounts created via this invite.
-          </p>
         </div>
         <div className="space-y-1">
           <label className="text-xs text-zinc-500">Allowed agents</label>
@@ -669,9 +666,9 @@ export function Invites() {
             }
             className="w-full px-3 py-2 rounded border border-zinc-300 dark:border-zinc-700 bg-transparent text-sm focus:outline-none focus:ring-2 focus:ring-zinc-400"
           >
-            <option value="strict">strict — full isolation (recommended)</option>
-            <option value="permissive">permissive — cross-account isolation only</option>
-            <option value="off">off — no sandbox</option>
+            <option value="strict">strict</option>
+            <option value="permissive">permissive</option>
+            <option value="off">off</option>
           </select>
         </div>
         <div className="space-y-1">
