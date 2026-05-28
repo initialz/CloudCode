@@ -318,13 +318,6 @@ export function Invites() {
                         </button>
                         <button
                           disabled={pending}
-                          onClick={() => onToggleActive(inv)}
-                          className="px-2 py-1 text-xs rounded border border-zinc-300 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800 disabled:opacity-50"
-                        >
-                          {inv.active ? 'Disable' : 'Enable'}
-                        </button>
-                        <button
-                          disabled={pending}
                           onClick={() => setConfirmDelete(inv)}
                           className="px-2 py-1 text-xs rounded border border-red-300 dark:border-red-700/50 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/20 disabled:opacity-50"
                         >
