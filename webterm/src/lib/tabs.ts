@@ -35,9 +35,18 @@ export type Tab = {
   opened: boolean;
 };
 
-/** Stable key used to deduplicate tabs. */
+/** Stable key used to deduplicate tabs. Tabs are scoped to a single
+ *  browser session (one logged-in account at a time), so the key only
+ *  needs agent + workspace. */
 export function tabKey(agent: string, workspace: string): string {
   return `${agent}::${workspace}`;
+}
+
+/** Key for persisted terminal scrollback (IndexedDB). Includes the
+ *  account so two different users on the same browser don't see each
+ *  other's history when they open a workspace with the same name. */
+export function termHistoryKey(account: string, agent: string, workspace: string): string {
+  return `${account}::${agent}::${workspace}`;
 }
 
 /** Human-readable label shown in the tab bar. */
