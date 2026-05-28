@@ -183,6 +183,11 @@ export const apiClient = {
         method: 'PATCH',
         body: JSON.stringify({ max_uses }),
       }),
+    setLabel: (id: string, label: string) =>
+      api<void>(`/invites/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ label }),
+      }),
     delete: (id: string) =>
       api<void>(`/invites/${encodeURIComponent(id)}`, { method: 'DELETE' }),
     acceptances: (id: string) =>

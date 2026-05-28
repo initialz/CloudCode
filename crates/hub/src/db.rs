@@ -1590,6 +1590,19 @@ impl Db {
         Ok(())
     }
 
+    pub async fn update_invite_label(&self, id: &str, label: Option<&str>) -> Result<()> {
+        let rows = sqlx::query("UPDATE invite_links SET label = ?1 WHERE id = ?2")
+            .bind(label)
+            .bind(id)
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        if rows == 0 {
+            anyhow::bail!("invite '{}' not found", id);
+        }
+        Ok(())
+    }
+
     pub async fn delete_invite(&self, id: &str) -> Result<()> {
         // Acceptances rows are kept on purpose — they're the audit
         // trail of who got in via this link. Dropping them when the

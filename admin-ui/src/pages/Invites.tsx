@@ -55,6 +55,10 @@ export function Invites() {
   const [editingMaxId, setEditingMaxId] = useState<string | null>(null);
   const [editingMaxValue, setEditingMaxValue] = useState('');
 
+  // Inline edit for label
+  const [editingLabelId, setEditingLabelId] = useState<string | null>(null);
+  const [editingLabelValue, setEditingLabelValue] = useState('');
+
   // Acceptances modal
   const [acceptancesModal, setAcceptancesModal] =
     useState<AcceptancesModalState | null>(null);
@@ -177,6 +181,32 @@ export function Invites() {
     }
   }
 
+  function beginEditLabel(inv: InviteDto) {
+    setEditingLabelId(inv.id);
+    setEditingLabelValue(inv.label ?? '');
+  }
+  function cancelEditLabel() {
+    setEditingLabelId(null);
+    setEditingLabelValue('');
+  }
+  async function commitEditLabel(inv: InviteDto) {
+    const trimmed = editingLabelValue.trim();
+    if (trimmed === (inv.label ?? '')) {
+      cancelEditLabel();
+      return;
+    }
+    setPending(true);
+    try {
+      await apiClient.invites.setLabel(inv.id, trimmed);
+      await reload();
+    } catch (e: any) {
+      setErr(e?.message ?? 'update failed');
+    } finally {
+      cancelEditLabel();
+      setPending(false);
+    }
+  }
+
   async function onDelete(id: string) {
     setPending(true);
     try {
@@ -283,12 +313,34 @@ export function Invites() {
                   return (
                     <tr key={inv.id}>
                       <td className="px-3 py-2 text-zinc-700 dark:text-zinc-200">
-                        {inv.label ? (
-                          inv.label
+                        {editingLabelId === inv.id ? (
+                          <input
+                            type="text"
+                            value={editingLabelValue}
+                            onChange={(e) => setEditingLabelValue(e.target.value)}
+                            onBlur={() => commitEditLabel(inv)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') commitEditLabel(inv);
+                              else if (e.key === 'Escape') cancelEditLabel();
+                            }}
+                            autoFocus
+                            className="w-full px-1 py-0 text-sm rounded border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 focus:outline-none focus:ring-1 focus:ring-zinc-500"
+                          />
                         ) : (
-                          <span className="text-zinc-400 italic">
-                            (unnamed)
-                          </span>
+                          <button
+                            type="button"
+                            onClick={() => beginEditLabel(inv)}
+                            className="text-left hover:underline"
+                            title="Click to edit"
+                          >
+                            {inv.label ? (
+                              inv.label
+                            ) : (
+                              <span className="text-zinc-400 italic">
+                                (unnamed)
+                              </span>
+                            )}
+                          </button>
                         )}
                       </td>
                       <td className="px-3 py-2">

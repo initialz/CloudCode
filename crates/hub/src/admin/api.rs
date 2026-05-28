@@ -2665,6 +2665,10 @@ pub struct PatchInviteRequest {
     pub active: Option<bool>,
     #[serde(default)]
     pub max_uses: Option<i64>,
+    /// `Some("")` clears the label (back to NULL); `Some("foo")` sets it.
+    /// Omitting the field leaves it unchanged.
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
 pub async fn invites_patch(
@@ -2686,6 +2690,13 @@ pub async fn invites_patch(
             );
         }
         if let Err(e) = state.app.db.update_invite_max_uses(&id, max_uses).await {
+            return err(StatusCode::NOT_FOUND, "not_found", e.to_string());
+        }
+    }
+    if let Some(label) = req.label {
+        let trimmed = label.trim();
+        let to_set = if trimmed.is_empty() { None } else { Some(trimmed) };
+        if let Err(e) = state.app.db.update_invite_label(&id, to_set).await {
             return err(StatusCode::NOT_FOUND, "not_found", e.to_string());
         }
     }
