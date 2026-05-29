@@ -1,5 +1,5 @@
-#!/usr/bin/env bash
-# cloudcode installer
+#!/bin/sh
+# cloudcode installer (POSIX sh — works with bash, dash, ash, ...)
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sh -s -- hub
@@ -9,7 +9,7 @@
 # Flags:
 #   --version vX.Y.Z   Pin to specific release (default: latest)
 #   --prefix DIR       Install root (default: /usr/local)
-set -euo pipefail
+set -eu
 
 REPO="initialz/cloudcode"
 COMPONENT="${1:-}"
