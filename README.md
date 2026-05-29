@@ -37,6 +37,17 @@ cloudcode --init && $EDITOR ~/.config/cloudcode/config.toml && cloudcode
 
 Open the admin UI at `http://<hub>:7101/admin/`, paste the admin token, grant your account access to the agent, and you're done. The user-facing browser client lives at `http://<hub>:7100/`.
 
+### Windows (WSL2)
+
+CloudCode's agent uses tmux for session persistence; native Windows builds aren't shipped yet. On Windows 10/11, run the installer from PowerShell — it sets up WSL2 (if needed) and installs the Linux agent inside it:
+
+```powershell
+# default is agent; set CC_COMPONENT to "hub" or "client" if needed
+iwr -useb https://raw.githubusercontent.com/initialz/cloudcode/main/install.ps1 | iex
+```
+
+After the script finishes, your agent lives inside WSL2. Start it from a WSL shell with `cloudcode-agent daemon start --config ./agent.toml` after editing the config.
+
 ## Documentation
 
 → **[User Guide](docs/USER_GUIDE.md)** — installation in depth, multi-tool setup, web UI walkthrough, CLI menu / persistence rules, macOS sandbox, admin UI, self-update, troubleshooting.
