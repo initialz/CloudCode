@@ -38,6 +38,7 @@ import { DEFAULT_TOOL, KNOWN_TOOLS } from '@/lib/tools';
 import Sidebar from '@/components/Sidebar';
 import TabBar from '@/components/TabBar';
 import SettingsDialog from '@/components/SettingsDialog';
+import Tutorial, { clearTutorialSeen, hasSeenTutorial } from '@/components/Tutorial';
 import FilesModal from '@/components/FilesModal';
 
 // ── xterm theme helpers ──────────────────────────────────────────────────────
@@ -141,6 +142,17 @@ export default function Workbench() {
 
   // Settings dialog
   const [showSettings, setShowSettings] = useState(false);
+  const [showTutorial, setShowTutorial] = useState(false);
+
+  // Show the tour the first time a user lands here (per browser).
+  useEffect(() => {
+    if (authLoading) return;
+    if (!hasSeenTutorial()) {
+      // Delay a tick so the sidebar has time to mount.
+      const t = window.setTimeout(() => setShowTutorial(true), 400);
+      return () => window.clearTimeout(t);
+    }
+  }, [authLoading]);
 
   // File manager modal
   const [filesModal, setFilesModal] = useState<{ agent: string; workspace: string } | null>(null);
@@ -1118,6 +1130,9 @@ export default function Workbench() {
         </div>
       </div>
 
+      {/* First-time tutorial */}
+      {showTutorial && <Tutorial onClose={() => setShowTutorial(false)} />}
+
       {/* Settings modal */}
       {showSettings && (
         <SettingsDialog
@@ -1127,6 +1142,10 @@ export default function Workbench() {
           onSavePreferences={savePreferences}
           realName={realName}
           onSaveRealName={saveRealName}
+          onReplayTutorial={() => {
+            clearTutorialSeen();
+            setShowTutorial(true);
+          }}
         />
       )}
 

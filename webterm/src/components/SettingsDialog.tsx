@@ -19,6 +19,8 @@ type Props = {
   onSavePreferences: (next: Preferences) => void;
   realName?: string | null;
   onSaveRealName?: (name: string | null) => void;
+  /** Closes settings and re-runs the first-time tour. */
+  onReplayTutorial?: () => void;
 };
 
 export default function SettingsDialog({
@@ -28,6 +30,7 @@ export default function SettingsDialog({
   onSavePreferences,
   realName,
   onSaveRealName,
+  onReplayTutorial,
 }: Props) {
   const [theme, setTheme] = useState<Theme>(getStoredTheme);
   const [nameText, setNameText] = useState(realName ?? '');
@@ -161,7 +164,20 @@ export default function SettingsDialog({
           </div>
         </div>
 
-        <div className="flex justify-end gap-2">
+        <div className="flex items-center gap-2">
+          {onReplayTutorial && (
+            <button
+              type="button"
+              onClick={() => {
+                onReplayTutorial();
+                onClose();
+              }}
+              className="text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100 underline transition-colors"
+            >
+              Show tutorial again
+            </button>
+          )}
+          <div className="flex-1" />
           <button
             onClick={handleClose}
             className="text-sm px-3 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-400 hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors"

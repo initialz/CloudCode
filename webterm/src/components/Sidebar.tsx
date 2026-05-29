@@ -121,7 +121,7 @@ export default function Sidebar({
         </div>
 
         {/* "+ New workspace" button — pinned below header */}
-        <div className="shrink-0 px-3 pt-3 pb-2">
+        <div className="shrink-0 px-3 pt-3 pb-2" data-tutorial="new-workspace">
           <button
             type="button"
             onClick={openCreate}
@@ -134,7 +134,7 @@ export default function Sidebar({
         </div>
 
         {/* Flat workspace list */}
-        <div className="flex-1 overflow-y-auto py-1">
+        <div className="flex-1 overflow-y-auto py-1" data-tutorial="workspace-list">
           <AgentTree
             workspaces={workspaces}
             loading={agentsLoading}
@@ -165,6 +165,7 @@ export default function Sidebar({
           )}
           <div className="flex gap-2">
             <button
+              data-tutorial="settings"
               onClick={onSettings}
               className="text-xs text-zinc-400 dark:text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 transition-colors"
             >
