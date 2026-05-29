@@ -39,14 +39,24 @@ Open the admin UI at `http://<hub>:7101/admin/`, paste the admin token, grant yo
 
 ### Windows (WSL2)
 
-CloudCode's agent uses tmux for session persistence; native Windows builds aren't shipped yet. On Windows 10/11, run the installer from PowerShell — it sets up WSL2 (if needed) and installs the Linux agent inside it:
+CloudCode's agent uses tmux for session persistence; native Windows builds aren't shipped yet. The recommended path is WSL2.
+
+**From a native Windows PowerShell window (not inside WSL):**
 
 ```powershell
 # default is agent; set CC_COMPONENT to "hub" or "client" if needed
 iwr -useb https://raw.githubusercontent.com/initialz/cloudcode/main/install.ps1 | iex
 ```
 
-After the script finishes, your agent lives inside WSL2. Start it from a WSL shell with `cloudcode-agent daemon start --config ./agent.toml` after editing the config.
+The script makes sure WSL2 is installed and then runs the Linux installer inside your default distro.
+
+**If you're already inside a WSL shell** (e.g. `wsl` then a bash prompt), skip the PowerShell wrapper and use the Linux one-liner directly:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sudo sh -s -- agent
+```
+
+After install your agent lives inside WSL2. Start it from a WSL shell with `cloudcode-agent daemon start --config ./agent.toml` after editing the config.
 
 ## Documentation
 

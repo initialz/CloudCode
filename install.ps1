@@ -7,11 +7,15 @@
 #   1. Ensuring WSL2 is installed with a Linux distro
 #   2. Running the Linux install.sh inside WSL2
 #
-# Usage (from PowerShell):
+# Usage (from a NATIVE Windows PowerShell window, NOT inside WSL):
 #   iwr -useb https://raw.githubusercontent.com/initialz/cloudcode/main/install.ps1 | iex
 #
 # Or with explicit component (default: agent):
 #   $env:CC_COMPONENT="agent"; iwr -useb https://raw.githubusercontent.com/initialz/cloudcode/main/install.ps1 | iex
+#
+# If you're already inside a WSL shell, skip this script and use the
+# Linux installer directly:
+#   curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh | sudo sh -s -- agent
 
 #Requires -Version 5.1
 
