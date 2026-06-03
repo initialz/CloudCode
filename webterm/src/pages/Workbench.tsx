@@ -187,23 +187,65 @@ export default function Workbench() {
 
   // Terminal file-drop / paste-image state.
   //   `dragOverTabId` — which tab's pane is showing the drop highlight.
-  //   `uploadingTabId` — which tab currently has an upload in flight (drives a
-  //     lightweight, non-blocking progress pill). Typing is never blocked.
+  //   `uploadDialog` — the modal shown while a dropped/pasted batch uploads:
+  //     byte progress + a single Close (✕) button that doubles as cancel
+  //     (aborts an in-flight upload). Auto-closes on success; stays open to
+  //     show an error.
+  type UploadDialogState = {
+    tabId: string;
+    label: string; // "image.png" or "3 files"
+    loaded: number;
+    total: number;
+    status: 'uploading' | 'error';
+    errorMsg?: string;
+    cancel: () => void; // abort the in-flight upload
+  };
   const [dragOverTabId, setDragOverTabId] = useState<string | null>(null);
-  const [uploadingTabId, setUploadingTabId] = useState<string | null>(null);
+  const [uploadDialog, setUploadDialog] = useState<UploadDialogState | null>(null);
+
+  // Only mutate the dialog if it still belongs to the same upload (the user
+  // may have closed it / started another) — guards against stale callbacks.
+  const patchUploadDialog = useCallback(
+    (tabId: string, patch: Partial<UploadDialogState>) =>
+      setUploadDialog((cur) => (cur && cur.tabId === tabId ? { ...cur, ...patch } : cur)),
+    [],
+  );
+
+  // Close (✕) doubles as cancel: abort an in-flight upload, then dismiss.
+  const closeUploadDialog = useCallback(() => {
+    setUploadDialog((cur) => {
+      if (cur && cur.status === 'uploading') cur.cancel();
+      return null;
+    });
+  }, []);
 
   // Drive the upload-and-insert pipeline for a tab. Shared by the drop and
-  // paste-image handlers; keeps the progress/toast wiring in one place.
+  // paste-image handlers; keeps the dialog/progress wiring in one place.
   const runUploadAndInsert = useCallback(
     (tab: Tab, files: File[]) => {
       if (files.length === 0) return;
-      setUploadingTabId(tab.id);
+      const label = files.length === 1 ? files[0].name : `${files.length} files`;
+      setUploadDialog({
+        tabId: tab.id,
+        label,
+        loaded: 0,
+        total: 0,
+        status: 'uploading',
+        cancel: () => {},
+      });
       void uploadAndInsertFiles(tab, files, {
-        onError: (message) => addToast(message),
-        onDone: () => setUploadingTabId((cur) => (cur === tab.id ? null : cur)),
+        onStart: (cancel) => patchUploadDialog(tab.id, { cancel }),
+        onProgress: (loaded, total) => patchUploadDialog(tab.id, { loaded, total }),
+        onError: (message) => patchUploadDialog(tab.id, { status: 'error', errorMsg: message }),
+        onDone: () =>
+          // Auto-close on success; keep open if an error was set (onError runs
+          // before this in the finally), so the user can read it.
+          setUploadDialog((cur) =>
+            cur && cur.tabId === tab.id && cur.status !== 'error' ? null : cur,
+          ),
       });
     },
-    [addToast],
+    [patchUploadDialog],
   );
   // Ref so the empty-deps `attachContainer` callback (which wires the paste
   // listener once, at term.open() time) always calls the latest pipeline.
@@ -1221,16 +1263,6 @@ export default function Workbench() {
                 </div>
               )}
 
-              {/* Upload-in-flight pill — non-blocking, lets typing continue */}
-              {uploadingTabId === tab.id && (
-                <div className="absolute bottom-2 right-2 z-30 pointer-events-none">
-                  <div className="flex items-center gap-1.5 rounded-full border border-blue-400 bg-blue-50 dark:border-blue-500/60 dark:bg-blue-900/40 px-2.5 py-1 text-xs font-medium text-blue-800 dark:text-blue-200 shadow-sm">
-                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-blue-500 animate-pulse" />
-                    Uploading…
-                  </div>
-                </div>
-              )}
-
               {/* Status overlays */}
               {(tab.status === 'connecting' || tab.status === 'opening') && (
                 <div className="absolute inset-0 flex items-center justify-center bg-white/80 dark:bg-zinc-950/80 z-10 pointer-events-none">
@@ -1309,6 +1341,51 @@ export default function Workbench() {
           onRestartWorkspace={handleResetWorkspace}
           onClose={() => setConfigModal(null)}
         />
+      )}
+
+      {/* Upload dialog — shown while a dropped/pasted batch uploads. The ✕
+          button doubles as cancel (aborts an in-flight upload). Auto-closes
+          on success; stays open to show an error. */}
+      {uploadDialog && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+          <div className="w-80 rounded-lg border border-zinc-200 bg-white p-4 shadow-xl dark:border-zinc-700 dark:bg-zinc-900">
+            <div className="mb-3 flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+                {uploadDialog.status === 'error' ? 'Upload failed' : 'Uploading'}
+              </h3>
+              <button
+                type="button"
+                aria-label="Close"
+                onClick={closeUploadDialog}
+                className="rounded p-1 text-zinc-400 hover:bg-zinc-100 hover:text-zinc-700 dark:hover:bg-zinc-800 dark:hover:text-zinc-200"
+              >
+                ✕
+              </button>
+            </div>
+            <p className="mb-2 truncate text-xs text-zinc-500 dark:text-zinc-400" title={uploadDialog.label}>
+              {uploadDialog.label}
+            </p>
+            {uploadDialog.status === 'error' ? (
+              <p className="text-xs text-red-600 dark:text-red-400">{uploadDialog.errorMsg}</p>
+            ) : (
+              <>
+                <div className="h-2 w-full overflow-hidden rounded bg-zinc-200 dark:bg-zinc-700">
+                  <div
+                    className="h-full bg-blue-500 transition-all"
+                    style={{
+                      width: `${uploadDialog.total > 0 ? Math.round((uploadDialog.loaded / uploadDialog.total) * 100) : 0}%`,
+                    }}
+                  />
+                </div>
+                <div className="mt-1 text-right text-[11px] text-zinc-500 dark:text-zinc-400">
+                  {uploadDialog.total > 0
+                    ? `${Math.round((uploadDialog.loaded / uploadDialog.total) * 100)}%`
+                    : 'Starting…'}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
       )}
 
       {/* Transient error toasts (non-fatal SessionError frames) */}

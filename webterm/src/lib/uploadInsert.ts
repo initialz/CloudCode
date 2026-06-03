@@ -17,12 +17,16 @@ export const UPLOAD_DIR = '.cloudcode/uploads';
 /** Callbacks the caller wires up so the pipeline can surface a lightweight
  *  progress indicator + error toast without owning any UI itself. */
 export type UploadInsertHooks = {
-  /** Fired as the upload streams; `loaded`/`total` are byte counts. Called
-   *  with `done: true` once finished (success or failure) so the caller can
-   *  clear its indicator. */
+  /** Fired once at the start with a `cancel` fn that aborts the in-flight
+   *  upload. The caller wires this to a Close/Cancel button. Cancelling is not
+   *  an error — `onError` is NOT called for a cancelled upload. */
+  onStart?: (cancel: () => void) => void;
+  /** Fired as the upload streams; `loaded`/`total` are byte counts. */
   onProgress?: (loaded: number, total: number) => void;
+  /** Fired once when finished (success, failure, or cancel) so the caller can
+   *  dismiss its indicator. */
   onDone?: () => void;
-  /** Surface an error to the user (e.g. a toast). */
+  /** Surface an error to the user (e.g. a toast). Not called on cancel. */
   onError?: (message: string) => void;
 };
 
@@ -58,14 +62,21 @@ export async function uploadAndInsertFiles(
     relativePath: file.name,
   }));
 
+  let cancelled = false;
   try {
-    const { promise } = uploadFiles(
+    const { promise, abort } = uploadFiles(
       tab.agent,
       tab.workspace,
       UPLOAD_DIR,
       items,
       (loaded, total) => hooks.onProgress?.(loaded, total),
     );
+    // Hand the caller a cancel fn (Close/Cancel button); mark cancelled so the
+    // resulting rejection isn't reported as an error.
+    hooks.onStart?.(() => {
+      cancelled = true;
+      abort();
+    });
     const results = await promise;
 
     // Only reference files that uploaded cleanly (error == null).
@@ -92,7 +103,10 @@ export async function uploadAndInsertFiles(
       }
     }
   } catch (err) {
-    hooks.onError?.(err instanceof Error ? err.message : 'Upload failed');
+    // A user-initiated cancel rejects the promise too — that's not an error.
+    if (!cancelled) {
+      hooks.onError?.(err instanceof Error ? err.message : 'Upload failed');
+    }
   } finally {
     hooks.onDone?.();
   }
