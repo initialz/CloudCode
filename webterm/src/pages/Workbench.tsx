@@ -963,6 +963,23 @@ export default function Workbench() {
         tab.term.open(el);
         tab.fitAddon.fit();
         tab.opened = true;
+        // While an IME composition is in flight (e.g. typing pinyin before
+        // picking a character), tag the terminal element so CSS can hide
+        // xterm's block cursor — it otherwise renders as a chunky inverted
+        // cell on top of the slim composing caret. Driven by the real
+        // compositionstart/end events on the textarea, which is the only
+        // reliable signal (xterm's .composition-view.active isn't dependable
+        // across IMEs). The composing bytes stay local until composition ends.
+        const imeTextarea = tab.term.textarea;
+        const imeEl = tab.term.element;
+        if (imeTextarea && imeEl) {
+          imeTextarea.addEventListener('compositionstart', () =>
+            imeEl.classList.add('cc-composing'),
+          );
+          imeTextarea.addEventListener('compositionend', () =>
+            imeEl.classList.remove('cc-composing'),
+          );
+        }
         const acct = accountRef.current;
         if (acct) {
           const histKey = termHistoryKey(acct, tab.agent, tab.workspace);

@@ -60,10 +60,16 @@ html.dark .xterm .composition-view {
   border-right-color: #ccc;
 }
 
-/* While an IME composition is active, hide xterm's own block text-cursor so
-   it doesn't sit on top of the slim composing caret above. Class names are
-   xterm's real DOM (.composition-view lives under .xterm-helpers, the cursor
-   under .xterm-rows; both share the .xterm ancestor, so :has reaches it). */
-.xterm:has(.composition-view.active) .xterm-cursor {
+/* While an IME composition is in flight, hide xterm's block cursor so it
+   doesn't sit as a chunky block on top of the slim composing caret. The
+   `cc-composing` class is toggled in JS on the real compositionstart/end
+   events (see Workbench.tsx). Cover both ways xterm renders the block cursor:
+   as a .xterm-cursor element, or by inverting the cell at the cursor (xterm's
+   inverted-default colour classes — fg/bg index 257). */
+.xterm.cc-composing .xterm-cursor {
   opacity: 0 !important;
+}
+
+.xterm.cc-composing .xterm-bg-257 {
+  background-color: transparent !important;
 }
