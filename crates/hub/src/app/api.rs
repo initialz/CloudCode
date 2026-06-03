@@ -929,10 +929,16 @@ pub async fn files_upload(
         }
 
         // Stream chunks (64 KiB each) from the multipart field to the agent.
+        // Track how many raw bytes we hand off so we can integrity-check the
+        // agent's reported byte count below — catches dropped/reordered
+        // frames (e.g. a regression in the agent's ordered-write handling)
+        // instead of silently accepting a truncated or 0-byte upload.
         let mut send_err: Option<String> = None;
+        let mut bytes_sent: u64 = 0;
         loop {
             match field.chunk().await {
                 Ok(Some(chunk_bytes)) => {
+                    bytes_sent += chunk_bytes.len() as u64;
                     let b64 =
                         base64::engine::general_purpose::STANDARD.encode(&chunk_bytes);
                     if conn
@@ -994,6 +1000,18 @@ pub async fn files_upload(
                 error,
                 ..
             })) => {
+                // Integrity check: the agent must have written exactly the
+                // bytes we streamed. A mismatch (with no agent-reported
+                // error) means frames were dropped/reordered in transit —
+                // surface it as a failed upload rather than reporting
+                // success on a truncated file.
+                let error = match error {
+                    Some(e) => Some(e),
+                    None if bytes_written != bytes_sent => Some(format!(
+                        "integrity check failed: wrote {bytes_written} of {bytes_sent} bytes"
+                    )),
+                    None => None,
+                };
                 results.push(json!({
                     "name": filename,
                     "bytes_written": bytes_written,

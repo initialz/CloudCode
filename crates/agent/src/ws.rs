@@ -228,6 +228,18 @@ where
                         }
                     });
                 }
+                // Stateful, ordered frames (the FsWriteInit → FsWriteChunk…
+                // → eof upload sequence) MUST run in arrival order. Spawning
+                // a task per frame (below) races them: a chunk handled before
+                // its init — or after the eof that drops the session — finds
+                // no write session and silently discards the data, leaving a
+                // 0-byte / truncated file. Handle these inline. They're cheap
+                // (create file / decode+append a chunk), so this doesn't
+                // reintroduce the head-of-line blocking the spawn was added to
+                // fix (v1.15.3) for the genuinely slow ops, which self-spawn.
+                Ok(frame) if is_ordered_frame(&frame) => {
+                    state.manager.clone().handle(frame, tx.clone()).await;
+                }
                 Ok(frame) => {
                     let mgr = state.manager.clone();
                     let send = tx.clone();
@@ -323,6 +335,21 @@ struct Backoff {
     next_ms: u64,
 }
 
+/// Frames belonging to a stateful, ordered sequence that must be handled
+/// in arrival order rather than each in its own task. Today that's the
+/// upload protocol: `FsWriteInit` opens a write session keyed by
+/// `request_id`, successive `FsWriteChunk` frames append to it, and the
+/// final `eof` chunk closes it. Spawning a task per frame races them, so a
+/// chunk can land before its init (no session yet) or after eof (session
+/// already gone) and the data is silently dropped — producing 0-byte or
+/// truncated uploads. All other frames keep the per-frame spawn.
+fn is_ordered_frame(msg: &ServerMsg) -> bool {
+    matches!(
+        msg,
+        ServerMsg::FsWriteInit { .. } | ServerMsg::FsWriteChunk { .. }
+    )
+}
+
 impl Backoff {
     fn new() -> Self {
         Self { next_ms: 500 }
@@ -335,5 +362,47 @@ impl Backoff {
         self.next_ms = (cur * 2).min(5_000);
         let jitter = rand::thread_rng().gen_range(0..200);
         Duration::from_millis(cur + jitter)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_ordered_frame;
+    use crate::tunnel::ServerMsg;
+    use uuid::Uuid;
+
+    // Upload frames must be order-preserving: handling them out of order
+    // (the per-frame spawn) drops data and yields 0-byte/truncated files.
+    #[test]
+    fn upload_write_frames_are_ordered() {
+        let init = ServerMsg::FsWriteInit {
+            request_id: Uuid::nil(),
+            account: "a".into(),
+            workspace: "w".into(),
+            path: "f.txt".into(),
+            size: 0,
+        };
+        let chunk = ServerMsg::FsWriteChunk {
+            request_id: Uuid::nil(),
+            data_b64: "aGVsbG8=".into(),
+            eof: false,
+        };
+        let eof = ServerMsg::FsWriteChunk {
+            request_id: Uuid::nil(),
+            data_b64: String::new(),
+            eof: true,
+        };
+        assert!(is_ordered_frame(&init));
+        assert!(is_ordered_frame(&chunk));
+        assert!(is_ordered_frame(&eof));
+    }
+
+    // Everything else keeps the concurrent per-frame spawn (HOL fix).
+    #[test]
+    fn non_write_frames_are_not_ordered() {
+        assert!(!is_ordered_frame(&ServerMsg::Ping));
+        assert!(!is_ordered_frame(&ServerMsg::PtyClose {
+            session_id: Uuid::nil()
+        }));
     }
 }
