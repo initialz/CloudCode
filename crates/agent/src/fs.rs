@@ -157,6 +157,10 @@ pub fn resolve_safe_parent(
 pub struct WriteSession {
     file: fs::File,
     bytes_written: u64,
+    /// The final filename actually written (after any ` (n)` conflict
+    /// suffix), without the directory portion. Reported back on eof so
+    /// the caller knows what was written.
+    final_name: String,
 }
 
 /// Thread-safe map of in-flight write sessions, keyed by request_id.
@@ -170,9 +174,53 @@ pub fn new_write_sessions() -> WriteSessions {
 /// session. Matches `MAX_FILE_BYTES` used for reads.
 const MAX_WRITE_BYTES: u64 = 1 << 30; // 1 GiB
 
+/// Given a resolved target path, return the first non-existing path by
+/// appending ` (n)` before the extension on conflict
+/// (`foo.png` → `foo (1).png` → `foo (2).png` …). Names without an
+/// extension get the suffix appended at the end (`README` → `README (1)`).
+/// If the target doesn't already exist it is returned unchanged.
+fn dedupe_path(target: &Path) -> PathBuf {
+    if !target.exists() {
+        return target.to_path_buf();
+    }
+
+    let parent = target.parent();
+    let file_name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    // Split the file name into stem + extension. We use the LAST dot so
+    // that `archive.tar.gz` becomes `archive.tar (1).gz` (matching the
+    // extension semantics the OS file pickers use). A leading-dot name
+    // with no other dot (e.g. `.env`) has no extension to split on.
+    let (stem, ext) = match file_name.rfind('.') {
+        Some(idx) if idx > 0 => (&file_name[..idx], Some(&file_name[idx + 1..])),
+        _ => (file_name.as_str(), None),
+    };
+
+    let mut n = 1u64;
+    loop {
+        let candidate_name = match ext {
+            Some(ext) => format!("{} ({}).{}", stem, n, ext),
+            None => format!("{} ({})", stem, n),
+        };
+        let candidate = match parent {
+            Some(p) => p.join(&candidate_name),
+            None => PathBuf::from(&candidate_name),
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
 /// Called on `FsWriteInit`: validate the target path and create/truncate
-/// the file. Stores a `WriteSession` in `sessions` so that subsequent
-/// `FsWriteChunk` frames can append data.
+/// the file. If the resolved target already exists, a conflict-free name
+/// is chosen by appending ` (n)` before the extension. Stores a
+/// `WriteSession` in `sessions` (recording the final filename) so that
+/// subsequent `FsWriteChunk` frames can append data.
 pub async fn write_init(
     sessions: &WriteSessions,
     workspace_root: &Path,
@@ -181,7 +229,16 @@ pub async fn write_init(
     path: &str,
     request_id: Uuid,
 ) -> Result<(), String> {
-    let target = resolve_safe_parent(workspace_root, account, workspace, path)?;
+    let resolved = resolve_safe_parent(workspace_root, account, workspace, path)?;
+
+    // On conflict, keep the original filename but append ` (n)` before
+    // the extension rather than overwriting the existing file.
+    let target = dedupe_path(&resolved);
+
+    let final_name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .ok_or_else(|| "path has no filename".to_string())?;
 
     let file = fs::File::create(&target)
         .await
@@ -191,22 +248,25 @@ pub async fn write_init(
     map.insert(request_id, WriteSession {
         file,
         bytes_written: 0,
+        final_name,
     });
     Ok(())
 }
 
 /// Called on `FsWriteChunk`: decode the base64 payload and append it to
-/// the open file. Returns `(bytes_written_total, is_eof)`.
+/// the open file. Returns `(bytes_written_total, final_name)`.
 ///
-/// - On non-eof chunks: writes data, returns running total + `false`.
-/// - On eof: flushes, closes (removes from map), returns final total + `true`.
+/// - On non-eof chunks: writes data, returns running total + `None`.
+/// - On eof: flushes, closes (removes from map), returns final total +
+///   `Some(final_name)` — the filename actually written (after any
+///   ` (n)` conflict suffix).
 /// - On error: removes the session from the map and returns Err.
 pub async fn write_chunk(
     sessions: &WriteSessions,
     request_id: Uuid,
     data_b64: &str,
     eof: bool,
-) -> Result<(u64, bool), String> {
+) -> Result<(u64, Option<String>), String> {
     let decoded = if data_b64.is_empty() {
         Vec::new()
     } else {
@@ -240,14 +300,15 @@ pub async fn write_chunk(
     if eof {
         let sess = map.remove(&request_id).unwrap();
         let total = sess.bytes_written;
+        let final_name = sess.final_name.clone();
         sess.file
             .sync_all()
             .await
             .map_err(|e| format!("sync: {}", e))?;
-        Ok((total, true))
+        Ok((total, Some(final_name)))
     } else {
         let total = map.get(&request_id).unwrap().bytes_written;
-        Ok((total, false))
+        Ok((total, None))
     }
 }
 
@@ -924,13 +985,13 @@ mod tests {
         let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
 
         // Non-eof chunk.
-        let (written, is_eof) = write_chunk(&sessions, rid, &b64, false).await.unwrap();
-        assert!(!is_eof);
+        let (written, final_name) = write_chunk(&sessions, rid, &b64, false).await.unwrap();
+        assert!(final_name.is_none());
         assert_eq!(written, payload.len() as u64);
 
         // EOF chunk (empty data).
-        let (total, is_eof) = write_chunk(&sessions, rid, "", true).await.unwrap();
-        assert!(is_eof);
+        let (total, final_name) = write_chunk(&sessions, rid, "", true).await.unwrap();
+        assert_eq!(final_name.as_deref(), Some("data.bin"));
         assert_eq!(total, payload.len() as u64);
 
         // Session should be removed.
@@ -940,6 +1001,58 @@ mod tests {
         let canon_base = stdfs::canonicalize(&base).unwrap();
         let content = stdfs::read(canon_base.join("sub").join("data.bin")).unwrap();
         assert_eq!(content, payload);
+    }
+
+    #[tokio::test]
+    async fn write_init_dedupes_conflicting_name() {
+        let (_tmp, root, account, workspace, base) = setup();
+        let canon_base = stdfs::canonicalize(&base).unwrap();
+        let sessions = new_write_sessions();
+
+        // First upload: pre-existing file with known content.
+        stdfs::write(canon_base.join("foo.png"), b"original").unwrap();
+
+        // Second upload to the SAME name must NOT overwrite — it should
+        // land on `foo (1).png` instead.
+        let rid = Uuid::new_v4();
+        write_init(&sessions, &root, &account, &workspace, "foo.png", rid)
+            .await
+            .unwrap();
+        let payload = b"second";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+        write_chunk(&sessions, rid, &b64, false).await.unwrap();
+        let (_total, final_name) = write_chunk(&sessions, rid, "", true).await.unwrap();
+
+        // The eof result reports the suffixed name (just the file name).
+        assert_eq!(final_name.as_deref(), Some("foo (1).png"));
+
+        // The new file exists with the new content...
+        assert_eq!(
+            stdfs::read(canon_base.join("foo (1).png")).unwrap(),
+            payload
+        );
+        // ...and the original is untouched.
+        assert_eq!(
+            stdfs::read(canon_base.join("foo.png")).unwrap(),
+            b"original"
+        );
+
+        // A third upload to the same name skips to `foo (2).png`.
+        let rid3 = Uuid::new_v4();
+        write_init(&sessions, &root, &account, &workspace, "foo.png", rid3)
+            .await
+            .unwrap();
+        let (_t, final3) = write_chunk(&sessions, rid3, "", true).await.unwrap();
+        assert_eq!(final3.as_deref(), Some("foo (2).png"));
+
+        // Extensionless names get the suffix at the end.
+        stdfs::write(canon_base.join("README"), b"x").unwrap();
+        let rid4 = Uuid::new_v4();
+        write_init(&sessions, &root, &account, &workspace, "README", rid4)
+            .await
+            .unwrap();
+        let (_t4, final4) = write_chunk(&sessions, rid4, "", true).await.unwrap();
+        assert_eq!(final4.as_deref(), Some("README (1)"));
     }
 
     #[tokio::test]

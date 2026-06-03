@@ -997,6 +997,7 @@ pub async fn files_upload(
         match tokio::time::timeout(FS_READ_IDLE_TIMEOUT, rx).await {
             Ok(Ok(ClientMsg::FsWriteResult {
                 bytes_written,
+                final_name,
                 error,
                 ..
             })) => {
@@ -1012,8 +1013,12 @@ pub async fn files_upload(
                     )),
                     None => None,
                 };
+                // Report the final name the agent actually wrote (after any
+                // ` (n)` conflict suffix). Fall back to the requested
+                // filename if an older agent didn't report one.
+                let name = final_name.unwrap_or_else(|| filename.clone());
                 results.push(json!({
-                    "name": filename,
+                    "name": name,
                     "bytes_written": bytes_written,
                     "error": error,
                 }));

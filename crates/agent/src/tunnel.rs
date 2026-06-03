@@ -208,6 +208,8 @@ pub enum ClientMsg {
         request_id: Uuid,
         #[serde(default)]
         bytes_written: u64,
+        #[serde(default)]
+        final_name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },

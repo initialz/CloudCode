@@ -400,6 +400,7 @@ impl PtyManager {
                         .send(OutFrame::Text(ClientMsg::FsWriteResult {
                             request_id,
                             bytes_written: 0,
+                            final_name: None,
                             error: Some(e),
                         }))
                         .await;
@@ -418,17 +419,20 @@ impl PtyManager {
                 )
                 .await
                 {
-                    Ok((bytes_written, true)) => {
-                        // EOF: send the final result.
+                    Ok((bytes_written, Some(final_name))) => {
+                        // EOF: send the final result, reporting the
+                        // filename actually written (after any conflict
+                        // suffix).
                         let _ = tx
                             .send(OutFrame::Text(ClientMsg::FsWriteResult {
                                 request_id,
                                 bytes_written,
+                                final_name: Some(final_name),
                                 error: None,
                             }))
                             .await;
                     }
-                    Ok((_bytes_written, false)) => {
+                    Ok((_bytes_written, None)) => {
                         // Non-eof chunk: no reply needed.
                     }
                     Err(e) => {
@@ -436,6 +440,7 @@ impl PtyManager {
                             .send(OutFrame::Text(ClientMsg::FsWriteResult {
                                 request_id,
                                 bytes_written: 0,
+                                final_name: None,
                                 error: Some(e),
                             }))
                             .await;

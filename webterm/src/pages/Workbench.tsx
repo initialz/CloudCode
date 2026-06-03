@@ -41,6 +41,7 @@ import SettingsDialog from '@/components/SettingsDialog';
 import ConfigDialog from '@/components/ConfigDialog';
 import Tutorial, { clearTutorialSeen, hasSeenTutorial } from '@/components/Tutorial';
 import FilesModal from '@/components/FilesModal';
+import { uploadAndInsertFiles, imageFilesFromClipboard } from '@/lib/uploadInsert';
 
 // ── xterm theme helpers ──────────────────────────────────────────────────────
 
@@ -183,6 +184,31 @@ export default function Workbench() {
   const dismissToast = useCallback((id: string) => {
     setToasts((prev) => prev.filter((t) => t.id !== id));
   }, []);
+
+  // Terminal file-drop / paste-image state.
+  //   `dragOverTabId` — which tab's pane is showing the drop highlight.
+  //   `uploadingTabId` — which tab currently has an upload in flight (drives a
+  //     lightweight, non-blocking progress pill). Typing is never blocked.
+  const [dragOverTabId, setDragOverTabId] = useState<string | null>(null);
+  const [uploadingTabId, setUploadingTabId] = useState<string | null>(null);
+
+  // Drive the upload-and-insert pipeline for a tab. Shared by the drop and
+  // paste-image handlers; keeps the progress/toast wiring in one place.
+  const runUploadAndInsert = useCallback(
+    (tab: Tab, files: File[]) => {
+      if (files.length === 0) return;
+      setUploadingTabId(tab.id);
+      void uploadAndInsertFiles(tab, files, {
+        onError: (message) => addToast(message),
+        onDone: () => setUploadingTabId((cur) => (cur === tab.id ? null : cur)),
+      });
+    },
+    [addToast],
+  );
+  // Ref so the empty-deps `attachContainer` callback (which wires the paste
+  // listener once, at term.open() time) always calls the latest pipeline.
+  const runUploadAndInsertRef = useRef(runUploadAndInsert);
+  runUploadAndInsertRef.current = runUploadAndInsert;
 
   // Refresh timer ref (30s poll)
   const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1010,6 +1036,27 @@ export default function Workbench() {
             imeEl.classList.remove('cc-composing'),
           );
         }
+
+        // Paste-image (Ctrl/Cmd+V): if the clipboard holds image data, upload
+        // it and insert an @-mention instead of pasting raw bytes. Listen in
+        // the capture phase on xterm's hidden textarea so we run BEFORE xterm's
+        // own paste handler. Non-image pastes fall through untouched (we never
+        // preventDefault), so normal text paste behaves exactly as before.
+        if (imeTextarea) {
+          imeTextarea.addEventListener(
+            'paste',
+            (e: ClipboardEvent) => {
+              if (!e.clipboardData) return;
+              const images = imageFilesFromClipboard(e.clipboardData.items);
+              if (images.length === 0) return; // let xterm paste normally
+              e.preventDefault();
+              e.stopPropagation();
+              const cur = tabsRef.current.find((t) => t.id === tabId);
+              if (cur) runUploadAndInsertRef.current(cur, images);
+            },
+            true,
+          );
+        }
         const acct = accountRef.current;
         if (acct) {
           const histKey = termHistoryKey(acct, tab.agent, tab.workspace);
@@ -1141,7 +1188,49 @@ export default function Workbench() {
               ref={(el) => attachContainer(tab.id, el)}
               className={`absolute inset-0 ${tab.id === activeTabId ? 'block' : 'hidden'}`}
               onMouseDown={() => tab.term.focus()}
+              // Drag-and-drop files onto the terminal pane: upload to
+              // `.cloudcode/uploads/` then insert `@`-mentions. dragover must
+              // preventDefault so the browser allows a drop here.
+              onDragOver={(e) => {
+                if (e.dataTransfer.types.includes('Files')) {
+                  e.preventDefault();
+                  e.dataTransfer.dropEffect = 'copy';
+                  setDragOverTabId(tab.id);
+                }
+              }}
+              onDragLeave={(e) => {
+                // Only clear when the pointer actually leaves the pane, not
+                // when moving between child nodes (relatedTarget inside el).
+                if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+                  setDragOverTabId((cur) => (cur === tab.id ? null : cur));
+                }
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                setDragOverTabId((cur) => (cur === tab.id ? null : cur));
+                const files = Array.from(e.dataTransfer.files);
+                if (files.length > 0) runUploadAndInsert(tab, files);
+              }}
             >
+              {/* Drop highlight overlay */}
+              {dragOverTabId === tab.id && (
+                <div className="absolute inset-0 z-30 flex items-center justify-center bg-blue-50/70 dark:bg-blue-950/50 border-2 border-dashed border-blue-400 dark:border-blue-600 pointer-events-none">
+                  <span className="text-sm font-medium text-blue-600 dark:text-blue-400">
+                    Drop files to upload &amp; reference
+                  </span>
+                </div>
+              )}
+
+              {/* Upload-in-flight pill — non-blocking, lets typing continue */}
+              {uploadingTabId === tab.id && (
+                <div className="absolute bottom-2 right-2 z-30 pointer-events-none">
+                  <div className="flex items-center gap-1.5 rounded-full border border-blue-400 bg-blue-50 dark:border-blue-500/60 dark:bg-blue-900/40 px-2.5 py-1 text-xs font-medium text-blue-800 dark:text-blue-200 shadow-sm">
+                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-blue-500 animate-pulse" />
+                    Uploading…
+                  </div>
+                </div>
+              )}
+
               {/* Status overlays */}
               {(tab.status === 'connecting' || tab.status === 'opening') && (
                 <div className="absolute inset-0 flex items-center justify-center bg-white/80 dark:bg-zinc-950/80 z-10 pointer-events-none">
