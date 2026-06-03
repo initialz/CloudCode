@@ -43,15 +43,16 @@ body {
   cursor: text !important;
 }
 
-/* IME composition: while you're choosing a Chinese character the pinyin
-   stays visible, but we show only a slim caret at its end instead of
-   xterm.js's chunky block cursor (which renders on top and looks like two
-   cursors). No background highlight — just the plain pinyin + a thin caret.
-   The composing bytes are held locally and sent only once composition ends. */
+/* IME composition: while you're choosing a Chinese character the pinyin stays
+   visible and underlined to mark it as composing (not yet committed), like a
+   native terminal — no background highlight. A slim caret sits at its end; the
+   chunky block cursor is hidden separately (see .cc-composing below). The
+   composing bytes are held locally and sent only once composition ends. */
 .xterm .composition-view {
   background: transparent;
   color: #1a1a1a; /* visible pinyin on a light theme */
-  text-decoration: none;
+  text-decoration: underline; /* mark the text as composing, not committed */
+  text-underline-offset: 2px;
   border-right: 1px solid #333; /* the slim caret at the composition end */
 }
 
