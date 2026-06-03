@@ -678,6 +678,31 @@ export default function Workbench() {
         }
       });
 
+      // Shift+Enter → newline, not submit. xterm.js sends a bare CR ("\r")
+      // for Enter regardless of Shift (it doesn't speak the kitty keyboard
+      // protocol that would disambiguate them), so the tool can't tell
+      // Shift+Enter from Enter and submits on both. Intercept Shift+Enter and
+      // send ESC+CR ("\x1b\r") instead — the Meta/Option+Enter sequence claude
+      // maps to "insert newline" (the same bytes claude's own /terminal-setup
+      // binds Shift+Enter to) — and swallow xterm's default CR.
+      term.attachCustomKeyEventHandler((e) => {
+        if (
+          e.type === 'keydown' &&
+          e.key === 'Enter' &&
+          e.shiftKey &&
+          !e.ctrlKey &&
+          !e.metaKey &&
+          !e.altKey
+        ) {
+          const tab = tabsRef.current.find((t) => t.id === id);
+          if (tab?.ws.connected) {
+            tab.ws.sendBinary(new TextEncoder().encode('\x1b\r'));
+          }
+          return false; // don't let xterm send the default CR
+        }
+        return true;
+      });
+
       const newTab: Tab = {
         id,
         agent,
