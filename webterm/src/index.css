@@ -43,20 +43,27 @@ body {
   cursor: text !important;
 }
 
-/* IME composition: while you're still choosing a Chinese character, don't
-   render the in-progress pinyin inline (xterm.js's default .composition-view
-   shows it as a highlighted box, which reads like already-entered text and
-   feels wrong). The macOS candidate window already shows the pinyin and
-   candidates, so inline we only need a caret marking the position — hide the
-   text and draw just a cursor via border-right. The composing bytes are held
-   locally and never sent to the remote until composition ends. */
+/* IME composition: while you're choosing a Chinese character the pinyin
+   stays visible, but we show only a slim caret at its end instead of
+   xterm.js's chunky block cursor (which renders on top and looks like two
+   cursors). No background highlight — just the plain pinyin + a thin caret.
+   The composing bytes are held locally and sent only once composition ends. */
 .xterm .composition-view {
   background: transparent;
-  color: transparent;
+  color: #1a1a1a; /* visible pinyin on a light theme */
   text-decoration: none;
-  border-right: 2px solid #333;
+  border-right: 1px solid #333; /* the slim caret at the composition end */
 }
 
 html.dark .xterm .composition-view {
+  color: #e6e6e6; /* visible pinyin on a dark theme */
   border-right-color: #ccc;
+}
+
+/* While an IME composition is active, hide xterm's own block text-cursor so
+   it doesn't sit on top of the slim composing caret above. Class names are
+   xterm's real DOM (.composition-view lives under .xterm-helpers, the cursor
+   under .xterm-rows; both share the .xterm ancestor, so :has reaches it). */
+.xterm:has(.composition-view.active) .xterm-cursor {
+  opacity: 0 !important;
 }
