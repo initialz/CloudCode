@@ -951,6 +951,61 @@ mod tests {
         assert!(err.contains("no write session"), "got: {}", err);
     }
 
+    // Closed-loop reproduction of the upload-corruption bug at the write
+    // layer. The agent used to spawn a task per inbound hub frame, so an
+    // upload's FsWriteInit / FsWriteChunk(data) / FsWriteChunk(eof) frames
+    // raced. Two race outcomes both drop the payload and leave a 0-byte
+    // file: the eof chunk running before the data chunk (session already
+    // closed), or the data chunk running before init (no session yet).
+    // The fix (`is_ordered_frame` in ws.rs) processes these frames in
+    // arrival order. This pins BOTH the broken interleavings (data lost)
+    // and the ordered path (full payload written).
+    #[tokio::test]
+    async fn out_of_order_upload_loses_data_but_ordered_keeps_it() {
+        let payload = b"hello123";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+
+        // Race outcome A: eof wins before the data chunk.
+        {
+            let (_tmp, root, account, workspace, base) = setup();
+            let sessions = new_write_sessions();
+            let rid = Uuid::new_v4();
+            write_init(&sessions, &root, &account, &workspace, "race.bin", rid)
+                .await
+                .unwrap();
+            write_chunk(&sessions, rid, "", true).await.unwrap(); // eof first
+            let err = write_chunk(&sessions, rid, &b64, false).await.unwrap_err();
+            assert!(err.contains("no write session"), "got: {}", err);
+            let canon_base = stdfs::canonicalize(&base).unwrap();
+            let content = stdfs::read(canon_base.join("race.bin")).unwrap();
+            assert_eq!(content.len(), 0, "bug repro: data dropped, file 0 bytes");
+        }
+
+        // Race outcome B: data chunk runs before init.
+        {
+            let (_tmp, _root, _account, _workspace, _base) = setup();
+            let sessions = new_write_sessions();
+            let rid = Uuid::new_v4();
+            let err = write_chunk(&sessions, rid, &b64, false).await.unwrap_err();
+            assert!(err.contains("no write session"), "got: {}", err);
+        }
+
+        // Ordered path — what the fix guarantees: full payload written.
+        {
+            let (_tmp, root, account, workspace, base) = setup();
+            let sessions = new_write_sessions();
+            let rid = Uuid::new_v4();
+            write_init(&sessions, &root, &account, &workspace, "ok.bin", rid)
+                .await
+                .unwrap();
+            write_chunk(&sessions, rid, &b64, false).await.unwrap();
+            write_chunk(&sessions, rid, "", true).await.unwrap();
+            let canon_base = stdfs::canonicalize(&base).unwrap();
+            let content = stdfs::read(canon_base.join("ok.bin")).unwrap();
+            assert_eq!(content, payload, "ordered upload must preserve content");
+        }
+    }
+
     // --- delete tests ---
 
     #[tokio::test]
