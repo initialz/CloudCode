@@ -694,6 +694,11 @@ export default function Workbench() {
           !e.metaKey &&
           !e.altKey
         ) {
+          // preventDefault stops the browser firing the follow-up keypress,
+          // whose CR ("\r") would otherwise still reach the tool and submit
+          // — turning Shift+Enter into "newline then submit". Returning false
+          // only stops xterm's keydown path, not that keypress.
+          e.preventDefault();
           const tab = tabsRef.current.find((t) => t.id === id);
           if (tab?.ws.connected) {
             tab.ws.sendBinary(new TextEncoder().encode('\x1b\r'));
