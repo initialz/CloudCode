@@ -43,25 +43,20 @@ body {
   cursor: text !important;
 }
 
-/* IME composition preview — the in-progress pinyin (e.g. "ni hao") shown
-   while you're still choosing a character, before anything is committed.
-   These bytes are held locally by xterm and are NOT sent to the remote
-   until composition ends, but xterm.js's default .composition-view is an
-   opaque black-on-white box that blends into our dark terminal and reads
-   like already-entered text. Mark it as a composing state the way a native
-   terminal does — an underline plus a faint accent highlight — so it's
-   obvious the text isn't committed yet. Visual only: we don't touch
-   display/position, so xterm's show/hide and cursor alignment still work. */
+/* IME composition: while you're still choosing a Chinese character, don't
+   render the in-progress pinyin inline (xterm.js's default .composition-view
+   shows it as a highlighted box, which reads like already-entered text and
+   feels wrong). The macOS candidate window already shows the pinyin and
+   candidates, so inline we only need a caret marking the position — hide the
+   text and draw just a cursor via border-right. The composing bytes are held
+   locally and never sent to the remote until composition ends. */
 .xterm .composition-view {
-  background: rgba(56, 139, 253, 0.18);
-  color: #1a1a1a;
-  text-decoration: underline;
-  text-decoration-thickness: 1px;
-  text-decoration-color: rgb(56, 139, 253);
-  text-underline-offset: 2px;
-  border-radius: 2px;
+  background: transparent;
+  color: transparent;
+  text-decoration: none;
+  border-right: 2px solid #333;
 }
 
 html.dark .xterm .composition-view {
-  color: #e6e6e6;
+  border-right-color: #ccc;
 }
