@@ -438,6 +438,7 @@ name = "cloudcode-client"
 version = "1.26.0"
 dependencies = [
  "anyhow",
+ "base64",
  "bytes",
  "clap",
  "crossterm",
@@ -453,6 +454,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

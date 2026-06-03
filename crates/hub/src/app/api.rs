@@ -853,6 +853,169 @@ pub struct FsUploadQuery {
     pub path: String,
 }
 
+/// Outcome of uploading a single file to an agent: the final on-disk
+/// name the agent wrote (after any ` (n)` conflict suffix) and an
+/// optional error string. On error `final_name` falls back to the
+/// requested name so callers can still label the failure.
+pub struct UploadOutcome {
+    pub final_name: String,
+    pub bytes_written: u64,
+    pub error: Option<String>,
+}
+
+/// Upload one file to `agent`'s workspace via the agent's
+/// `FsWriteInit` → `FsWriteChunk` → `FsWriteResult` write path. Shared
+/// by the HTTP `files_upload` handler and the WS CLI file-drop handler
+/// so conflict-safe naming + the byte-count integrity check live in
+/// one place.
+///
+/// `dir` is the (already-normalised, trailing-slash-or-empty)
+/// destination directory; `file_name` the leaf name; `chunks` an async
+/// stream of raw body slices (each is base64-encoded into a 64 KiB-ish
+/// `FsWriteChunk`). A stream item of `Err` aborts the upload (still
+/// sending a terminal eof so the agent cleans up).
+///
+/// The caller must have registered nothing for `request_id` — this
+/// helper owns the workspace-request oneshot lifecycle.
+pub async fn upload_file_to_agent<S>(
+    conn: &Arc<crate::registry::AgentConn>,
+    account: &str,
+    workspace: &str,
+    file_name: &str,
+    dir: &str,
+    chunks: S,
+) -> UploadOutcome
+where
+    S: futures::Stream<Item = Result<Bytes, String>>,
+{
+    let target_path = format!("{dir}{file_name}");
+    let request_id = Uuid::new_v4();
+
+    let (tx, rx) = oneshot::channel();
+    conn.register_workspace_request(request_id, tx);
+
+    if conn
+        .send(ServerMsg::FsWriteInit {
+            request_id,
+            account: account.to_string(),
+            workspace: workspace.to_string(),
+            path: target_path,
+            size: 0, // content-length unknown
+        })
+        .await
+        .is_err()
+    {
+        return UploadOutcome {
+            final_name: file_name.to_string(),
+            bytes_written: 0,
+            error: Some("agent disconnected before init was sent".into()),
+        };
+    }
+
+    // Stream chunks. Track how many raw bytes we hand off so we can
+    // integrity-check the agent's reported byte count below — catches
+    // dropped/reordered frames instead of silently accepting a
+    // truncated upload.
+    let mut send_err: Option<String> = None;
+    let mut bytes_sent: u64 = 0;
+    futures::pin_mut!(chunks);
+    loop {
+        match chunks.next().await {
+            Some(Ok(chunk_bytes)) => {
+                bytes_sent += chunk_bytes.len() as u64;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&chunk_bytes);
+                if conn
+                    .send(ServerMsg::FsWriteChunk {
+                        request_id,
+                        data_b64: b64,
+                        eof: false,
+                    })
+                    .await
+                    .is_err()
+                {
+                    send_err = Some("agent disconnected during upload".into());
+                    break;
+                }
+            }
+            Some(Err(e)) => {
+                // Source read error — still send eof so the agent cleans up.
+                let _ = conn
+                    .send(ServerMsg::FsWriteChunk {
+                        request_id,
+                        data_b64: String::new(),
+                        eof: true,
+                    })
+                    .await;
+                send_err = Some(e);
+                break;
+            }
+            None => {
+                // End of input — send the terminal chunk.
+                if conn
+                    .send(ServerMsg::FsWriteChunk {
+                        request_id,
+                        data_b64: String::new(),
+                        eof: true,
+                    })
+                    .await
+                    .is_err()
+                {
+                    send_err = Some("agent disconnected at eof".into());
+                }
+                break;
+            }
+        }
+    }
+
+    if let Some(e) = send_err {
+        return UploadOutcome {
+            final_name: file_name.to_string(),
+            bytes_written: 0,
+            error: Some(e),
+        };
+    }
+
+    match tokio::time::timeout(FS_READ_IDLE_TIMEOUT, rx).await {
+        Ok(Ok(ClientMsg::FsWriteResult {
+            bytes_written,
+            final_name,
+            error,
+            ..
+        })) => {
+            // Integrity check: the agent must have written exactly the
+            // bytes we streamed. A mismatch (with no agent-reported
+            // error) means frames were dropped/reordered in transit.
+            let error = match error {
+                Some(e) => Some(e),
+                None if bytes_written != bytes_sent => Some(format!(
+                    "integrity check failed: wrote {bytes_written} of {bytes_sent} bytes"
+                )),
+                None => None,
+            };
+            UploadOutcome {
+                final_name: final_name.unwrap_or_else(|| file_name.to_string()),
+                bytes_written,
+                error,
+            }
+        }
+        Ok(Ok(_)) => UploadOutcome {
+            final_name: file_name.to_string(),
+            bytes_written: 0,
+            error: Some("agent returned unexpected frame".into()),
+        },
+        Ok(Err(_)) => UploadOutcome {
+            final_name: file_name.to_string(),
+            bytes_written: 0,
+            error: Some("agent disconnected before write result".into()),
+        },
+        Err(_) => UploadOutcome {
+            final_name: file_name.to_string(),
+            bytes_written: 0,
+            error: Some("agent did not reply in time".into()),
+        },
+    }
+}
+
 /// `POST /api/files/upload?agent=A&workspace=W&path=target/dir/`
 ///
 /// Receives a multipart/form-data body with one or more file fields and
@@ -884,7 +1047,7 @@ pub async fn files_upload(
     let mut results: Vec<serde_json::Value> = Vec::new();
 
     loop {
-        let mut field = match multipart.next_field().await {
+        let field = match multipart.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
             Err(e) => {
@@ -901,150 +1064,24 @@ pub async fn files_upload(
             None => continue, // skip non-file fields
         };
 
-        let target_path = format!("{dir}{filename}");
-        let request_id = Uuid::new_v4();
-
-        // Register a workspace-request oneshot for the FsWriteResult.
-        let (tx, rx) = oneshot::channel();
-        conn.register_workspace_request(request_id, tx);
-
-        // Send FsWriteInit to agent.
-        if conn
-            .send(ServerMsg::FsWriteInit {
-                request_id,
-                account: account.clone(),
-                workspace: q.workspace.clone(),
-                path: target_path.clone(),
-                size: 0, // content-length unknown from multipart
-            })
-            .await
-            .is_err()
-        {
-            results.push(json!({
-                "name": filename,
-                "bytes_written": 0,
-                "error": "agent disconnected before init was sent",
-            }));
-            continue;
-        }
-
-        // Stream chunks (64 KiB each) from the multipart field to the agent.
-        // Track how many raw bytes we hand off so we can integrity-check the
-        // agent's reported byte count below — catches dropped/reordered
-        // frames (e.g. a regression in the agent's ordered-write handling)
-        // instead of silently accepting a truncated or 0-byte upload.
-        let mut send_err: Option<String> = None;
-        let mut bytes_sent: u64 = 0;
-        loop {
+        // Adapt the multipart field into a chunk stream (64 KiB-ish
+        // slices, as the multipart parser produces them) and hand it
+        // to the shared upload helper so the HTTP and CLI file-drop
+        // paths share conflict-naming + the integrity check.
+        let chunks = futures::stream::unfold(field, |mut field| async move {
             match field.chunk().await {
-                Ok(Some(chunk_bytes)) => {
-                    bytes_sent += chunk_bytes.len() as u64;
-                    let b64 =
-                        base64::engine::general_purpose::STANDARD.encode(&chunk_bytes);
-                    if conn
-                        .send(ServerMsg::FsWriteChunk {
-                            request_id,
-                            data_b64: b64,
-                            eof: false,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        send_err = Some("agent disconnected during upload".into());
-                        break;
-                    }
-                }
-                Ok(None) => {
-                    // End of this file part — send terminal chunk.
-                    if conn
-                        .send(ServerMsg::FsWriteChunk {
-                            request_id,
-                            data_b64: String::new(),
-                            eof: true,
-                        })
-                        .await
-                        .is_err()
-                    {
-                        send_err = Some("agent disconnected at eof".into());
-                    }
-                    break;
-                }
-                Err(e) => {
-                    // Multipart read error — still send eof so agent cleans up.
-                    let _ = conn
-                        .send(ServerMsg::FsWriteChunk {
-                            request_id,
-                            data_b64: String::new(),
-                            eof: true,
-                        })
-                        .await;
-                    send_err = Some(format!("multipart read error: {e}"));
-                    break;
-                }
+                Ok(Some(b)) => Some((Ok(b), field)),
+                Ok(None) => None,
+                Err(e) => Some((Err(format!("multipart read error: {e}")), field)),
             }
-        }
-
-        if let Some(e) = send_err {
-            results.push(json!({
-                "name": filename,
-                "bytes_written": 0,
-                "error": e,
-            }));
-            continue;
-        }
-
-        // Wait for agent FsWriteResult.
-        match tokio::time::timeout(FS_READ_IDLE_TIMEOUT, rx).await {
-            Ok(Ok(ClientMsg::FsWriteResult {
-                bytes_written,
-                final_name,
-                error,
-                ..
-            })) => {
-                // Integrity check: the agent must have written exactly the
-                // bytes we streamed. A mismatch (with no agent-reported
-                // error) means frames were dropped/reordered in transit —
-                // surface it as a failed upload rather than reporting
-                // success on a truncated file.
-                let error = match error {
-                    Some(e) => Some(e),
-                    None if bytes_written != bytes_sent => Some(format!(
-                        "integrity check failed: wrote {bytes_written} of {bytes_sent} bytes"
-                    )),
-                    None => None,
-                };
-                // Report the final name the agent actually wrote (after any
-                // ` (n)` conflict suffix). Fall back to the requested
-                // filename if an older agent didn't report one.
-                let name = final_name.unwrap_or_else(|| filename.clone());
-                results.push(json!({
-                    "name": name,
-                    "bytes_written": bytes_written,
-                    "error": error,
-                }));
-            }
-            Ok(Ok(_)) => {
-                results.push(json!({
-                    "name": filename,
-                    "bytes_written": 0,
-                    "error": "agent returned unexpected frame",
-                }));
-            }
-            Ok(Err(_)) => {
-                results.push(json!({
-                    "name": filename,
-                    "bytes_written": 0,
-                    "error": "agent disconnected before write result",
-                }));
-            }
-            Err(_) => {
-                results.push(json!({
-                    "name": filename,
-                    "bytes_written": 0,
-                    "error": "agent did not reply in time",
-                }));
-            }
-        }
+        });
+        let outcome =
+            upload_file_to_agent(&conn, &account, &q.workspace, &filename, &dir, chunks).await;
+        results.push(json!({
+            "name": outcome.final_name,
+            "bytes_written": outcome.bytes_written,
+            "error": outcome.error,
+        }));
     }
 
     (StatusCode::OK, Json(json!({ "results": results }))).into_response()

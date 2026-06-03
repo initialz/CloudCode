@@ -1,6 +1,7 @@
 mod input;
 mod menu;
 mod mouse_filter;
+mod paste_detect;
 mod proto;
 mod relay;
 mod wire;
@@ -428,7 +429,7 @@ async fn session_loop(
         // (2) Run the PTY relay until either claude exits cleanly
         //     (Closed → return to menu) or the wire dies (HubLost →
         //     reconnect + re-open the same workspace).
-        match relay::run(wire, bytes).await? {
+        match relay::run(wire, bytes, agent, workspace).await? {
             RelayOutcome::Closed => return Ok(()),
             RelayOutcome::HubLost => {
                 if !reconnect_wire(cfg, wire, &mut backoff).await? {

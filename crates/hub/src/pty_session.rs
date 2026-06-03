@@ -25,6 +25,7 @@ use crate::tunnel::{
 use crate::AppState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::State;
+use base64::Engine;
 use axum::http::HeaderMap;
 use axum::response::Response;
 use futures::{SinkExt, StreamExt};
@@ -80,11 +81,17 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, pre_auth: Option
     // the first select! is still caught by this connection.
     let mut kick_rx = state.user_kick_sender(&account_name).subscribe();
 
+    // Channel used by spawned CLI file-drop upload tasks to hand their
+    // `FsWriteResult` back to this loop for forwarding to the client.
+    // Buffered modestly — uploads complete one result each.
+    let (fs_result_tx, mut fs_result_rx) = mpsc::channel::<HubToClient>(16);
+
     let mut ctx = ConnCtx {
         state: state.clone(),
         account_name,
         selected_agent: None,
         active: None,
+        fs_uploads: HashMap::new(),
     };
 
     // Application-level keepalive ticker (see USER_PING_INTERVAL doc).
@@ -135,7 +142,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, pre_auth: Option
                             Ok(f) => f,
                             Err(e) => { tracing::warn!(error = %e, "bad client frame"); continue; }
                         };
-                        if !handle_client_frame(&mut ctx, frame, &mut sink).await {
+                        if !handle_client_frame(&mut ctx, frame, &mut sink, &fs_result_tx).await {
                             break;
                         }
                     }
@@ -153,6 +160,17 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, pre_auth: Option
                 let Some(evt) = evt else { continue; };
                 if !handle_agent_event(&mut ctx, evt, &mut sink).await {
                     break;
+                }
+            }
+            fs_result = fs_result_rx.recv() => {
+                // A spawned CLI file-drop upload finished — forward its
+                // FsWriteResult to the client. The Sender lives in ctx +
+                // the loop for the connection's life, so `None` can't
+                // happen, but treat it as a no-op if it ever does.
+                if let Some(frame) = fs_result {
+                    if send_client(&mut sink, &frame).await.is_err() {
+                        break;
+                    }
                 }
             }
         }
@@ -173,6 +191,11 @@ struct ConnCtx {
     account_name: String,
     selected_agent: Option<Arc<AgentConn>>,
     active: Option<ActiveSession>,
+    /// In-flight CLI file-drop uploads, keyed by request_id. Each entry
+    /// is the sender half of the chunk stream feeding a spawned
+    /// `upload_file_to_agent`; `FsWriteChunk` frames push decoded bytes
+    /// here, and the `eof` chunk drops the sender to close the stream.
+    fs_uploads: HashMap<Uuid, mpsc::Sender<Result<bytes::Bytes, String>>>,
 }
 
 struct ActiveSession {
@@ -320,7 +343,12 @@ where
     }
 }
 
-async fn handle_client_frame<S>(ctx: &mut ConnCtx, frame: ClientToHub, sink: &mut S) -> bool
+async fn handle_client_frame<S>(
+    ctx: &mut ConnCtx,
+    frame: ClientToHub,
+    sink: &mut S,
+    fs_result_tx: &mpsc::Sender<HubToClient>,
+) -> bool
 where
     S: SinkExt<Message, Error = axum::Error> + Unpin,
 {
@@ -1010,6 +1038,98 @@ where
             }
             true
         }
+        ClientToHub::FsWriteInit {
+            request_id,
+            agent,
+            workspace,
+            path,
+        } => {
+            // CLI file-drop (Phase 2): authorize, resolve the agent
+            // conn, then spawn a task that streams chunks (arriving as
+            // subsequent FsWriteChunk frames) to the agent via the
+            // shared upload helper. The chunk stream is fed by an mpsc
+            // channel whose sender we stash on ctx keyed by request_id.
+            if let Err(reason) =
+                authorize_workspace_ws(&ctx.state, &ctx.account_name, &agent, &workspace).await
+            {
+                let _ = fs_result_tx
+                    .send(HubToClient::FsWriteResult {
+                        request_id,
+                        final_name: None,
+                        error: Some(reason),
+                    })
+                    .await;
+                return true;
+            }
+            let Some(conn) = ctx.state.registry.get(&agent) else {
+                let _ = fs_result_tx
+                    .send(HubToClient::FsWriteResult {
+                        request_id,
+                        final_name: None,
+                        error: Some(format!("agent '{}' is offline", agent)),
+                    })
+                    .await;
+                return true;
+            };
+            // Split `path` into (dir-with-trailing-slash, file_name) so
+            // the shared helper rebuilds the same `target_path` the HTTP
+            // path does. A path with no '/' is a bare filename in the
+            // workspace root.
+            let (dir, file_name) = match path.rsplit_once('/') {
+                Some((d, f)) => (format!("{d}/"), f.to_string()),
+                None => (String::new(), path.clone()),
+            };
+            let (chunk_tx, chunk_rx) = mpsc::channel::<Result<bytes::Bytes, String>>(16);
+            ctx.fs_uploads.insert(request_id, chunk_tx);
+            let account = ctx.account_name.clone();
+            let result_tx = fs_result_tx.clone();
+            tokio::spawn(async move {
+                let stream = futures::stream::unfold(chunk_rx, |mut rx| async move {
+                    rx.recv().await.map(|item| (item, rx))
+                });
+                let outcome = crate::app::api::upload_file_to_agent(
+                    &conn, &account, &workspace, &file_name, &dir, stream,
+                )
+                .await;
+                let _ = result_tx
+                    .send(HubToClient::FsWriteResult {
+                        request_id,
+                        final_name: if outcome.error.is_none() {
+                            Some(outcome.final_name)
+                        } else {
+                            None
+                        },
+                        error: outcome.error,
+                    })
+                    .await;
+            });
+            true
+        }
+        ClientToHub::FsWriteChunk {
+            request_id,
+            data_b64,
+            eof,
+        } => {
+            // Route this chunk into the in-flight upload's stream. An
+            // unknown request_id (init never seen / already finished) is
+            // silently ignored.
+            if eof {
+                // Dropping the sender closes the stream → the spawned
+                // task sees end-of-input and sends the terminal chunk.
+                ctx.fs_uploads.remove(&request_id);
+            } else if let Some(tx) = ctx.fs_uploads.get(&request_id) {
+                let item = match base64::engine::general_purpose::STANDARD.decode(&data_b64) {
+                    Ok(bytes) => Ok(bytes::Bytes::from(bytes)),
+                    Err(e) => Err(format!("invalid base64 in upload chunk: {e}")),
+                };
+                // If the upload task already exited (channel closed),
+                // drop the dangling entry so we stop trying.
+                if tx.send(item).await.is_err() {
+                    ctx.fs_uploads.remove(&request_id);
+                }
+            }
+            true
+        }
         ClientToHub::Close => false,
         ClientToHub::Hello { .. } | ClientToHub::Pong => true,
     }
@@ -1302,6 +1422,35 @@ fn tool_args_from_scope(scope: &serde_json::Value, tool: &str) -> Vec<String> {
     arr.iter()
         .filter_map(|v| v.as_str().map(|s| s.to_string()))
         .collect()
+}
+
+/// Authorize an (account, agent, workspace) tuple for a CLI file-drop
+/// upload. Same two checks as the HTTP `app::api::authorize_workspace`
+/// (account allowed on agent + workspace exists for this account/agent)
+/// but returns a plain string reason for the WS `FsWriteResult.error`
+/// instead of an HTTP `Response`.
+async fn authorize_workspace_ws(
+    state: &Arc<AppState>,
+    account: &str,
+    agent: &str,
+    workspace: &str,
+) -> Result<(), String> {
+    match state.db.is_agent_allowed(account, agent).await {
+        Ok(true) => {}
+        Ok(false) => return Err("account is not allowed on this agent".into()),
+        Err(e) => {
+            tracing::warn!(error = %e, "is_agent_allowed failed (fs upload)");
+            return Err("internal error".into());
+        }
+    }
+    match state.db.get_workspace_agent(account, agent, workspace).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err("workspace not found for this account/agent".into()),
+        Err(e) => {
+            tracing::warn!(error = %e, "get_workspace_agent failed (fs upload)");
+            Err("internal error".into())
+        }
+    }
 }
 
 /// Same rule as the agent's `validate_name(_, "tool")` — keep them

@@ -7,12 +7,23 @@
 
 use crate::input::ByteRx;
 use crate::mouse_filter::MouseModeStripper;
+use crate::paste_detect::{parse_paste_paths, wrap_as_paste, PasteDetector, PasteEvent};
 use crate::proto::{ClientToHub, HubToClient};
 use crate::wire::{OutFrame, Wire};
 use anyhow::Result;
+use base64::Engine;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use std::collections::HashMap;
 use std::io::Write;
 use tokio::sync::mpsc;
+use uuid::Uuid;
+
+/// Workspace-relative directory dropped files are uploaded into, shared
+/// with Phase 1 (webterm) and the agent's auto-`mkdir` on write.
+const UPLOAD_DIR: &str = ".cloudcode/uploads";
+/// Upload chunk size — matches the hub's HTTP upload path (64 KiB
+/// base64-encoded `FsWriteChunk` frames).
+const UPLOAD_CHUNK: usize = 64 * 1024;
 
 /// What ended the relay loop.
 #[derive(Debug)]
@@ -96,11 +107,21 @@ pub fn leave_session_mode() {
 /// terminal via `enter_session_mode()`. Returns `RelayOutcome::Closed`
 /// for clean exits and `RelayOutcome::HubLost` when the WS dies — that
 /// distinction lets the outer loop decide whether to reconnect.
-pub async fn run(wire: &mut Wire, bytes: &mut ByteRx) -> Result<RelayOutcome> {
-    relay_loop(wire, bytes).await
+pub async fn run(
+    wire: &mut Wire,
+    bytes: &mut ByteRx,
+    agent: &str,
+    workspace: &str,
+) -> Result<RelayOutcome> {
+    relay_loop(wire, bytes, agent, workspace).await
 }
 
-async fn relay_loop(wire: &mut Wire, bytes: &mut ByteRx) -> Result<RelayOutcome> {
+async fn relay_loop(
+    wire: &mut Wire,
+    bytes: &mut ByteRx,
+    agent: &str,
+    workspace: &str,
+) -> Result<RelayOutcome> {
     // Strip mouse-mode CSI escapes from the agent → terminal stream
     // so the local emulator keeps doing its native drag-to-select /
     // Cmd+C copy. See mouse_filter.rs for the trade-off (claude's
@@ -115,6 +136,20 @@ async fn relay_loop(wire: &mut Wire, bytes: &mut ByteRx) -> Result<RelayOutcome>
     }
     let mut winch = spawn_winch_signal();
 
+    // CLI file-drop (Phase 2) state.
+    //
+    // `detector` slices the stdin stream into normal passthrough vs.
+    // complete bracketed pastes. A paste whose every token is an
+    // existing local file is intercepted: we spawn an upload task
+    // (so the relay's output arm is never blocked) which streams the
+    // file(s) via FsWrite* frames on a cloned out_tx, then injects the
+    // resulting `@…` mentions back through `inject_tx`. The relay's
+    // text arm routes each `FsWriteResult` to the waiting task via the
+    // per-request sender stored in `pending_uploads`.
+    let mut detector = PasteDetector::new();
+    let mut pending_uploads: HashMap<Uuid, mpsc::Sender<HubToClient>> = HashMap::new();
+    let (inject_tx, mut inject_rx) = mpsc::channel::<Vec<u8>>(16);
+
     loop {
         tokio::select! {
             chunk = bytes.recv() => {
@@ -122,8 +157,52 @@ async fn relay_loop(wire: &mut Wire, bytes: &mut ByteRx) -> Result<RelayOutcome>
                 // not a hub failure — close cleanly so the outer loop
                 // returns to the menu instead of reconnecting forever.
                 let Some(chunk) = chunk else { return Ok(RelayOutcome::Closed); };
-                if wire.out_tx.send(OutFrame::Binary(chunk)).await.is_err() {
-                    return Ok(RelayOutcome::HubLost);
+                for event in detector.feed(&chunk) {
+                    match event {
+                        PasteEvent::Passthrough(b) => {
+                            if wire.out_tx.send(OutFrame::Binary(b)).await.is_err() {
+                                return Ok(RelayOutcome::HubLost);
+                            }
+                        }
+                        PasteEvent::Paste { content } => {
+                            // Decide: is every token an existing local
+                            // file? If so, intercept + upload. Otherwise
+                            // forward the paste verbatim (normal paste).
+                            let text = String::from_utf8_lossy(&content);
+                            let tokens = parse_paste_paths(&text);
+                            let is_file_drop = !tokens.is_empty()
+                                && tokens.iter().all(|t| {
+                                    std::fs::metadata(t).map(|m| m.is_file()).unwrap_or(false)
+                                });
+                            if is_file_drop {
+                                spawn_upload(
+                                    &wire.out_tx,
+                                    &inject_tx,
+                                    &mut pending_uploads,
+                                    agent,
+                                    workspace,
+                                    tokens,
+                                );
+                            } else if wire
+                                .out_tx
+                                .send(OutFrame::Binary(wrap_as_paste(&content)))
+                                .await
+                                .is_err()
+                            {
+                                return Ok(RelayOutcome::HubLost);
+                            }
+                        }
+                    }
+                }
+            }
+            inject = inject_rx.recv() => {
+                // Inject bytes produced by a finished upload task —
+                // the `@…` mentions (or an inline failure note). Sent as
+                // raw input on the same binary channel typed input uses.
+                if let Some(b) = inject {
+                    if wire.out_tx.send(OutFrame::Binary(b)).await.is_err() {
+                        return Ok(RelayOutcome::HubLost);
+                    }
                 }
             }
             bin = wire.in_bin_rx.recv() => {
@@ -143,6 +222,14 @@ async fn relay_loop(wire: &mut Wire, bytes: &mut ByteRx) -> Result<RelayOutcome>
                     HubToClient::SessionError { message } => {
                         tracing::warn!(%message, "session error during relay");
                     }
+                    HubToClient::FsWriteResult { request_id, .. } => {
+                        // Route the result to its waiting upload task.
+                        // Remove the entry once the task has it (each
+                        // upload awaits exactly one result per request).
+                        if let Some(tx) = pending_uploads.remove(&request_id) {
+                            let _ = tx.send(frame).await;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -156,6 +243,133 @@ async fn relay_loop(wire: &mut Wire, bytes: &mut ByteRx) -> Result<RelayOutcome>
             }
         }
     }
+}
+
+/// Intercept a detected file drop: register one result channel per
+/// file in `pending_uploads` and spawn a single task that uploads each
+/// file in turn, then injects the resulting `@…` mentions. Runs off the
+/// select loop so the relay's output arm is never blocked by an upload.
+fn spawn_upload(
+    out_tx: &mpsc::Sender<OutFrame>,
+    inject_tx: &mpsc::Sender<Vec<u8>>,
+    pending_uploads: &mut HashMap<Uuid, mpsc::Sender<HubToClient>>,
+    agent: &str,
+    workspace: &str,
+    tokens: Vec<String>,
+) {
+    // Per-file request_id + a oneshot-style result channel registered
+    // with the loop so the text arm can route each FsWriteResult here.
+    let mut jobs: Vec<(Uuid, String, mpsc::Receiver<HubToClient>)> = Vec::new();
+    for path in &tokens {
+        let request_id = Uuid::new_v4();
+        let (res_tx, res_rx) = mpsc::channel::<HubToClient>(1);
+        pending_uploads.insert(request_id, res_tx);
+        jobs.push((request_id, path.clone(), res_rx));
+    }
+
+    let out_tx = out_tx.clone();
+    let inject_tx = inject_tx.clone();
+    let agent = agent.to_string();
+    let workspace = workspace.to_string();
+
+    tokio::spawn(async move {
+        let mut mentions: Vec<String> = Vec::new();
+        for (request_id, path, res_rx) in jobs {
+            let file_name = basename(&path);
+            match upload_one_file(&out_tx, request_id, &agent, &workspace, &path, res_rx).await {
+                Ok(final_name) => {
+                    mentions.push(format!("@{UPLOAD_DIR}/{final_name}"));
+                }
+                Err(_) => {
+                    // Inline failure note so the user sees it; other
+                    // files in the batch still proceed.
+                    mentions.push(format!("[upload failed: {file_name}]"));
+                }
+            }
+        }
+        if !mentions.is_empty() {
+            // Space-joined with a trailing space, as raw input bytes —
+            // the original local path is never forwarded.
+            let inject = format!("{} ", mentions.join(" "));
+            let _ = inject_tx.send(inject.into_bytes()).await;
+        }
+    });
+}
+
+/// Upload a single local file via the FsWrite* frames and await its
+/// `FsWriteResult`. Returns the agent-reported final name on success.
+async fn upload_one_file(
+    out_tx: &mpsc::Sender<OutFrame>,
+    request_id: Uuid,
+    agent: &str,
+    workspace: &str,
+    path: &str,
+    mut res_rx: mpsc::Receiver<HubToClient>,
+) -> Result<String, ()> {
+    let file_name = basename(path);
+    let dest = format!("{UPLOAD_DIR}/{file_name}");
+
+    if out_tx
+        .send(OutFrame::Text(ClientToHub::FsWriteInit {
+            request_id,
+            agent: agent.to_string(),
+            workspace: workspace.to_string(),
+            path: dest,
+        }))
+        .await
+        .is_err()
+    {
+        return Err(());
+    }
+
+    // Stream the file in 64 KiB base64 chunks, then a terminal eof.
+    let data = std::fs::read(path).map_err(|_| ())?;
+    for chunk in data.chunks(UPLOAD_CHUNK) {
+        let data_b64 = base64::engine::general_purpose::STANDARD.encode(chunk);
+        if out_tx
+            .send(OutFrame::Text(ClientToHub::FsWriteChunk {
+                request_id,
+                data_b64,
+                eof: false,
+            }))
+            .await
+            .is_err()
+        {
+            return Err(());
+        }
+    }
+    if out_tx
+        .send(OutFrame::Text(ClientToHub::FsWriteChunk {
+            request_id,
+            data_b64: String::new(),
+            eof: true,
+        }))
+        .await
+        .is_err()
+    {
+        return Err(());
+    }
+
+    // Await the result routed in by the relay loop's text arm.
+    match res_rx.recv().await {
+        Some(HubToClient::FsWriteResult {
+            final_name, error, ..
+        }) => match (final_name, error) {
+            (Some(name), None) => Ok(name),
+            _ => Err(()),
+        },
+        _ => Err(()),
+    }
+}
+
+/// Workspace-side leaf name for a local path (basename), used both for
+/// the upload destination and the `@`-mention.
+fn basename(path: &str) -> String {
+    path.rsplit(['/', '\\'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(path)
+        .to_string()
 }
 
 fn current_terminal_size() -> Option<(u16, u16)> {
