@@ -38,6 +38,7 @@ import { DEFAULT_TOOL, KNOWN_TOOLS } from '@/lib/tools';
 import Sidebar from '@/components/Sidebar';
 import TabBar from '@/components/TabBar';
 import SettingsDialog from '@/components/SettingsDialog';
+import ConfigDialog from '@/components/ConfigDialog';
 import Tutorial, { clearTutorialSeen, hasSeenTutorial } from '@/components/Tutorial';
 import FilesModal from '@/components/FilesModal';
 
@@ -156,6 +157,9 @@ export default function Workbench() {
 
   // File manager modal
   const [filesModal, setFilesModal] = useState<{ agent: string; workspace: string } | null>(null);
+
+  // Per-workspace config dialog
+  const [configModal, setConfigModal] = useState<{ agent: string; workspace: string } | null>(null);
 
   // Per-user preferences (default args per tool, future things). Loaded
   // from the hub on mount; kept in a ref so non-reactive callbacks
@@ -1061,6 +1065,7 @@ export default function Workbench() {
         onResetWorkspace={handleResetWorkspace}
         onDeleteWorkspace={handleDeleteWorkspace}
         onOpenFiles={(a, w) => setFilesModal({ agent: a, workspace: w })}
+        onConfigWorkspace={(a, w) => setConfigModal({ agent: a, workspace: w })}
         onSettings={() => setShowSettings(true)}
         onLogout={handleLogout}
       />
@@ -1155,6 +1160,18 @@ export default function Workbench() {
           agent={filesModal.agent}
           workspace={filesModal.workspace}
           onClose={() => setFilesModal(null)}
+        />
+      )}
+
+      {/* Per-workspace config modal */}
+      {configModal && (
+        <ConfigDialog
+          agent={configModal.agent}
+          workspace={configModal.workspace}
+          preferences={preferences}
+          onSavePreferences={savePreferences}
+          onRestartWorkspace={handleResetWorkspace}
+          onClose={() => setConfigModal(null)}
         />
       )}
 

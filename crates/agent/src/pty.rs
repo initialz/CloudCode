@@ -188,6 +188,7 @@ impl PtyManager {
                 sandbox,
                 sandbox_mode,
                 tool,
+                env,
             } => {
                 self.open_session(
                     session_id,
@@ -199,6 +200,7 @@ impl PtyManager {
                     sandbox,
                     sandbox_mode,
                     tool,
+                    env,
                     tx,
                 )
                 .await;
@@ -513,6 +515,7 @@ impl PtyManager {
         sandbox: bool,
         sandbox_mode: Option<String>,
         tool: Option<String>,
+        env: HashMap<String, String>,
         tx: mpsc::Sender<OutFrame>,
     ) {
         if let Err(e) = validate_name(&account, "account") {
@@ -779,6 +782,22 @@ impl PtyManager {
         for (k, _) in std::env::vars() {
             if k.starts_with("CLAUDECODE") || k.starts_with("CLAUDE_CODE_") {
                 cmd.env_remove(&k);
+            }
+        }
+        // User-configured env (per-account / per-workspace), resolved
+        // hub-side and forwarded in PtyOpen. Applied BEFORE the fixed
+        // CLOUDCODE_* / TERM vars below so user config can never clobber
+        // our internal vars. Set on the outer `cmd` (the sandbox-exec
+        // wrapper, or tmux directly when mode == Off): run_sandbox_exec
+        // execs via execvp(3), which preserves the environment, so these
+        // vars survive into tmux → the bash wrapper → the tool process
+        // inside the sandbox. Keys are validated defensively (same rule
+        // as webterm/hub); bad keys are skipped, values pass verbatim.
+        for (k, v) in &env {
+            if is_valid_env_key(k) {
+                cmd.env(k, v);
+            } else {
+                tracing::warn!(key = %k, "skipping env var with invalid key name");
             }
         }
         // Make sure the inner process knows it's interactive.
@@ -1588,6 +1607,18 @@ fn validate_name(name: &str, kind: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// Defensive validation for user-supplied env var names. Matches the
+/// shared contract `^[A-Za-z_][A-Za-z0-9_]*$` used by webterm and the hub.
+/// Values are never validated — they pass through verbatim.
+fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 fn expand_path(p: &Path) -> PathBuf {
     let s = p.to_string_lossy();
     let expanded = if let Some(rest) = s.strip_prefix("~/") {
@@ -1689,6 +1720,24 @@ mod tests {
             let n = format!("ws{}bad", bad);
             assert!(validate_name(&n, "workspace").is_err(), "expected reject: {:?}", n);
         }
+    }
+
+    #[test]
+    fn env_keys_match_posix_identifier_rule() {
+        // ^[A-Za-z_][A-Za-z0-9_]*$
+        assert!(is_valid_env_key("FOO"));
+        assert!(is_valid_env_key("_foo"));
+        assert!(is_valid_env_key("ANTHROPIC_BASE_URL"));
+        assert!(is_valid_env_key("a1_B2"));
+        assert!(is_valid_env_key("x"));
+        // Rejections.
+        assert!(!is_valid_env_key(""), "empty");
+        assert!(!is_valid_env_key("1FOO"), "leading digit");
+        assert!(!is_valid_env_key("FOO-BAR"), "dash");
+        assert!(!is_valid_env_key("FOO BAR"), "space");
+        assert!(!is_valid_env_key("FOO.BAR"), "dot");
+        assert!(!is_valid_env_key("FOO="), "equals");
+        assert!(!is_valid_env_key("PATH$"), "dollar");
     }
 }
 

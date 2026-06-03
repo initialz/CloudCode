@@ -1,15 +1,18 @@
-// Theme + per-tool default args modal.
+// Theme + global env vars + per-tool default args modal.
 
 import { apply, getStoredTheme, setStoredTheme, Theme } from '@/lib/theme';
 import { useState } from 'react';
-import { KNOWN_TOOLS, type Tool } from '@/lib/tools';
-import { argsToText, textToArgs, type Preferences } from '@/lib/preferences';
-
-// Tools whose default args we expose in this dialog. KNOWN_TOOLS stays
-// the source of truth for "can be launched"; this is a narrower set —
-// codex args are hidden until we have a clear UX for codex-specific
-// flags.
-const CONFIGURABLE_TOOLS: Tool[] = KNOWN_TOOLS.filter((t) => t !== 'codex');
+import { type Tool } from '@/lib/tools';
+import { type Preferences } from '@/lib/preferences';
+import {
+  ArgsEditor,
+  EnvEditor,
+  collapseConfig,
+  envToRows,
+  initialArgsText,
+  invalidRowIds,
+  type EnvRow,
+} from '@/components/ConfigForm';
 
 type Props = {
   onClose: () => void;
@@ -34,16 +37,17 @@ export default function SettingsDialog({
 }: Props) {
   const [theme, setTheme] = useState<Theme>(getStoredTheme);
   const [nameText, setNameText] = useState(realName ?? '');
-  // Local text-input state per tool. We commit (parse + save) on blur
-  // rather than on every keystroke so partial typing like "--mod" doesn't
-  // round-trip through the server. Initial value pulls from the prop;
-  // the textbox is otherwise uncontrolled-ish (we hold it in local state
-  // and sync from props only at mount).
-  const [argsText, setArgsText] = useState<Record<Tool, string>>(() =>
-    Object.fromEntries(
-      CONFIGURABLE_TOOLS.map((t) => [t, argsToText(preferences.toolArgs[t] ?? [])]),
-    ) as Record<Tool, string>,
+  // Local form state, seeded from props at mount. We commit (parse +
+  // save) on Save rather than per-keystroke so partial typing doesn't
+  // round-trip through the server.
+  const [envRows, setEnvRows] = useState<EnvRow[]>(() =>
+    envToRows(preferences.env),
   );
+  const [argsText, setArgsText] = useState<Record<Tool, string>>(() =>
+    initialArgsText(preferences),
+  );
+
+  const hasInvalidEnv = invalidRowIds(envRows).size > 0;
 
   function handleTheme(t: Theme) {
     setTheme(t);
@@ -51,10 +55,13 @@ export default function SettingsDialog({
   }
 
   function handleSave() {
+    if (hasInvalidEnv) return;
     commitName();
-    for (const tool of CONFIGURABLE_TOOLS) {
-      commitArgs(tool);
-    }
+    const next: Preferences = {
+      ...preferences,
+      ...collapseConfig(preferences, envRows, argsText),
+    };
+    onSavePreferences(next);
     setStoredTheme(theme);
     onThemeChange?.(theme);
     onClose();
@@ -74,23 +81,9 @@ export default function SettingsDialog({
     onSaveRealName?.(next);
   }
 
-  function commitArgs(tool: Tool) {
-    const parsed = textToArgs(argsText[tool] ?? '');
-    const current = preferences.toolArgs[tool] ?? [];
-    // Avoid a network roundtrip when nothing actually changed (e.g. user
-    // tabs through the input without editing).
-    if (parsed.length === current.length && parsed.every((v, i) => v === current[i])) {
-      return;
-    }
-    onSavePreferences({
-      ...preferences,
-      toolArgs: { ...preferences.toolArgs, [tool]: parsed },
-    });
-  }
-
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl shadow-xl p-6 w-full max-w-md mx-4">
+      <div className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl shadow-xl p-6 w-full max-w-md mx-4 max-h-[90vh] overflow-y-auto">
         <h3 className="text-base font-semibold text-zinc-900 dark:text-zinc-100 mb-4">
           Settings
         </h3>
@@ -134,34 +127,16 @@ export default function SettingsDialog({
         </div>
 
         <div className="mb-5">
-          <p className="text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-2 uppercase tracking-wide">
-            Default args per tool
-          </p>
-          <p className="text-xs text-zinc-500 dark:text-zinc-400 mb-3 leading-snug">
-            Appended whenever you launch the tool from this account.
-            Whitespace-separated; quoted args aren&apos;t supported.
-          </p>
-          <div className="space-y-2">
-            {CONFIGURABLE_TOOLS.map((tool) => (
-              <label key={tool} className="flex items-center gap-3">
-                <span className="w-16 shrink-0 text-xs font-mono text-zinc-700 dark:text-zinc-300 capitalize">
-                  {tool}
-                </span>
-                <input
-                  type="text"
-                  spellCheck={false}
-                  autoCapitalize="off"
-                  autoCorrect="off"
-                  placeholder="--flag value …"
-                  value={argsText[tool] ?? ''}
-                  onChange={(e) =>
-                    setArgsText((prev) => ({ ...prev, [tool]: e.target.value }))
-                  }
-                  className="flex-1 px-2 py-1.5 text-xs font-mono rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-950 text-zinc-900 dark:text-zinc-100 focus:outline-none focus:ring-1 focus:ring-zinc-400 dark:focus:ring-zinc-500"
-                />
-              </label>
-            ))}
-          </div>
+          <ArgsEditor
+            argsText={argsText}
+            onChange={(tool, text) =>
+              setArgsText((prev) => ({ ...prev, [tool]: text }))
+            }
+          />
+        </div>
+
+        <div className="mb-5">
+          <EnvEditor rows={envRows} onChange={setEnvRows} />
         </div>
 
         <div className="flex items-center gap-2">
@@ -186,7 +161,8 @@ export default function SettingsDialog({
           </button>
           <button
             onClick={handleSave}
-            className="text-sm px-3 py-1.5 rounded-lg bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:opacity-90 transition-colors"
+            disabled={hasInvalidEnv}
+            className="text-sm px-3 py-1.5 rounded-lg bg-zinc-900 dark:bg-zinc-100 text-white dark:text-zinc-900 hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
           >
             Save
           </button>

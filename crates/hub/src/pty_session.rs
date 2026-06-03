@@ -28,6 +28,7 @@ use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::response::Response;
 use futures::{SinkExt, StreamExt};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -776,28 +777,38 @@ where
             // user gets one mode worse than they asked for, but it
             // stays running.
             let sandbox = sandbox_mode == "strict";
-            // Merge in webterm-side default args when the client
-            // sent none. webterm already does this on its end before
-            // dispatching OpenSession (so its claude_args is
-            // pre-populated when prefs are set); the CLI client
-            // doesn't have a preferences UI, so we do the merge for
-            // it here. `tool` falls back to "claude" because the
-            // CLI omits it when relying on the agent's configured
-            // default — using webterm's default tool keeps the
-            // common case (user set claude args + CLI without
-            // --tool) doing the right thing. Non-empty CLI args
-            // always win.
-            let claude_args = if claude_args.is_empty() {
-                let lookup_tool = tool.as_deref().unwrap_or("claude");
-                args_from_user_preferences(
-                    &ctx.state.db,
-                    &ctx.account_name,
-                    lookup_tool,
-                )
+            // Resolve effective env + args from the stored
+            // `user_preferences` blob, applying the per-workspace
+            // snapshot rule: if `workspaces["<agent>/<workspace>"]`
+            // exists, use ITS env + tool_args (a full snapshot — no
+            // merge with global); otherwise fall back to global env +
+            // global tool_args. `tool` falls back to "claude" because
+            // the CLI omits it when relying on the agent's configured
+            // default — using webterm's default tool keeps the common
+            // case (user set claude args + CLI without --tool) doing
+            // the right thing.
+            let lookup_tool = tool.as_deref().unwrap_or("claude");
+            let (effective_env, effective_args) = match ctx
+                .state
+                .db
+                .get_user_preferences(&ctx.account_name)
                 .await
+            {
+                Ok(Some(blob)) => {
+                    resolve_effective_config(&blob, &agent, &workspace, lookup_tool)
+                }
+                _ => (HashMap::new(), Vec::new()),
+            };
+            // Non-empty CLI args always win for args (preserves the
+            // existing behaviour where webterm pre-populates claude_args
+            // from prefs before dispatching). Env always comes from
+            // stored config — clients never send env.
+            let claude_args = if claude_args.is_empty() {
+                effective_args
             } else {
                 claude_args
             };
+            let env = effective_env;
             let (evt_tx, mut evt_rx) = mpsc::channel::<PtyEventOut>(PTY_EVENT_QUEUE);
             conn.register_session(session_id, evt_tx);
             if conn
@@ -811,6 +822,7 @@ where
                     sandbox,
                     sandbox_mode: Some(sandbox_mode),
                     tool,
+                    env,
                 })
                 .await
                 .is_err()
@@ -1221,29 +1233,65 @@ async fn handle_workspace_op<S>(
     }
 }
 
-/// webterm; we know its current shape is `{tool_args: {<tool>:
-/// [String, ...]}}`. Any deviation (missing row, bad JSON, wrong
-/// shape, unknown tool) maps to an empty argv — matching webterm's
-/// own fall-back behaviour, so a misconfigured row never silently
-/// injects wrong flags into claude/codex.
-async fn args_from_user_preferences(
-    db: &crate::db::Db,
-    account: &str,
+/// Resolve the effective `(env, tool_args)` for an OpenSession from the
+/// stored `user_preferences` blob. webterm owns the blob schema; the hub
+/// reads only what it needs:
+///
+/// ```jsonc
+/// {
+///   "tool_args": { "<tool>": [String, ...] },   // global
+///   "env": { "KEY": "VALUE" },                    // global
+///   "workspaces": {
+///     "<agent>/<workspace>": {
+///       "env": { ... },
+///       "tool_args": { "<tool>": [...] }
+///     }
+///   }
+/// }
+/// ```
+///
+/// Resolution rule (per-workspace is a FULL SNAPSHOT — pick one or the
+/// other, never merge): if `workspaces["<agent>/<workspace>"]` exists,
+/// use its `env` + `tool_args[tool]`; otherwise use the global `env` +
+/// global `tool_args[tool]`. Any deviation (missing key, bad JSON, wrong
+/// shape) maps to defaults (`{}` env, `[]` args) — matching webterm's own
+/// defensive fall-back, so a misconfigured row never silently injects
+/// wrong env/flags into claude/codex.
+fn resolve_effective_config(
+    blob: &str,
+    agent: &str,
+    workspace: &str,
     tool: &str,
-) -> Vec<String> {
-    let Ok(Some(blob)) = db.get_user_preferences(account).await else {
-        return Vec::new();
+) -> (HashMap<String, String>, Vec<String>) {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(blob) else {
+        return (HashMap::new(), Vec::new());
     };
-    parse_tool_args_blob(&blob, tool)
+    let ws_key = format!("{}/{}", agent, workspace);
+    // Scope from which we read `env` + `tool_args`: the workspace
+    // snapshot if present, otherwise the top-level (global) object.
+    let scope = json
+        .get("workspaces")
+        .and_then(|v| v.as_object())
+        .and_then(|m| m.get(&ws_key))
+        .unwrap_or(&json);
+    (env_from_scope(scope), tool_args_from_scope(scope, tool))
 }
 
-/// Pure parse step extracted so tests can exercise every shape-edge
-/// case without standing up a DB.
-fn parse_tool_args_blob(blob: &str, tool: &str) -> Vec<String> {
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(blob) else {
-        return Vec::new();
+/// Pull `env` (a flat `{string: string}` map) from a config scope,
+/// dropping any non-string values defensively.
+fn env_from_scope(scope: &serde_json::Value) -> HashMap<String, String> {
+    let Some(obj) = scope.get("env").and_then(|v| v.as_object()) else {
+        return HashMap::new();
     };
-    let Some(arr) = json
+    obj.iter()
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+        .collect()
+}
+
+/// Pull `tool_args[tool]` (an array of strings) from a config scope,
+/// dropping any non-string entries defensively.
+fn tool_args_from_scope(scope: &serde_json::Value, tool: &str) -> Vec<String> {
+    let Some(arr) = scope
         .get("tool_args")
         .and_then(|v| v.as_object())
         .and_then(|m| m.get(tool))
@@ -1336,34 +1384,125 @@ where
 mod tests {
     use super::*;
 
+    // Helper: resolve args only, falling through to global (no matching
+    // workspace key), to keep these focused on the tool_args parsing.
+    fn global_args(blob: &str, tool: &str) -> Vec<String> {
+        resolve_effective_config(blob, "ag", "ws", tool).1
+    }
+    fn global_env(blob: &str) -> HashMap<String, String> {
+        resolve_effective_config(blob, "ag", "ws", "claude").0
+    }
+
     #[test]
     fn pref_args_pulls_typed_array_for_requested_tool() {
         let blob = r#"{"tool_args":{"claude":["--model","claude-3-opus"],"codex":[]}}"#;
         assert_eq!(
-            parse_tool_args_blob(blob, "claude"),
+            global_args(blob, "claude"),
             vec!["--model".to_string(), "claude-3-opus".to_string()]
         );
-        assert_eq!(parse_tool_args_blob(blob, "codex"), Vec::<String>::new());
+        assert_eq!(global_args(blob, "codex"), Vec::<String>::new());
     }
 
     #[test]
     fn pref_args_fall_back_to_empty_on_bad_shapes() {
-        assert!(parse_tool_args_blob("not json", "claude").is_empty());
-        assert!(parse_tool_args_blob("\"oops\"", "claude").is_empty());
-        assert!(parse_tool_args_blob("{}", "claude").is_empty());
-        assert!(parse_tool_args_blob(r#"{"tool_args":[]}"#, "claude").is_empty());
-        assert!(
-            parse_tool_args_blob(r#"{"tool_args":{"codex":["x"]}}"#, "claude").is_empty()
-        );
-        assert!(
-            parse_tool_args_blob(r#"{"tool_args":{"claude":"--model x"}}"#, "claude").is_empty()
-        );
+        assert!(global_args("not json", "claude").is_empty());
+        assert!(global_args("\"oops\"", "claude").is_empty());
+        assert!(global_args("{}", "claude").is_empty());
+        assert!(global_args(r#"{"tool_args":[]}"#, "claude").is_empty());
+        assert!(global_args(r#"{"tool_args":{"codex":["x"]}}"#, "claude").is_empty());
+        assert!(global_args(r#"{"tool_args":{"claude":"--model x"}}"#, "claude").is_empty());
         assert_eq!(
-            parse_tool_args_blob(
+            global_args(
                 r#"{"tool_args":{"claude":["--a",42,"--b",null,"--c"]}}"#,
                 "claude"
             ),
             vec!["--a".to_string(), "--b".to_string(), "--c".to_string()]
         );
+    }
+
+    #[test]
+    fn env_pulls_string_map_and_drops_non_strings() {
+        let blob = r#"{"env":{"A":"1","B":"two","C":3,"D":null}}"#;
+        let env = global_env(blob);
+        assert_eq!(env.get("A"), Some(&"1".to_string()));
+        assert_eq!(env.get("B"), Some(&"two".to_string()));
+        assert!(!env.contains_key("C"));
+        assert!(!env.contains_key("D"));
+    }
+
+    #[test]
+    fn env_defaults_empty_on_bad_shapes() {
+        assert!(global_env("not json").is_empty());
+        assert!(global_env("{}").is_empty());
+        assert!(global_env(r#"{"env":[]}"#).is_empty());
+        assert!(global_env(r#"{"env":"oops"}"#).is_empty());
+    }
+
+    #[test]
+    fn workspace_snapshot_wins_over_global_no_merge() {
+        // Workspace key present -> use its env + tool_args ONLY (full
+        // snapshot, no merge with global).
+        let blob = r#"{
+            "env": {"GLOBAL":"g"},
+            "tool_args": {"claude":["--global"]},
+            "workspaces": {
+                "ag/ws": {
+                    "env": {"WS":"w"},
+                    "tool_args": {"claude":["--ws"]}
+                }
+            }
+        }"#;
+        let (env, args) = resolve_effective_config(blob, "ag", "ws", "claude");
+        assert_eq!(env.get("WS"), Some(&"w".to_string()));
+        assert!(!env.contains_key("GLOBAL"), "snapshot must not merge global env");
+        assert_eq!(args, vec!["--ws".to_string()]);
+    }
+
+    #[test]
+    fn missing_workspace_key_falls_through_to_global() {
+        let blob = r#"{
+            "env": {"GLOBAL":"g"},
+            "tool_args": {"claude":["--global"]},
+            "workspaces": {
+                "other/ws": {"env":{"X":"1"}}
+            }
+        }"#;
+        let (env, args) = resolve_effective_config(blob, "ag", "ws", "claude");
+        assert_eq!(env.get("GLOBAL"), Some(&"g".to_string()));
+        assert_eq!(args, vec!["--global".to_string()]);
+    }
+
+    #[test]
+    fn workspace_key_uses_agent_and_name() {
+        // Same workspace name on a different agent must NOT collide.
+        let blob = r#"{
+            "workspaces": {
+                "agentA/proj": {"env":{"WHICH":"A"}},
+                "agentB/proj": {"env":{"WHICH":"B"}}
+            }
+        }"#;
+        assert_eq!(
+            resolve_effective_config(blob, "agentA", "proj", "claude")
+                .0
+                .get("WHICH"),
+            Some(&"A".to_string())
+        );
+        assert_eq!(
+            resolve_effective_config(blob, "agentB", "proj", "claude")
+                .0
+                .get("WHICH"),
+            Some(&"B".to_string())
+        );
+    }
+
+    #[test]
+    fn workspace_snapshot_with_empty_env_deletes_inherited() {
+        // Forked snapshot with no env -> empty map even though global has env.
+        let blob = r#"{
+            "env": {"GLOBAL":"g"},
+            "workspaces": { "ag/ws": {"tool_args":{"claude":["--ws"]}} }
+        }"#;
+        let (env, _) = resolve_effective_config(blob, "ag", "ws", "claude");
+        assert!(env.is_empty());
     }
 }

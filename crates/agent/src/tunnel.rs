@@ -323,6 +323,12 @@ pub enum ServerMsg {
         /// hubs that didn't know about multi-tool.
         #[serde(default)]
         tool: Option<String>,
+        /// Extra environment variables to inject into the tool process,
+        /// resolved hub-side from the stored per-account / per-workspace
+        /// config. `#[serde(default)]` so a pre-env hub degrades to "no
+        /// extra env" instead of failing to parse.
+        #[serde(default)]
+        env: std::collections::HashMap<String, String>,
     },
     PtyResize {
         session_id: Uuid,
