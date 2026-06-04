@@ -817,7 +817,19 @@ pub async fn hub_version() -> Response {
 pub async fn agents_releases(State(state): State<AdminState>) -> Response {
     match state.releases.get_fresh().await {
         Ok(entry) => Json(entry.public.clone()).into_response(),
-        Err(e) => err(StatusCode::SERVICE_UNAVAILABLE, "upstream_unavailable", e),
+        // Degrade gracefully instead of 503-ing the whole agents page: the
+        // release list is auxiliary, and the only way we get here is a GitHub
+        // fetch failure with an empty cache (e.g. rate-limited right after a
+        // hub restart). Return an empty list so the page still loads; a later
+        // refresh picks the releases up once the fetch succeeds.
+        Err(e) => {
+            tracing::warn!(error = %e, "releases fetch failed with empty cache; returning empty list");
+            Json(ReleasesResponse {
+                releases: Vec::new(),
+                latest: None,
+            })
+            .into_response()
+        }
     }
 }
 
