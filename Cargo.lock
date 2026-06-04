@@ -395,7 +395,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cloudcode-agent"
-version = "1.27.0"
+version = "1.27.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -435,7 +435,7 @@ dependencies = [
 
 [[package]]
 name = "cloudcode-client"
-version = "1.27.0"
+version = "1.27.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "cloudcode-daemon"
-version = "1.27.0"
+version = "1.27.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "cloudcode-hub"
-version = "1.27.0"
+version = "1.27.1"
 dependencies = [
  "anyhow",
  "argon2",
