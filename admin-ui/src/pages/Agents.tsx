@@ -226,10 +226,13 @@ export function Agents() {
               ) : (
                 agents.map((a) => {
                   const isUpToDate = versionsEqual(a.version, a.latest_version);
+                  // `!= null` (loose) guards against BOTH null and undefined —
+                  // if latest_version is ever absent from the response we must
+                  // not fall through and render "Update to undefined".
                   const hasUpdate =
                     a.online &&
-                    a.version !== null &&
-                    a.latest_version !== null &&
+                    a.version != null &&
+                    a.latest_version != null &&
                     !isUpToDate;
                   const isUpdating = updating[a.name] === true;
                   const updateErr = updateErrs[a.name];

@@ -575,7 +575,9 @@ struct AgentRowDto {
     version: Option<String>,
     /// Latest agent release available from GitHub at the time of this
     /// call. Used by the admin UI to surface an "update available" badge.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always serialized (as `null` when unknown) so the client sees the
+    /// field per its `string | null` contract — omitting it made the UI read
+    /// `undefined` and render "Update to undefined".
     latest_version: Option<String>,
 }
 
@@ -632,10 +634,12 @@ pub async fn agents_list(State(state): State<AdminState>) -> Response {
 // Agent releases + self-update
 // ---------------------------------------------------------------------
 
-// TEMP for live self-update testing — bumped down from 5 min so a
-// fresh release tag becomes observable within ~60 s of publishing.
-// Restore to 5 * 60 after the test cycle finishes.
-const RELEASES_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+// Cache GitHub releases for 5 minutes. Keep this comfortably long: we hit the
+// GitHub API UNAUTHENTICATED (60 req/hour/IP), so a short TTL plus admin-UI
+// polling exhausts the rate limit, the fetch starts returning 403, and
+// `latest_version` collapses to None (the "Update to undefined" bug). At 5 min
+// that's ~12 req/hour, well under the limit.
+const RELEASES_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const GITHUB_RELEASES_URL: &str =
     "https://api.github.com/repos/initialz/cloudcode/releases";
 const UPDATE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
