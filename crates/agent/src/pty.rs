@@ -1397,6 +1397,100 @@ impl PtyManager {
     fn account_root(&self, account: &str) -> PathBuf {
         self.workspace_root().join(account)
     }
+
+    /// Background task: reclaim resources from abandoned workspaces. Every
+    /// `REAP_TICK`, kill the per-workspace tmux server (which takes claude down
+    /// with it) for any workspace that has had no attached client for
+    /// `>= REAP_IDLE_AFTER` AND whose claude is idle (`end_turn`). The
+    /// conversation jsonl is left intact, so the next open resumes via
+    /// `claude --continue`. Non-claude tools have no idle signal and are never
+    /// reaped (conservative). Spawned once from `serve()`.
+    pub async fn run_idle_reaper(self: Arc<Self>) {
+        use std::collections::HashSet;
+        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+        // (account, workspace) -> first time we observed it detached.
+        let mut seen: HashMap<(String, String), Instant> = HashMap::new();
+        loop {
+            tokio::time::sleep(REAP_TICK).await;
+
+            // Live per-workspace tmux servers.
+            let live: Vec<(String, String)> = self
+                .list_workspace_paths()
+                .iter()
+                .filter_map(|p| {
+                    p.split_once('/').map(|(a, w)| (a.to_string(), w.to_string()))
+                })
+                .filter(|(a, w)| tmux_session_alive(a, w))
+                .collect();
+
+            // Workspaces with a client attached right now.
+            let attached: HashSet<(String, String)> = self
+                .sessions
+                .iter()
+                .map(|e| (e.value().account.clone(), e.value().workspace.clone()))
+                .collect();
+
+            // detached = live minus attached.
+            let detached: HashSet<(String, String)> =
+                live.into_iter().filter(|k| !attached.contains(k)).collect();
+
+            let now = Instant::now();
+            for (account, workspace) in due_for_reaping(&detached, &mut seen, now, REAP_IDLE_AFTER)
+            {
+                // Only reap an idle claude (end_turn). Busy / non-claude → skip
+                // this tick but keep the `seen` entry, so we retry once idle.
+                let cwd_raw = self.workspace_root().join(&account).join(&workspace);
+                let cwd = std::fs::canonicalize(&cwd_raw).unwrap_or(cwd_raw);
+                let proj_dir = crate::jsonl::project_dir(&home, &cwd);
+                if !is_claude_idle(&proj_dir) {
+                    continue;
+                }
+                // Final guard: nobody attached between the scan above and now.
+                let attached_now = self.sessions.iter().any(|e| {
+                    e.value().account == account && e.value().workspace == workspace
+                });
+                if attached_now {
+                    continue;
+                }
+                let label = format!("cc-{}-{}", account, workspace);
+                let _ = std::process::Command::new(&self.tmux.executable)
+                    .args(["-L", &label, "kill-server"])
+                    .output();
+                tracing::info!(
+                    %account, %workspace,
+                    "reaped idle workspace (no client >= 30m + claude idle); --continue will resume"
+                );
+                seen.remove(&(account, workspace));
+            }
+        }
+    }
+}
+
+/// How often the idle reaper scans for abandoned workspaces.
+const REAP_TICK: std::time::Duration = std::time::Duration::from_secs(60);
+/// A detached workspace is reaped after this long with no attached client
+/// (and only when claude is idle). Fixed, not configurable.
+const REAP_IDLE_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// Given the currently-detached workspaces, update `seen` (first-observed-
+/// detached timestamps) and return those detached for at least `threshold`.
+/// Pure decision logic, unit-tested: workspaces no longer detached (re-attached
+/// or whose server is gone) are dropped from `seen` so their timer resets.
+fn due_for_reaping(
+    detached: &std::collections::HashSet<(String, String)>,
+    seen: &mut HashMap<(String, String), Instant>,
+    now: Instant,
+    threshold: std::time::Duration,
+) -> Vec<(String, String)> {
+    seen.retain(|k, _| detached.contains(k));
+    let mut due = Vec::new();
+    for k in detached {
+        let since = *seen.entry(k.clone()).or_insert(now);
+        if now.duration_since(since) >= threshold {
+            due.push(k.clone());
+        }
+    }
+    due
 }
 
 /// Generic shell wrapper used for every pane (first or split). The
@@ -1697,6 +1791,36 @@ fn tmux_socket_candidates(label: &str) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reaper_due_logic() {
+        use std::collections::HashSet;
+        use std::time::Duration;
+        let k = |a: &str, w: &str| (a.to_string(), w.to_string());
+        let mut seen: HashMap<(String, String), Instant> = HashMap::new();
+        let now = Instant::now();
+        let threshold = Duration::from_secs(30 * 60);
+
+        // Newly detached: timestamp recorded, not yet due.
+        let det: HashSet<(String, String)> = [k("acct", "ws1")].into_iter().collect();
+        assert!(due_for_reaping(&det, &mut seen, now, threshold).is_empty());
+        assert!(seen.contains_key(&k("acct", "ws1")));
+
+        // Still detached, observed 31 min after first-seen → due.
+        let later = now + Duration::from_secs(31 * 60);
+        assert_eq!(
+            due_for_reaping(&det, &mut seen, later, threshold),
+            vec![k("acct", "ws1")]
+        );
+
+        // No longer detached (re-attached): dropped from `seen`, timer resets.
+        let empty: HashSet<(String, String)> = HashSet::new();
+        assert!(due_for_reaping(&empty, &mut seen, later, threshold).is_empty());
+        assert!(!seen.contains_key(&k("acct", "ws1")));
+
+        // A fresh detach starts the clock over: not immediately due.
+        assert!(due_for_reaping(&det, &mut seen, later, threshold).is_empty());
+    }
 
     #[test]
     fn names_accept_safe_chars() {

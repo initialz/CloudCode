@@ -224,6 +224,12 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     let workspace_root = expand_workspace_root(&config.claude.workspace_root);
     audit::spawn(home, workspace_root, audit_slot.clone());
 
+    // Idle workspace reaper: kill the tmux server (and claude) for workspaces
+    // with no attached client for >= 30 min while claude is idle, reclaiming
+    // their RAM. Spawned once per agent lifetime; the conversation resumes via
+    // `claude --continue` on the next open.
+    tokio::spawn(manager.clone().run_idle_reaper());
+
     let state = Arc::new(AppState {
         name,
         config,
