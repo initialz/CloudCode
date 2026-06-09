@@ -1,3 +1,4 @@
+mod cc_browser;
 mod input;
 mod menu;
 mod mouse_filter;
