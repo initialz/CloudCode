@@ -5,6 +5,7 @@
 //! reports, mouse events, anything claude's UI library queries) reaches
 //! the remote PTY exactly as the terminal produced it.
 
+use crate::cc_browser;
 use crate::input::ByteRx;
 use crate::mouse_filter::MouseModeStripper;
 use crate::paste_detect::{parse_paste_paths, wrap_as_paste, PasteDetector, PasteEvent};
@@ -150,6 +151,12 @@ async fn relay_loop(
     let mut pending_uploads: HashMap<Uuid, mpsc::Sender<HubToClient>> = HashMap::new();
     let (inject_tx, mut inject_rx) = mpsc::channel::<Vec<u8>>(16);
 
+    // In-session browser MCP channel (M1). Lazily started on the first
+    // `BrowserRpc` frame from the hub; output frames flow back to the
+    // hub via `browser_out_rx` (forwarded in the select! arm below).
+    let mut browser: Option<cc_browser::BrowserChannel> = None;
+    let (browser_out_tx, mut browser_out_rx) = tokio::sync::mpsc::channel::<String>(64);
+
     loop {
         tokio::select! {
             chunk = bytes.recv() => {
@@ -230,7 +237,31 @@ async fn relay_loop(
                             let _ = tx.send(frame).await;
                         }
                     }
+                    HubToClient::BrowserRpc { payload } => {
+                        if browser.is_none() {
+                            if let Some((prog, args)) = cc_browser::m1_mcp_command() {
+                                let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                                match cc_browser::BrowserChannel::start(&prog, &argrefs, browser_out_tx.clone()) {
+                                    Ok(ch) => browser = Some(ch),
+                                    Err(e) => tracing::warn!(error=%e, "failed to start browser MCP subprocess"),
+                                }
+                            }
+                        }
+                        if let Some(ch) = browser.as_ref() {
+                            let _ = ch.feed(payload).await;
+                        }
+                    }
+                    HubToClient::BrowserClosed { .. } => {
+                        browser = None; // drop -> kill_on_drop reaps subprocess
+                    }
                     _ => {}
+                }
+            }
+            out = browser_out_rx.recv() => {
+                if let Some(payload) = out {
+                    let _ = wire.out_tx
+                        .send(OutFrame::Text(ClientToHub::BrowserRpc { payload }))
+                        .await;
                 }
             }
             _ = winch_tick(&mut winch) => {
