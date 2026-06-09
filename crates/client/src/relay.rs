@@ -155,6 +155,7 @@ async fn relay_loop(
     // `BrowserRpc` frame from the hub; output frames flow back to the
     // hub via `browser_out_rx` (forwarded in the select! arm below).
     let mut browser: Option<cc_browser::BrowserChannel> = None;
+    let mcp_cmd = cc_browser::m1_mcp_command();
     let (browser_out_tx, mut browser_out_rx) = tokio::sync::mpsc::channel::<String>(64);
 
     loop {
@@ -239,7 +240,7 @@ async fn relay_loop(
                     }
                     HubToClient::BrowserRpc { payload } => {
                         if browser.is_none() {
-                            if let Some((prog, args)) = cc_browser::m1_mcp_command() {
+                            if let Some((prog, args)) = mcp_cmd.clone() {
                                 let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                                 match cc_browser::BrowserChannel::start(&prog, &argrefs, browser_out_tx.clone()) {
                                     Ok(ch) => browser = Some(ch),
@@ -248,7 +249,14 @@ async fn relay_loop(
                             }
                         }
                         if let Some(ch) = browser.as_ref() {
-                            let _ = ch.feed(payload).await;
+                            if ch.feed(payload).is_err() {
+                                browser = None;
+                                let _ = wire.out_tx
+                                    .send(OutFrame::Text(ClientToHub::BrowserClosed {
+                                        reason: Some("browser subprocess unavailable".to_string()),
+                                    }))
+                                    .await;
+                            }
                         }
                     }
                     HubToClient::BrowserClosed { .. } => {
@@ -258,10 +266,15 @@ async fn relay_loop(
                 }
             }
             out = browser_out_rx.recv() => {
+                // None is unreachable while relay_loop holds browser_out_tx;
+                // guard on `browser` so frames queued before a teardown are
+                // dropped instead of being sent after BrowserClosed.
                 if let Some(payload) = out {
-                    let _ = wire.out_tx
-                        .send(OutFrame::Text(ClientToHub::BrowserRpc { payload }))
-                        .await;
+                    if browser.is_some() {
+                        let _ = wire.out_tx
+                            .send(OutFrame::Text(ClientToHub::BrowserRpc { payload }))
+                            .await;
+                    }
                 }
             }
             _ = winch_tick(&mut winch) => {

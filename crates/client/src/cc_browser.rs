@@ -105,9 +105,12 @@ impl BrowserChannel {
         Ok(Self { in_tx })
     }
 
+    /// Enqueue an inbound frame for the subprocess without blocking.
+    /// Returns Err if the channel is full or the subprocess task is gone —
+    /// callers should treat Err as "channel dead" and tear down.
     #[allow(dead_code)]
-    pub async fn feed(&self, frame: String) -> Result<(), ()> {
-        self.in_tx.send(frame).await.map_err(|_| ())
+    pub fn feed(&self, frame: String) -> Result<(), ()> {
+        self.in_tx.try_send(frame).map_err(|_| ())
     }
 }
 
@@ -153,7 +156,6 @@ mod tests {
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(8);
         let chan = BrowserChannel::start("node", &[fixture], out_tx).expect("start channel");
         chan.feed(r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#.to_string())
-            .await
             .unwrap();
         let got = out_rx.recv().await.expect("a response frame");
         assert!(got.contains("echo"));
