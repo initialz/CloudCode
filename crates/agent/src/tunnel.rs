@@ -221,6 +221,15 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+
+    /// One opaque MCP JSON-RPC frame from the agent's resident MCP
+    /// endpoint (claude is the MCP client) toward the bound client's
+    /// browser subprocess. `session_id` is the routing key; payload is
+    /// raw text, never parsed in transit.
+    BrowserRpc {
+        session_id: Uuid,
+        payload: String,
+    },
 }
 
 /// One entry returned in a `FsListResult`. Directory entries have
@@ -480,6 +489,14 @@ pub enum ServerMsg {
         workspace: String,
         paths: Vec<String>,
     },
+
+    /// One opaque MCP JSON-RPC frame from the client's browser
+    /// subprocess back toward claude, routed by `session_id` to the
+    /// matching MCP endpoint stream. Payload is raw text, never parsed.
+    BrowserRpc {
+        session_id: Uuid,
+        payload: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -488,4 +505,37 @@ pub enum RejectReason {
     NameTaken,
     AuthFailed,
     VersionMismatch,
+}
+
+#[cfg(test)]
+mod browser_tests {
+    use super::*;
+
+    #[test]
+    fn browser_rpc_frames_roundtrip_byte_exact() {
+        use uuid::Uuid;
+        let sid = Uuid::new_v4();
+        let original = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+
+        let c = ClientMsg::BrowserRpc { session_id: sid, payload: original.to_string() };
+        let j = serde_json::to_string(&c).unwrap();
+        assert!(j.contains("\"type\":\"browser_rpc\""));
+        match serde_json::from_str::<ClientMsg>(&j).unwrap() {
+            ClientMsg::BrowserRpc { session_id, payload } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(payload, original);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let s = ServerMsg::BrowserRpc { session_id: sid, payload: original.to_string() };
+        let j2 = serde_json::to_string(&s).unwrap();
+        match serde_json::from_str::<ServerMsg>(&j2).unwrap() {
+            ServerMsg::BrowserRpc { session_id, payload } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(payload, original);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 }

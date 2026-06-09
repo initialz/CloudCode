@@ -477,6 +477,7 @@ impl PtyManager {
                 }
             }
             ServerMsg::Welcome { .. } | ServerMsg::Rejected { .. } | ServerMsg::Ping => {}
+            ServerMsg::BrowserRpc { .. } => { /* routed in Task 10 */ }
         }
     }
 
