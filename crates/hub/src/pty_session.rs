@@ -1130,6 +1130,8 @@ where
             }
             true
         }
+        // Routing not yet implemented — accepted and ignored until Task 2+.
+        ClientToHub::BrowserRpc { .. } | ClientToHub::BrowserClosed { .. } => true,
         ClientToHub::Close => false,
         ClientToHub::Hello { .. } | ClientToHub::Pong => true,
     }

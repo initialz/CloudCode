@@ -2,7 +2,35 @@
 //! Mirrored verbatim in `crates/client/src/proto.rs`.
 
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use uuid::Uuid;
+
+/// Serde helper: serializes/deserializes `Box<RawValue>` via an
+/// intermediate `serde_json::Value` so it is compatible with serde's
+/// internally-tagged enum content deserializer (which cannot produce
+/// `RawValue` directly from buffered content).
+mod raw_value_serde {
+    use serde::{Deserializer, Serialize, Serializer};
+    use serde_json::value::RawValue;
+
+    pub fn serialize<S>(v: &Box<RawValue>, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // Delegate to RawValue's own Serialize impl (emits raw JSON bytes).
+        v.as_ref().serialize(s)
+    }
+
+    pub fn deserialize<'de, D>(d: D) -> Result<Box<RawValue>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Deserialize into serde_json::Value first (always works with
+        // content-based deserializers), then re-encode to RawValue.
+        let v: serde_json::Value = serde::Deserialize::deserialize(d)?;
+        serde_json::value::to_raw_value(&v).map_err(serde::de::Error::custom)
+    }
+}
 
 #[allow(dead_code)]
 pub const PTY_PROTOCOL_VERSION: &str = "1";
@@ -115,6 +143,19 @@ pub enum ClientToHub {
         #[serde(default)]
         eof: bool,
     },
+    /// In-session: one opaque MCP JSON-RPC frame from the client's
+    /// browser MCP subprocess back toward claude. Hub forwards it to
+    /// the bound agent as `ServerMsg::BrowserRpc` tagged with the
+    /// active session_id. Payload is never parsed in transit.
+    BrowserRpc {
+        #[serde(with = "raw_value_serde")]
+        payload: Box<RawValue>,
+    },
+    /// In-session: client tearing down its browser channel.
+    BrowserClosed {
+        #[serde(default)]
+        reason: Option<String>,
+    },
     /// Voluntary client-initiated close (ends the whole connection).
     Close,
     Pong,
@@ -178,6 +219,18 @@ pub enum HubToClient {
         #[serde(default)]
         error: Option<String>,
     },
+    /// One opaque MCP JSON-RPC frame from claude (via the agent) toward
+    /// the client's browser MCP subprocess. Payload is never parsed.
+    BrowserRpc {
+        #[serde(with = "raw_value_serde")]
+        payload: Box<RawValue>,
+    },
+    /// Hub/agent tore down the browser channel (denied / disconnect /
+    /// task ended). Client should stop its MCP subprocess.
+    BrowserClosed {
+        #[serde(default)]
+        reason: Option<String>,
+    },
     Ping,
 }
 
@@ -212,6 +265,34 @@ pub struct AgentInfo {
     pub name: String,
     #[serde(default)]
     pub current: bool,
+}
+
+#[cfg(test)]
+mod browser_tests {
+    use super::*;
+
+    #[test]
+    fn browser_rpc_client_to_hub_roundtrips() {
+        let raw = serde_json::value::RawValue::from_string(
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_string(),
+        )
+        .unwrap();
+        let frame = ClientToHub::BrowserRpc { payload: raw };
+        let json = serde_json::to_string(&frame).unwrap();
+        assert!(json.contains("\"type\":\"browser_rpc\""));
+        assert!(json.contains("tools/list"));
+        let back: ClientToHub = serde_json::from_str(&json).unwrap();
+        matches!(back, ClientToHub::BrowserRpc { .. });
+    }
+
+    #[test]
+    fn browser_rpc_hub_to_client_roundtrips() {
+        let raw = serde_json::value::RawValue::from_string(r#"{"ok":true}"#.to_string()).unwrap();
+        let frame = HubToClient::BrowserRpc { payload: raw };
+        let json = serde_json::to_string(&frame).unwrap();
+        let back: HubToClient = serde_json::from_str(&json).unwrap();
+        matches!(back, HubToClient::BrowserRpc { .. });
+    }
 }
 
 /// Workspace status row carried in HubToClient::WorkspaceList.
