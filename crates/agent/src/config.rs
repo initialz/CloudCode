@@ -24,6 +24,10 @@ pub struct Config {
     pub recording: RecordingConfig,
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    /// Port for the resident localhost MCP HTTP/SSE endpoint that claude
+    /// connects to. Defaults to 7110 when unset.
+    #[serde(default)]
+    pub mcp_port: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -2,6 +2,7 @@ mod audit;
 mod config;
 mod fs;
 mod jsonl;
+mod mcp_endpoint;
 mod name;
 mod pty;
 mod sandbox;
@@ -27,6 +28,9 @@ pub struct AppState {
     /// agent-level audit task (spawned once at startup) can ship
     /// `UserInteraction` frames to the hub.
     pub audit_slot: audit::SenderSlot,
+    /// Resident localhost MCP endpoint state. Routes claude<->client
+    /// frames once Task 10/11 wire the handlers and ws plumbing.
+    pub mcp: mcp_endpoint::EndpointState,
 }
 
 #[derive(Parser)]
@@ -235,7 +239,21 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         config,
         manager,
         audit_slot,
+        mcp: mcp_endpoint::EndpointState::new(),
     });
+
+    // Resident localhost MCP HTTP/SSE endpoint. claude connects here;
+    // frames tunnel to the bound client over the agent<->hub ws. Only
+    // `/healthz` exists today; handlers + ws wiring land in Task 10/11.
+    {
+        let mcp_state = state.mcp.clone();
+        let port = state.config.mcp_port.unwrap_or(7110);
+        tokio::spawn(async move {
+            if let Err(e) = mcp_endpoint::serve(mcp_state, port).await {
+                tracing::error!(error = %e, "mcp endpoint exited");
+            }
+        });
+    }
 
     ws::run(state).await
 }
