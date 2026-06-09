@@ -292,7 +292,8 @@ fn classify(frame: &ClientMsg) -> Routing {
         ClientMsg::PtyOpened { session_id, .. }
         | ClientMsg::PtyClosed { session_id, .. }
         | ClientMsg::PtyError { session_id, .. }
-        | ClientMsg::SplitPaneResult { session_id, .. } => Routing::Session(*session_id),
+        | ClientMsg::SplitPaneResult { session_id, .. }
+        | ClientMsg::BrowserRpc { session_id, .. } => Routing::Session(*session_id),
         ClientMsg::WorkspaceListResult { request_id, .. }
         | ClientMsg::WorkspaceCreateResult { request_id, .. }
         | ClientMsg::WorkspaceDeleteResult { request_id, .. }
@@ -335,6 +336,20 @@ mod tests {
             workspace_requests: DashMap::new(),
             fs_read_streams: DashMap::new(),
         })
+    }
+
+    #[test]
+    fn browser_rpc_classifies_as_session() {
+        use uuid::Uuid;
+        let sid = Uuid::new_v4();
+        let frame = ClientMsg::BrowserRpc {
+            session_id: sid,
+            payload: "{}".to_string(),
+        };
+        match classify(&frame) {
+            Routing::Session(got) => assert_eq!(got, sid),
+            _ => panic!("BrowserRpc should route by session"),
+        }
     }
 
     #[tokio::test]

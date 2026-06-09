@@ -1519,6 +1519,10 @@ where
             // arrive through the existing PTY tap. Nothing else to do.
             true
         }
+        PtyEventOut::Frame(ClientMsg::BrowserRpc { payload, .. }) => {
+            let _ = send_client(sink, &HubToClient::BrowserRpc { payload }).await;
+            true
+        }
         PtyEventOut::Frame(_) => true,
     }
 }
