@@ -218,6 +218,15 @@ pub enum ClientMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+
+    /// One opaque MCP JSON-RPC frame from the agent's resident MCP
+    /// endpoint (claude is the MCP client) toward the bound client's
+    /// browser subprocess. `session_id` is the routing key; payload is
+    /// raw text, never parsed in transit.
+    BrowserRpc {
+        session_id: Uuid,
+        payload: String,
+    },
 }
 
 /// One entry returned in a `FsListResult`. Directory entries have
@@ -456,6 +465,14 @@ pub enum ServerMsg {
         account: String,
         workspace: String,
         paths: Vec<String>,
+    },
+
+    /// One opaque MCP JSON-RPC frame from the client's browser
+    /// subprocess back toward claude, routed by `session_id` to the
+    /// matching MCP endpoint stream. Payload is raw text, never parsed.
+    BrowserRpc {
+        session_id: Uuid,
+        payload: String,
     },
 }
 
