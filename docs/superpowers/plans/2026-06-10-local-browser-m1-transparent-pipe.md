@@ -12,6 +12,10 @@
 
 **方向回顾:** 请求 = claude(agent)→endpoint→`ClientMsg::BrowserRpc`→hub→`HubToClient::BrowserRpc`→client→子进程。响应 = 子进程→client→`ClientToHub::BrowserRpc`→hub→`ServerMsg::BrowserRpc`→endpoint→claude。
 
+> **更正(执行中,2026-06-10):** `payload` 类型在全计划中由 `Box<RawValue>` 改为 **`String`**(原始 JSON-RPC 文本,字节精确,贴合代码库 `data_b64: String` 惯例,避开内部 tag 枚举对 RawValue 的反序列化限制)。见 Task 1 重构 commit `3cb9d34`。下文凡 `Box<RawValue>`/`RawValue` 载荷处一律按 `String` 理解。
+
+---
+
 **M1 不含**(留 M2/M3):真 `@playwright/mcp`、授权门、handoff、headless⇄headed、install.sh 预装。M1 的桩无条件放行、无授权门。
 
 ---
