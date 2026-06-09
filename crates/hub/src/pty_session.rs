@@ -1130,8 +1130,26 @@ where
             }
             true
         }
-        // Routing not yet implemented — accepted and ignored until Task 2+.
-        ClientToHub::BrowserRpc { .. } | ClientToHub::BrowserClosed { .. } => true,
+        ClientToHub::BrowserRpc { payload } => {
+            if let (Some(conn), Some(active)) =
+                (ctx.selected_agent.as_ref(), ctx.active.as_ref())
+            {
+                let _ = conn
+                    .send(ServerMsg::BrowserRpc {
+                        session_id: active.session_id,
+                        payload,
+                    })
+                    .await;
+            }
+            true
+        }
+        ClientToHub::BrowserClosed { reason } => {
+            // M1: no auth gate yet. Log and keep the connection alive.
+            // M2 will translate this into agent-side teardown / a denied
+            // MCP error toward claude.
+            tracing::debug!(?reason, "client closed browser channel (M1: noop)");
+            true
+        }
         ClientToHub::Close => false,
         ClientToHub::Hello { .. } | ClientToHub::Pong => true,
     }
