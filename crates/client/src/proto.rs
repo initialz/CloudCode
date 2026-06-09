@@ -89,6 +89,19 @@ pub enum ClientToHub {
         #[serde(default)]
         eof: bool,
     },
+    /// In-session: one opaque MCP JSON-RPC frame from the client's
+    /// browser MCP subprocess back toward claude. Hub forwards it to
+    /// the bound agent as `ServerMsg::BrowserRpc` tagged with the
+    /// active session_id. Payload is never parsed in transit.
+    BrowserRpc {
+        /// Opaque MCP JSON-RPC frame as raw text. Never parsed in transit.
+        payload: String,
+    },
+    /// In-session: client tearing down its browser channel.
+    BrowserClosed {
+        #[serde(default)]
+        reason: Option<String>,
+    },
     /// Voluntary client-initiated close (ends the whole connection).
     Close,
     Pong,
@@ -152,6 +165,18 @@ pub enum HubToClient {
         #[serde(default)]
         error: Option<String>,
     },
+    /// One opaque MCP JSON-RPC frame from claude (via the agent) toward
+    /// the client's browser MCP subprocess. Payload is never parsed.
+    BrowserRpc {
+        /// Opaque MCP JSON-RPC frame as raw text. Never parsed in transit.
+        payload: String,
+    },
+    /// Hub/agent tore down the browser channel (denied / disconnect /
+    /// task ended). Client should stop its MCP subprocess.
+    BrowserClosed {
+        #[serde(default)]
+        reason: Option<String>,
+    },
     Ping,
 }
 
@@ -178,4 +203,47 @@ pub struct WorkspaceInfo {
     pub tmux_alive: bool,
     #[serde(default)]
     pub has_client: bool,
+}
+
+#[cfg(test)]
+mod browser_tests {
+    use super::*;
+
+    #[test]
+    fn browser_rpc_both_directions_byte_exact() {
+        let original = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"zebra":1,"alpha":2}}"#;
+        let c = ClientToHub::BrowserRpc { payload: original.to_string() };
+        let j = serde_json::to_string(&c).unwrap();
+        assert!(j.contains("\"type\":\"browser_rpc\""));
+        match serde_json::from_str::<ClientToHub>(&j).unwrap() {
+            ClientToHub::BrowserRpc { payload } => assert_eq!(payload, original),
+            _ => panic!("wrong variant"),
+        }
+
+        let h = HubToClient::BrowserRpc { payload: original.to_string() };
+        let j2 = serde_json::to_string(&h).unwrap();
+        assert!(j2.contains("\"type\":\"browser_rpc\""));
+        match serde_json::from_str::<HubToClient>(&j2).unwrap() {
+            HubToClient::BrowserRpc { payload } => assert_eq!(payload, original),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn browser_closed_roundtrips_and_defaults() {
+        // with reason
+        let c = ClientToHub::BrowserClosed { reason: Some("denied".to_string()) };
+        let j = serde_json::to_string(&c).unwrap();
+        match serde_json::from_str::<ClientToHub>(&j).unwrap() {
+            ClientToHub::BrowserClosed { reason } => assert_eq!(reason.as_deref(), Some("denied")),
+            _ => panic!("wrong variant"),
+        }
+        // reason omitted on the wire -> defaults to None
+        let from_wire: HubToClient =
+            serde_json::from_str(r#"{"type":"browser_closed"}"#).unwrap();
+        match from_wire {
+            HubToClient::BrowserClosed { reason } => assert_eq!(reason, None),
+            _ => panic!("wrong variant"),
+        }
+    }
 }
