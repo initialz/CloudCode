@@ -5,6 +5,7 @@
 //! reports, mouse events, anything claude's UI library queries) reaches
 //! the remote PTY exactly as the terminal produced it.
 
+use crate::auth_gate;
 use crate::cc_browser;
 use crate::input::ByteRx;
 use crate::mouse_filter::MouseModeStripper;
@@ -158,6 +159,18 @@ async fn relay_loop(
     let mcp_cmd = cc_browser::m1_mcp_command();
     let (browser_out_tx, mut browser_out_rx) = tokio::sync::mpsc::channel::<String>(64);
 
+    // Session-scoped authorization gate (M2). The first browser frame
+    // prompts the user with an inline consent pill; an approval then
+    // rides a sliding idle window (default 10 min, configurable via
+    // CC_BROWSER_IDLE_TIMEOUT_SECS) before the next frame re-prompts.
+    let idle_timeout = std::time::Duration::from_secs(
+        std::env::var("CC_BROWSER_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(600),
+    );
+    let mut gate = auth_gate::AuthGate::new(idle_timeout);
+
     loop {
         tokio::select! {
             chunk = bytes.recv() => {
@@ -239,28 +252,63 @@ async fn relay_loop(
                         }
                     }
                     HubToClient::BrowserRpc { payload } => {
-                        if browser.is_none() {
-                            if let Some((prog, args)) = mcp_cmd.clone() {
-                                let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                                match cc_browser::BrowserChannel::start(&prog, &argrefs, browser_out_tx.clone()) {
-                                    Ok(ch) => browser = Some(ch),
-                                    Err(e) => tracing::warn!(
-                                        error = %e,
-                                        program = %prog,
-                                        args = ?args,
-                                        "failed to start browser MCP subprocess"
-                                    ),
+                        // M2 authorization gate: a live grant slides its
+                        // idle window; otherwise block on the inline
+                        // consent pill before touching the subprocess.
+                        // While the prompt awaits, the other select! arms
+                        // are parked — PTY output buffers in its channel
+                        // and flushes once the modal closes.
+                        let now = std::time::Instant::now();
+                        let allowed = match gate.check(now) {
+                            auth_gate::Decision::Allow => {
+                                gate.touch(now);
+                                true
+                            }
+                            auth_gate::Decision::AskUser => {
+                                if prompt_browser_consent(bytes).await {
+                                    gate.grant(std::time::Instant::now());
+                                    true
+                                } else {
+                                    gate.deny();
+                                    false
                                 }
                             }
-                        }
-                        if let Some(ch) = browser.as_ref() {
-                            if ch.feed(payload).is_err() {
-                                browser = None;
-                                let _ = wire.out_tx
-                                    .send(OutFrame::Text(ClientToHub::BrowserClosed {
-                                        reason: Some("browser subprocess unavailable".to_string()),
-                                    }))
-                                    .await;
+                        };
+                        if !allowed {
+                            // Reap the subprocess (if one was running)
+                            // and tell the agent side so claude gets a
+                            // clean JSON-RPC error instead of waiting
+                            // out the endpoint timeout.
+                            browser = None;
+                            let _ = wire.out_tx
+                                .send(OutFrame::Text(ClientToHub::BrowserClosed {
+                                    reason: Some("denied by user".to_string()),
+                                }))
+                                .await;
+                        } else {
+                            if browser.is_none() {
+                                if let Some((prog, args)) = mcp_cmd.clone() {
+                                    let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                                    match cc_browser::BrowserChannel::start(&prog, &argrefs, browser_out_tx.clone()) {
+                                        Ok(ch) => browser = Some(ch),
+                                        Err(e) => tracing::warn!(
+                                            error = %e,
+                                            program = %prog,
+                                            args = ?args,
+                                            "failed to start browser MCP subprocess"
+                                        ),
+                                    }
+                                }
+                            }
+                            if let Some(ch) = browser.as_ref() {
+                                if ch.feed(payload).is_err() {
+                                    browser = None;
+                                    let _ = wire.out_tx
+                                        .send(OutFrame::Text(ClientToHub::BrowserClosed {
+                                            reason: Some("browser subprocess unavailable".to_string()),
+                                        }))
+                                        .await;
+                                }
                             }
                         }
                     }
@@ -292,6 +340,59 @@ async fn relay_loop(
             }
         }
     }
+}
+
+/// Draw an inline consent pill over the live PTY screen and block on a
+/// y/n answer read from the raw stdin stream. The relay's other select!
+/// arms are parked while this awaits — inbound PTY output buffers in
+/// its channel and flushes after the modal closes.
+///
+/// No local timeout: we wait indefinitely. The agent endpoint times the
+/// in-flight MCP request out at 25s, so claude sees a clean timeout
+/// error while the pill stays up — the next `BrowserRpc` frame lands in
+/// `AskUser` again and re-arms the same prompt.
+///
+/// Every keystroke other than y/Y/n/N/Esc is swallowed; nothing typed
+/// while the modal is up is forwarded to the PTY.
+///
+/// Returns true = approved, false = denied (n/N/Esc, or stdin closing —
+/// the relay loop's own recv arm then sees the closed channel on its
+/// next iteration and exits cleanly).
+async fn prompt_browser_consent(bytes: &mut ByteRx) -> bool {
+    let mut stdout = std::io::stdout();
+    // BEL to ring attention, save the cursor (DECSC), and hide it while
+    // the pill is up — same hide/show pairing as main.rs
+    // show_pill()/clear_pill(), but scoped to one line instead of a
+    // full-screen repaint.
+    let _ = stdout.write_all(b"\x07\x1b7\x1b[?25l");
+    // Fixed line near the top (row 2), cleared first so the pill sits on
+    // a clean background; bold yellow like show_pill's title line, reset
+    // after (show_pill's `\x1b[{row};1H … \x1b[0m` convention).
+    let text = "云端任务请求操作你的浏览器 — 允许? [y]允许 / [n]拒绝";
+    let _ = write!(stdout, "\x1b[2;1H\x1b[2K\x1b[1;33m  {text}  \x1b[0m");
+    let _ = stdout.flush();
+
+    let approved = 'wait: loop {
+        let Some(chunk) = bytes.recv().await else { break false };
+        // A lone ESC byte is the Esc key. ESC followed by more bytes in
+        // the same chunk is a CSI/SS3 sequence (arrow keys, terminal
+        // replies) — swallow those rather than misread them as a deny.
+        if chunk == [0x1b] {
+            break false;
+        }
+        for b in chunk {
+            match b {
+                b'y' | b'Y' => break 'wait true,
+                b'n' | b'N' => break 'wait false,
+                _ => {} // swallowed — never forwarded to the PTY
+            }
+        }
+    };
+
+    // Clear the pill line, restore the cursor (DECRC), show it again.
+    let _ = stdout.write_all(b"\x1b[2;1H\x1b[2K\x1b8\x1b[?25h");
+    let _ = stdout.flush();
+    approved
 }
 
 /// Intercept a detected file drop: register one result channel per

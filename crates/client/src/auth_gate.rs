@@ -56,7 +56,6 @@ mod tests {
 
 /// What the relay should do with an inbound browser frame.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum Decision {
     /// Grant is live — forward the frame.
     Allow,
@@ -66,14 +65,12 @@ pub enum Decision {
 
 /// One grant per claude task, approximated by a sliding idle window
 /// (per spec: the release predicate is idle-timeout only).
-#[allow(dead_code)]
 pub struct AuthGate {
     idle_timeout: Duration,
     granted_at: Option<Instant>,
     last_activity: Option<Instant>,
 }
 
-#[allow(dead_code)]
 impl AuthGate {
     pub fn new(idle_timeout: Duration) -> Self {
         Self { idle_timeout, granted_at: None, last_activity: None }
