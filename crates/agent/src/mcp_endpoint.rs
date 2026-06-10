@@ -310,4 +310,91 @@ mod tests {
         assert_eq!(extract_id_key(r#"{"method":"x"}"#), None);
         assert_eq!(extract_id_key(r#"{"id":null}"#), None);
     }
+
+    /// Grab a currently-free localhost TCP port by binding to :0, reading the
+    /// assigned port, then dropping the listener so `serve` can rebind it.
+    /// There's a tiny TOCTOU window, but it's vanishingly unlikely to matter
+    /// for a single test process and is far more robust than a fixed port.
+    fn free_port() -> u16 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
+        l.local_addr().expect("local_addr").port()
+    }
+
+    /// Wait until `serve` has bound and `/healthz` answers, retrying on
+    /// connection-refused. Returns the body once it's up.
+    async fn wait_healthz(client: &reqwest::Client, base: &str) -> String {
+        for _ in 0..50 {
+            match client.get(format!("{base}/healthz")).send().await {
+                Ok(resp) => return resp.text().await.unwrap(),
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        panic!("endpoint never came up on {base}");
+    }
+
+    /// End-to-end over REAL HTTP: start the actual axum endpoint on a free
+    /// localhost port, simulate the hub+client round-trip via the `to_hub`
+    /// channel + `resolve_response`, and drive the whole thing with a real
+    /// reqwest POST. This is the only test that exercises axum routing and a
+    /// live TCP socket (the others call `handle_post` directly).
+    #[tokio::test]
+    async fn real_http_post_roundtrips_via_endpoint() {
+        let state = EndpointState::new();
+        let sid = Uuid::new_v4();
+        let token = "tok-e2e";
+        state.register(token.into(), sid);
+
+        let (hub_tx, mut hub_rx) = mpsc::channel(4);
+        state.set_hub_sender(hub_tx).await;
+
+        let port = free_port();
+        let serve_state = state.clone();
+        tokio::spawn(async move {
+            let _ = serve(serve_state, port).await;
+        });
+
+        // Simulate the client+hub: take the forwarded frame off `to_hub` and
+        // feed back a matching JSON-RPC response (same id) via resolve_response.
+        let resp_state = state.clone();
+        tokio::spawn(async move {
+            if let Some(OutFrame::Text(ClientMsg::BrowserRpc { session_id, payload })) =
+                hub_rx.recv().await
+            {
+                assert_eq!(session_id, sid);
+                // echo the id back in a synthetic tools/list result
+                let id = extract_id_key(&payload).expect("request had an id");
+                let body = format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"result":{{"tools":[{{"name":"echo"}}]}}}}"#
+                );
+                assert!(resp_state.resolve_response(session_id, body));
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}");
+
+        // serve() needs a moment to bind; poll /healthz first.
+        assert_eq!(wait_healthz(&client, &base).await, "ok");
+
+        // The real POST: JSON-RPC tools/list to the known token.
+        let resp = client
+            .post(format!("{base}/mcp/{token}"))
+            .body(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
+            .send()
+            .await
+            .expect("POST to endpoint");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("\"id\":1"), "response keeps the request id: {text}");
+        assert!(text.contains("echo"), "response carries the simulated result: {text}");
+
+        // Unknown token -> 404.
+        let unknown = client
+            .post(format!("{base}/mcp/does-not-exist"))
+            .body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+            .send()
+            .await
+            .expect("POST unknown token");
+        assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+    }
 }
