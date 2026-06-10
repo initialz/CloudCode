@@ -71,7 +71,11 @@ jobs:
           target: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --workspace --target ${{ matrix.target }}
+        # Explicit server binaries only — NOT --workspace — so the eframe GUI
+        # app (cloudcode-app) is never built on the musl server targets, where
+        # its winit/GUI system deps don't exist. The desktop app ships via the
+        # separate macOS .app/.dmg job below.
+        run: cargo build --release --target ${{ matrix.target }} -p cloudcode-hub -p cloudcode-agent -p cloudcode-client
 
       - name: Package
         shell: bash
