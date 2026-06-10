@@ -24,6 +24,8 @@ pub struct Config {
     pub recording: RecordingConfig,
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    #[serde(default)]
+    pub browser: BrowserConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +131,30 @@ pub struct SandboxConfig {
     /// profile fits your tooling.
     #[serde(default)]
     pub enabled: bool,
+}
+
+/// Resident headless-Chrome config (P1 desktop app). Off by default: the
+/// browser only stands up when explicitly opted in. See `browser::chrome`.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct BrowserConfig {
+    /// Master switch. Default false — browser off unless opted in.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Explicit Chrome/Chromium binary path. If unset (or the path doesn't
+    /// exist) we auto-detect well-known install locations / PATH names.
+    #[serde(default)]
+    pub chrome_path: Option<String>,
+    /// CDP remote-debugging port Chrome listens on. Default 19222.
+    #[serde(default = "default_cdp_port")]
+    pub cdp_port: u16,
+    /// Override the playwright-mcp launch command (whitespace-split). Test /
+    /// escape hatch; normally left unset so the built-in launcher is used.
+    #[serde(default)]
+    pub mcp_command: Option<String>,
+}
+
+fn default_cdp_port() -> u16 {
+    19222
 }
 
 #[derive(Debug, Deserialize, Clone)]
