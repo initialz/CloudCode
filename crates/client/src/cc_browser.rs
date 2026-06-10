@@ -1,9 +1,11 @@
 //! Manages a local MCP-over-stdio subprocess (M2: @playwright/mcp headless).
 //! Pipes opaque JSON-RPC frames (raw text) in/out.
 
+use std::sync::{Arc, Mutex};
+
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// Best-effort check whether `node` is on PATH (capability probe).
 #[allow(dead_code)]
@@ -62,18 +64,52 @@ impl McpProcess {
         }
     }
 
+    /// Kill the subprocess AND await its exit. The wait matters: the
+    /// playwright profile (`--user-data-dir`) holds a single-instance
+    /// lock, and a restart on the same profile fails with "Browser is
+    /// already in use" unless the old process has fully exited.
     #[allow(dead_code)]
     pub async fn shutdown(mut self) {
         let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
     }
 }
 
-/// A running browser MCP channel: owns the subprocess + a task that
+/// Parse the `id` of a JSON-RPC frame (None for notifications / non-JSON).
+fn json_id(frame: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(frame)
+        .ok()?
+        .get("id")
+        .cloned()
+}
+
+/// Parse the `method` of a JSON-RPC frame.
+fn json_method(frame: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(frame)
+        .ok()?
+        .get("method")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
+/// A running browser MCP channel: a pump task owns the subprocess and
 /// forwards every subprocess output frame to `out_tx`. `feed` enqueues
 /// an inbound frame for the subprocess.
+///
+/// The channel also caches the MCP handshake frames (`initialize`
+/// request + `notifications/initialized`) that pass through `feed`:
+/// claude never re-sends the handshake on a live connection, so after a
+/// `restart` (headless<->headed switch) the new subprocess must have the
+/// cached handshake replayed before it serves tools.
 #[allow(dead_code)]
 pub struct BrowserChannel {
     in_tx: mpsc::Sender<String>,
+    /// Cached handshake frames in arrival order (at most 2: initialize,
+    /// notifications/initialized). Shared across restarts.
+    handshake: Arc<Mutex<Vec<String>>>,
+    /// Resolves when the pump task has exited — i.e. the subprocess has
+    /// been killed AND waited (profile lock released).
+    done_rx: oneshot::Receiver<()>,
 }
 
 impl BrowserChannel {
@@ -84,8 +120,19 @@ impl BrowserChannel {
         out_tx: mpsc::Sender<String>,
     ) -> std::io::Result<Self> {
         tracing::info!(program, ?args, "starting browser MCP subprocess");
-        let mut proc = McpProcess::spawn(program, args)?;
+        let proc = McpProcess::spawn(program, args)?;
+        Ok(Self::from_process(proc, out_tx, Arc::new(Mutex::new(Vec::new()))))
+    }
+
+    /// Wrap an already-spawned (and possibly already-handshaken) process
+    /// in a pump task + channel.
+    fn from_process(
+        mut proc: McpProcess,
+        out_tx: mpsc::Sender<String>,
+        handshake: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
         let (in_tx, mut in_rx) = mpsc::channel::<String>(32);
+        let (done_tx, done_rx) = oneshot::channel::<()>();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -101,9 +148,10 @@ impl BrowserChannel {
                     }
                 }
             }
-            proc.shutdown().await;
+            proc.shutdown().await; // kill + wait: profile lock released
+            let _ = done_tx.send(());
         });
-        Ok(Self { in_tx })
+        Self { in_tx, handshake, done_rx }
     }
 
     /// Enqueue an inbound frame for the subprocess without blocking.
@@ -111,7 +159,79 @@ impl BrowserChannel {
     /// callers should treat Err as "channel dead" and tear down.
     #[allow(dead_code)]
     pub fn feed(&self, frame: String) -> Result<(), ()> {
+        self.maybe_cache_handshake(&frame);
         self.in_tx.try_send(frame).map_err(|_| ())
+    }
+
+    /// Cache the handshake frames for later replay. Cheap: once both
+    /// frames are cached (len >= 2) no further parsing happens.
+    fn maybe_cache_handshake(&self, frame: &str) {
+        let mut cache = self.handshake.lock().expect("handshake mutex");
+        if cache.len() >= 2 {
+            return;
+        }
+        match json_method(frame).as_deref() {
+            Some("initialize") | Some("notifications/initialized") => {
+                cache.push(frame.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// Stop the current subprocess (kill + wait, releasing the profile
+    /// lock) and start a new one with `program`/`args`, replaying the
+    /// cached MCP handshake so the live claude session continues
+    /// seamlessly. The replayed initialize RESPONSE is swallowed (claude
+    /// already has one). Outbound frames keep flowing to `out_tx`.
+    #[allow(dead_code)]
+    pub async fn restart(
+        self,
+        program: &str,
+        args: &[&str],
+        out_tx: mpsc::Sender<String>,
+    ) -> std::io::Result<BrowserChannel> {
+        let BrowserChannel { in_tx, handshake, done_rx } = self;
+        // Dropping in_tx makes the old pump's in_rx yield None -> the
+        // pump kills + waits its child, then signals done_tx. Awaiting
+        // done_rx guarantees the old process has fully exited before the
+        // successor is spawned (same --user-data-dir refuses two
+        // instances).
+        drop(in_tx);
+        let _ = done_rx.await;
+
+        tracing::info!(program, ?args, "restarting browser MCP subprocess");
+        let mut proc = McpProcess::spawn(program, args)?;
+
+        // Replay the cached handshake into the fresh process, swallowing
+        // the replayed initialize response (matched by id) so claude
+        // never sees a duplicate. Unrelated frames (e.g. server-initiated
+        // notifications) are forwarded to out_tx as usual.
+        let frames: Vec<String> = handshake.lock().expect("handshake mutex").clone();
+        for frame in &frames {
+            let init_id = if json_method(frame).as_deref() == Some("initialize") {
+                json_id(frame)
+            } else {
+                None // notifications/initialized: no response expected
+            };
+            proc.feed(frame).await?;
+            if let Some(want) = init_id {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+                for _ in 0..10 {
+                    let Ok(maybe) = tokio::time::timeout_at(deadline, proc.next_frame()).await
+                    else {
+                        tracing::warn!("timed out waiting for replayed initialize response");
+                        break;
+                    };
+                    let Some(resp) = maybe else { break }; // EOF
+                    if json_id(&resp).as_ref() == Some(&want) {
+                        break; // swallowed: claude already has its initialize response
+                    }
+                    let _ = out_tx.send(resp).await;
+                }
+            }
+        }
+
+        Ok(Self::from_process(proc, out_tx, handshake))
     }
 }
 
@@ -156,6 +276,29 @@ pub fn mcp_command() -> Option<(String, Vec<String>)> {
     ))
 }
 
+/// Remove any `--headless` token from an argv (pure, for testability).
+fn strip_headless(args: Vec<String>) -> Vec<String> {
+    args.into_iter().filter(|a| a != "--headless").collect()
+}
+
+/// Resolve the HEADED browser MCP subprocess command (human handoff).
+/// playwright-mcp is headed by default — there is no `--headed` flag —
+/// so headed = the same command minus `--headless`.
+///
+/// Override entirely via `CC_BROWSER_MCP_HEADED` (whitespace-separated,
+/// same parsing as `CC_BROWSER_MCP`); otherwise derives from
+/// `mcp_command()` by stripping `--headless` (returned as-is when the
+/// token is absent). Returns None when `mcp_command()` does.
+#[allow(dead_code)]
+pub fn mcp_command_headed() -> Option<(String, Vec<String>)> {
+    if let Ok(cmd) = std::env::var("CC_BROWSER_MCP_HEADED") {
+        let mut parts = cmd.split_whitespace().map(|s| s.to_string());
+        let prog = parts.next()?;
+        return Some((prog, parts.collect()));
+    }
+    let (prog, args) = mcp_command()?;
+    Some((prog, strip_headless(args)))
+}
 
 #[cfg(test)]
 mod tests {
@@ -187,6 +330,76 @@ mod tests {
             .unwrap();
         let got = out_rx.recv().await.expect("a response frame");
         assert!(got.contains("echo"));
+    }
+
+    /// Restart must (1) fully retire the old subprocess, (2) replay the
+    /// cached handshake into the new one, (3) swallow the replayed
+    /// initialize response so claude never sees a duplicate. The echo
+    /// stub answers any request by id, exercising the replay pipeline;
+    /// it ignores id-less frames, so `notifications/initialized` draws
+    /// no response (matching real MCP semantics).
+    #[tokio::test]
+    async fn restart_replays_handshake_and_swallows_response() {
+        if which_node().is_none() {
+            return;
+        }
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/echo-mcp.mjs");
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(8);
+        let chan = BrowserChannel::start("node", &[fixture], out_tx.clone()).expect("start");
+
+        // Normal handshake flow: initialize response reaches out_rx, and
+        // both handshake frames get cached by feed().
+        chan.feed(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#
+                .to_string(),
+        )
+        .unwrap();
+        let init_resp = out_rx.recv().await.expect("initialize response");
+        assert!(init_resp.contains("serverInfo"));
+        chan.feed(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string())
+            .unwrap();
+        assert_eq!(chan.handshake.lock().unwrap().len(), 2);
+
+        // Restart onto the same stub: handshake is replayed, and the
+        // replayed initialize response (id 1) must be swallowed.
+        let chan = chan
+            .restart("node", &[fixture], out_tx.clone())
+            .await
+            .expect("restart");
+
+        chan.feed(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#.to_string())
+            .unwrap();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(10), out_rx.recv())
+            .await
+            .expect("a frame within 10s")
+            .expect("channel alive");
+        // The very next frame after restart must be the tools/list
+        // response — NOT a duplicate initialize response.
+        assert!(next.contains(r#""id":2"#), "expected tools/list response, got: {next}");
+        assert!(!next.contains("serverInfo"), "duplicate initialize response leaked: {next}");
+        assert!(next.contains("echo"));
+        // Nothing else queued in between.
+        assert!(out_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn strip_headless_removes_token() {
+        let args = vec![
+            "-y".to_string(),
+            "@playwright/mcp@0.0.76".to_string(),
+            "--headless".to_string(),
+            "--user-data-dir".to_string(),
+            "/tmp/p".to_string(),
+        ];
+        let stripped = strip_headless(args);
+        assert!(!stripped.iter().any(|a| a == "--headless"));
+        assert_eq!(stripped.len(), 4);
+    }
+
+    #[test]
+    fn strip_headless_noop_when_absent() {
+        let args = vec!["node".to_string(), "stub.mjs".to_string()];
+        assert_eq!(strip_headless(args.clone()), args);
     }
 
     /// Real playwright smoke test — spawns `@playwright/mcp@0.0.76` via npx
