@@ -372,20 +372,13 @@ async fn prompt_browser_consent(bytes: &mut ByteRx) -> bool {
     let _ = write!(stdout, "\x1b[2;1H\x1b[2K\x1b[1;33m  {text}  \x1b[0m");
     let _ = stdout.flush();
 
-    let approved = 'wait: loop {
+    let mut in_paste = false;
+    let approved = loop {
         let Some(chunk) = bytes.recv().await else { break false };
-        // A lone ESC byte is the Esc key. ESC followed by more bytes in
-        // the same chunk is a CSI/SS3 sequence (arrow keys, terminal
-        // replies) — swallow those rather than misread them as a deny.
-        if chunk == [0x1b] {
-            break false;
-        }
-        for b in chunk {
-            match b {
-                b'y' | b'Y' => break 'wait true,
-                b'n' | b'N' => break 'wait false,
-                _ => {} // swallowed — never forwarded to the PTY
-            }
+        match scan_consent_chunk(&chunk, &mut in_paste) {
+            ConsentScan::Approve => break true,
+            ConsentScan::Deny => break false,
+            ConsentScan::Ignore => {} // swallowed — never forwarded to the PTY
         }
     };
 
@@ -393,6 +386,82 @@ async fn prompt_browser_consent(bytes: &mut ByteRx) -> bool {
     let _ = stdout.write_all(b"\x1b[2;1H\x1b[2K\x1b8\x1b[?25h");
     let _ = stdout.flush();
     approved
+}
+
+/// What a stdin chunk means for the consent prompt.
+#[derive(Debug, PartialEq, Eq)]
+enum ConsentScan {
+    Approve,
+    Deny,
+    Ignore,
+}
+
+/// Classify one raw stdin chunk for the consent prompt. Conservative by
+/// design: only a deliberate, bare keypress may answer.
+///
+/// Threat model: bytes that merely *contain* y/n must never answer a
+/// consent prompt. A bracketed paste can carry any text ("yes please" in
+/// pasted prose would silently APPROVE browser access), and terminals
+/// emit unsolicited replies — e.g. a DSR status report `ESC [ 0 n`
+/// contains `n` and would spuriously DENY. So:
+///
+/// - Bracketed-paste regions (`ESC [ 200~` … `ESC [ 201~`) are tracked
+///   across chunks via `in_paste` and swallowed wholesale.
+/// - Any chunk starting with ESC is an escape sequence (CSI/SS3, a
+///   terminal reply, arrow key, paste marker) and is swallowed — never
+///   byte-scanned for letters. The single exception: a chunk that is
+///   exactly one ESC byte is the Esc key → Deny.
+/// - Plain chunks answer only when short (<= 4 bytes, a normal keypress
+///   chunk); longer plain blobs are unbracketed pastes → swallowed.
+fn scan_consent_chunk(chunk: &[u8], in_paste: &mut bool) -> ConsentScan {
+    const PASTE_START: &[u8] = b"\x1b[200~";
+    const PASTE_END: &[u8] = b"\x1b[201~";
+
+    // Inside a paste: swallow everything up to (and including) the end
+    // marker; content after the end marker in the same chunk is still an
+    // ESC-led tail or paste residue — swallow the whole chunk either way.
+    if *in_paste {
+        if chunk.windows(PASTE_END.len()).any(|w| w == PASTE_END) {
+            *in_paste = false;
+        }
+        return ConsentScan::Ignore;
+    }
+
+    // A paste may open anywhere in a chunk (the terminal can coalesce
+    // typed bytes with a paste). If it opens without closing in the same
+    // chunk, remember we're inside one — and swallow the chunk.
+    if let Some(start) = chunk
+        .windows(PASTE_START.len())
+        .position(|w| w == PASTE_START)
+    {
+        let after = &chunk[start + PASTE_START.len()..];
+        *in_paste = !after.windows(PASTE_END.len()).any(|w| w == PASTE_END);
+        return ConsentScan::Ignore;
+    }
+
+    if chunk.first() == Some(&0x1b) {
+        // Bare Esc keypress.
+        if chunk == [0x1b] {
+            return ConsentScan::Deny;
+        }
+        // Any longer ESC-led chunk is an escape sequence (CSI/SS3, a
+        // terminal reply like DSR `ESC [ 0 n`, arrow key) — swallow it,
+        // never byte-scan it for answer letters.
+        return ConsentScan::Ignore;
+    }
+
+    // Plain chunk: only a short, keypress-sized chunk may answer. Longer
+    // plain chunks are unbracketed paste blobs — swallow them.
+    if chunk.len() <= 4 {
+        for b in chunk {
+            match b {
+                b'y' | b'Y' => return ConsentScan::Approve,
+                b'n' | b'N' => return ConsentScan::Deny,
+                _ => {}
+            }
+        }
+    }
+    ConsentScan::Ignore
 }
 
 /// Intercept a detected file drop: register one result channel per
@@ -569,4 +638,60 @@ fn spawn_winch_signal() -> WinchHandle {
 async fn winch_tick(_: &mut WinchHandle) -> Option<()> {
     std::future::pending::<()>().await;
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{scan_consent_chunk, ConsentScan};
+
+    fn scan(chunk: &[u8]) -> ConsentScan {
+        let mut in_paste = false;
+        scan_consent_chunk(chunk, &mut in_paste)
+    }
+
+    #[test]
+    fn bare_keypresses_answer() {
+        assert_eq!(scan(b"y"), ConsentScan::Approve);
+        assert_eq!(scan(b"N"), ConsentScan::Deny);
+        assert_eq!(scan(b"\x1b"), ConsentScan::Deny); // bare Esc
+    }
+
+    #[test]
+    fn dsr_terminal_reply_is_ignored() {
+        // DSR status report contains `n` but must not deny.
+        assert_eq!(scan(b"\x1b[0n"), ConsentScan::Ignore);
+    }
+
+    #[test]
+    fn self_contained_paste_is_ignored() {
+        // Paste containing `y` must not approve.
+        assert_eq!(scan(b"\x1b[200~hey yes\x1b[201~"), ConsentScan::Ignore);
+    }
+
+    #[test]
+    fn split_paste_swallows_all_chunks_then_keypress_answers() {
+        let mut in_paste = false;
+        assert_eq!(
+            scan_consent_chunk(b"\x1b[200~hello y", &mut in_paste),
+            ConsentScan::Ignore
+        );
+        assert!(in_paste);
+        assert_eq!(
+            scan_consent_chunk(b"more\x1b[201~", &mut in_paste),
+            ConsentScan::Ignore
+        );
+        assert!(!in_paste);
+        assert_eq!(scan_consent_chunk(b"y", &mut in_paste), ConsentScan::Approve);
+    }
+
+    #[test]
+    fn long_plain_chunk_is_ignored() {
+        // Unbracketed paste blob: contains `y` but is not a keypress.
+        assert_eq!(scan(b"yes please"), ConsentScan::Ignore);
+    }
+
+    #[test]
+    fn short_plain_chunk_without_answer_key_is_ignored() {
+        assert_eq!(scan(b"ab"), ConsentScan::Ignore);
+    }
 }

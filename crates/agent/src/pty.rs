@@ -647,9 +647,28 @@ impl PtyManager {
             if let Some(parent) = mcp_cfg_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            if let Err(e) = std::fs::write(&mcp_cfg_path, &mcp_cfg) {
+            // The config carries a bearer token: create it 0600 from the
+            // start (no world-readable window between write and chmod).
+            #[cfg(unix)]
+            let write_res = {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&mcp_cfg_path)
+                    .and_then(|mut f| f.write_all(mcp_cfg.as_bytes()))
+            };
+            #[cfg(not(unix))]
+            let write_res = std::fs::write(&mcp_cfg_path, &mcp_cfg);
+            if let Err(e) = write_res {
                 tracing::warn!(error = %e, "failed to write browser mcp config");
             }
+            // `.mode(0o600)` only applies at create time; a file left over
+            // from an older run keeps its original (possibly 0644) mode
+            // through the truncate, so repair it explicitly.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
