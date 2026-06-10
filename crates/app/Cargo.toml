@@ -25,3 +25,4 @@ tracing-subscriber.workspace = true
 eframe = "0.28"
 egui = "0.28"
 alacritty_terminal = { workspace = true }
+unicode-width = { workspace = true }

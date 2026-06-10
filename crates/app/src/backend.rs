@@ -25,10 +25,8 @@ pub enum UiCommand {
     OpenSession { agent: String, workspace: String },
     CreateWorkspace { name: String, agent: String },
     DeleteWorkspace { name: String, agent: String },
-    /// Raw bytes typed into the terminal. Wired through to the hub
-    /// already; the producer (keyboard/IME -> bytes) lands in Task 3, so
-    /// it's unused by the skeleton UI.
-    #[allow(dead_code)]
+    /// Raw bytes typed into the terminal (keyboard/IME → PTY). Produced by
+    /// `TerminalPanel::ui` and forwarded to the hub as a binary frame.
     SendInput(Vec<u8>),
     /// Terminal resize. Same story — the panel that computes cols/rows
     /// from pixels lands in Task 3/5.

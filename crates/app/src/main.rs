@@ -17,7 +17,7 @@ use backend::{spawn, BackendEvent, BackendHandle, UiCommand};
 use config::HubConfig;
 use state::{apply_event, badge, FollowUp, Screen};
 use std::path::PathBuf;
-use terminal::TerminalPanel;
+use terminal::{install_cjk_font, TerminalPanel};
 
 fn main() -> eframe::Result {
     tracing_subscriber::fmt()
@@ -83,6 +83,10 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, cfg: anyhow::Result<HubConfig>) -> App {
+        // Register a system CJK font as a fallback so Chinese renders
+        // instead of tofu. Runtime-loaded (not embedded) — see fonts.rs.
+        install_cjk_font(&cc.egui_ctx);
+
         match cfg {
             Ok(cfg) => {
                 let hub_url = cfg.hub_url.clone();
@@ -281,16 +285,22 @@ impl eframe::App for App {
                         );
                     });
                     ui.separator();
-                    egui::ScrollArea::both()
+                    let input = egui::ScrollArea::both()
                         .auto_shrink([false, false])
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
                             if let Some(panel) = &mut self.terminal {
-                                panel.ui(ui);
+                                panel.ui(ui)
                             } else {
                                 ui.weak("(terminal not ready)");
+                                Vec::new()
                             }
-                        });
+                        })
+                        .inner;
+                    // Keyboard/IME bytes from the terminal panel -> hub PTY.
+                    if !input.is_empty() {
+                        self.send(UiCommand::SendInput(input));
+                    }
                 }
                 Screen::Error { message } => {
                     ui.vertical_centered(|ui| {
