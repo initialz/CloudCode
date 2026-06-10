@@ -27,3 +27,13 @@ egui = "0.28"
 alacritty_terminal = { workspace = true }
 unicode-width = { workspace = true }
 zune-jpeg = { workspace = true }
+
+# macOS .app bundle metadata (consumed by `cargo bundle` in the release CI).
+# Not signed/notarized (no cert) — first launch needs a Gatekeeper bypass;
+# see README. The .icns is generated in CI from assets/icon.png (iconutil).
+[package.metadata.bundle]
+name = "CloudCode"
+identifier = "com.cloudcode.app"
+category = "public.app-category.developer-tools"
+short_description = "CloudCode desktop — claude terminal + live browser mirror"
+icon = ["assets/icon.icns"]

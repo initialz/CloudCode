@@ -103,3 +103,68 @@ jobs:
             cloudcode-*.tar.gz
             cloudcode-*.sha256
           fail_on_unmatched_files: true
+
+  # Desktop GUI app — packaged separately as a macOS .app/.dmg (Apple Silicon).
+  # Not built on the musl server targets above (eframe needs system GUI libs).
+  # Unsigned/unnotarized (no cert): first launch needs a Gatekeeper bypass —
+  # see the desktop-app section of README.md.
+  package-macos-app:
+    name: macOS desktop app (.dmg)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle --locked
+
+      - name: Generate icon.icns from placeholder PNG
+        run: |
+          set -euo pipefail
+          mkdir -p icon.iconset
+          sips -z 16 16   crates/app/assets/icon.png --out icon.iconset/icon_16x16.png
+          sips -z 32 32   crates/app/assets/icon.png --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32   crates/app/assets/icon.png --out icon.iconset/icon_32x32.png
+          sips -z 64 64   crates/app/assets/icon.png --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128 crates/app/assets/icon.png --out icon.iconset/icon_128x128.png
+          sips -z 256 256 crates/app/assets/icon.png --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256 crates/app/assets/icon.png --out icon.iconset/icon_256x256.png
+          sips -z 512 512 crates/app/assets/icon.png --out icon.iconset/icon_256x256@2x.png
+          sips -z 512 512 crates/app/assets/icon.png --out icon.iconset/icon_512x512.png
+          cp crates/app/assets/icon.png icon.iconset/icon_512x512@2x.png
+          iconutil -c icns icon.iconset -o crates/app/assets/icon.icns
+
+      - name: Bundle .app
+        run: cargo bundle --release -p cloudcode-app
+
+      - name: Create .dmg
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          APP="target/release/bundle/osx/CloudCode.app"
+          test -d "$APP" || { echo "bundle not found at $APP"; ls -R target/release/bundle || true; exit 1; }
+          DMG="CloudCode-${TAG}-macos-aarch64.dmg"
+          hdiutil create -volname "CloudCode" -srcfolder "$APP" -ov -format UDZO "$DMG"
+          shasum -a 256 "$DMG" > "${DMG}.sha256"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          files: |
+            CloudCode-*.dmg
+            CloudCode-*.dmg.sha256
+          fail_on_unmatched_files: true
