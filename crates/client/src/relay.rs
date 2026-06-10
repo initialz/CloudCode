@@ -178,6 +178,14 @@ async fn relay_loop(
     // carries no method, so we correlate by id.
     let mut inflight: HashMap<String, String> = HashMap::new();
 
+    // Login-page hint state (M3, notify-only heuristic).
+    // `hint_shown` prevents re-displaying on every frame within the same
+    // gate grant (reset when the gate re-prompts or channel tears down).
+    // `hint_up` tracks whether the pill is currently painted so the next
+    // outbound frame can clear it.
+    let mut hint_shown: bool = false;
+    let mut hint_up: bool = false;
+
     loop {
         tokio::select! {
             chunk = bytes.recv() => {
@@ -307,6 +315,10 @@ async fn relay_loop(
                             // out the endpoint timeout.
                             browser = None;
                             inflight.clear();
+                            // Reset the login-page hint so it can fire
+                            // again after the next grant.
+                            hint_shown = false;
+                            if hint_up { clear_pill(); hint_up = false; }
                             let _ = wire.out_tx
                                 .send(OutFrame::Text(ClientToHub::BrowserClosed {
                                     reason: Some("denied by user".to_string()),
@@ -338,16 +350,38 @@ async fn relay_loop(
                             .await;
                         } else {
                             if browser.is_none() {
-                                if let Some((prog, args)) = mcp_cmd.clone() {
-                                    let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                                    match cc_browser::BrowserChannel::start(&prog, &argrefs, browser_out_tx.clone()) {
-                                        Ok(ch) => browser = Some(ch),
-                                        Err(e) => tracing::warn!(
-                                            error = %e,
-                                            program = %prog,
-                                            args = ?args,
-                                            "failed to start browser MCP subprocess"
-                                        ),
+                                match mcp_cmd.clone() {
+                                    None => {
+                                        // M2 review LOW-2: fast-fail so the agent fails
+                                        // pending requests immediately (claude gets -32002
+                                        // in milliseconds instead of waiting out 120s).
+                                        tracing::warn!("browser MCP command unavailable; failing fast");
+                                        let _ = wire.out_tx
+                                            .send(OutFrame::Text(ClientToHub::BrowserClosed {
+                                                reason: Some("browser subprocess unavailable".to_string()),
+                                            }))
+                                            .await;
+                                    }
+                                    Some((prog, args)) => {
+                                        let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+                                        match cc_browser::BrowserChannel::start(&prog, &argrefs, browser_out_tx.clone()) {
+                                            Ok(ch) => browser = Some(ch),
+                                            Err(e) => {
+                                                // M2 review LOW-2: warn and fast-fail so the
+                                                // agent fails pending requests immediately.
+                                                tracing::warn!(
+                                                    error = %e,
+                                                    program = %prog,
+                                                    args = ?args,
+                                                    "failed to start browser MCP subprocess"
+                                                );
+                                                let _ = wire.out_tx
+                                                    .send(OutFrame::Text(ClientToHub::BrowserClosed {
+                                                        reason: Some("browser subprocess unavailable".to_string()),
+                                                    }))
+                                                    .await;
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -379,6 +413,10 @@ async fn relay_loop(
                     HubToClient::BrowserClosed { .. } => {
                         browser = None; // drop -> kill_on_drop reaps subprocess
                         inflight.clear(); // no responses will arrive for these
+                        // Reset login-page hint so it can fire again next time
+                        // the channel is re-established.
+                        hint_shown = false;
+                        if hint_up { clear_pill(); hint_up = false; }
                     }
                     _ => {}
                 }
@@ -389,6 +427,13 @@ async fn relay_loop(
                 // dropped instead of being sent after BrowserClosed.
                 if let Some(payload) = out {
                     if browser.is_some() {
+                        // Clear any outstanding login-page hint pill before
+                        // this new frame lands (auto-clears on next frame).
+                        if hint_up {
+                            clear_pill();
+                            hint_up = false;
+                        }
+
                         // Correlate the response to its request method via
                         // `inflight`; a tools/list reply gains the
                         // client-side request_handoff tool before claude
@@ -399,6 +444,18 @@ async fn relay_loop(
                             Some(m) if m == "tools/list" => inject_handoff_tool(payload),
                             _ => payload,
                         };
+
+                        // Login-page hint (notify-only heuristic, M3).
+                        // String-sniff for password-field indicators: not a
+                        // judgment, just a prompt to the human that the page
+                        // may need login. Once per gate grant (`hint_shown`);
+                        // non-blocking — pill stays until the next frame.
+                        if !hint_shown && looks_like_login_page(&payload) {
+                            hint_shown = true;
+                            draw_pill("页面似乎需要登录 — 可让 claude 调 request_handoff 交给你操作");
+                            hint_up = true;
+                        }
+
                         let _ = wire.out_tx
                             .send(OutFrame::Text(ClientToHub::BrowserRpc { payload }))
                             .await;
@@ -981,6 +1038,23 @@ async fn upload_one_file(
     }
 }
 
+/// Heuristic sniff: does an outbound MCP frame look like it contains a
+/// password field indicator? Used for the notify-only login-page hint.
+///
+/// This is a **string sniff, NOT a judgment** — false positives are
+/// possible (any page that mentions the word "password" in its DOM
+/// snapshot will match). The hint is non-blocking and purely advisory:
+/// it tells the human they *may* want to call request_handoff; claude's
+/// flow is not altered in any way.
+///
+/// Two patterns cover both the unescaped JSON form and the MCP text-
+/// content escaped form that playwright-mcp uses:
+///   `"type":"password"`  — DOM snapshot attribute (unescaped)
+///   `\"type\":\"password\"` — same attribute inside a JSON string value
+pub fn looks_like_login_page(frame: &str) -> bool {
+    frame.contains(r#""type":"password""#) || frame.contains(r#"\"type\":\"password\""#)
+}
+
 /// Workspace-side leaf name for a local path (basename), used both for
 /// the upload destination and the `@`-mention.
 fn basename(path: &str) -> String {
@@ -1044,8 +1118,8 @@ async fn winch_tick(_: &mut WinchHandle) -> Option<()> {
 mod tests {
     use super::{
         extract_handoff_reason, extract_id_key, extract_method, inject_handoff_tool,
-        is_handoff_call, jsonrpc_client_error, jsonrpc_client_result_text, method_is_passive,
-        scan_consent_chunk, scan_for_enter, ConsentScan,
+        is_handoff_call, jsonrpc_client_error, jsonrpc_client_result_text, looks_like_login_page,
+        method_is_passive, scan_consent_chunk, scan_for_enter, ConsentScan,
     };
 
     #[test]
@@ -1356,5 +1430,40 @@ mod tests {
         assert!(!in_paste);
         // ...then a real keypress answers.
         assert!(scan_for_enter(b"\r", &mut in_paste));
+    }
+
+    // ---- looks_like_login_page ----
+
+    #[test]
+    fn login_page_sniff_unescaped() {
+        // Unescaped DOM-snapshot form — direct JSON attribute.
+        assert!(looks_like_login_page(
+            r#"{"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"<input \"type\":\"password\" />"}]}}"#
+        ));
+        // Simpler unescaped form as it might appear in a plaintext snapshot.
+        assert!(looks_like_login_page(
+            r#"{"type":"password","value":""}"#
+        ));
+    }
+
+    #[test]
+    fn login_page_sniff_escaped_variant() {
+        // Escaped form inside a JSON string value (playwright-mcp text content).
+        let escaped = r#"{"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"...\"type\":\"password\"..."}]}}"#;
+        assert!(looks_like_login_page(escaped));
+    }
+
+    #[test]
+    fn plain_frame_does_not_match() {
+        // Regular navigation result — no password field.
+        assert!(!looks_like_login_page(
+            r#"{"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"Welcome, user!"}]}}"#
+        ));
+        // Empty string.
+        assert!(!looks_like_login_page(""));
+        // Frame mentioning "password" only as prose, not as a type attribute.
+        assert!(!looks_like_login_page(
+            r#"{"type":"text","text":"Enter your password below"}"#
+        ));
     }
 }

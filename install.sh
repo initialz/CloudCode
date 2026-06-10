@@ -178,6 +178,17 @@ EOF
   client)
     install_bin cloudcode
 
+    # Browser channel (optional): pre-warm the pinned playwright MCP so the
+    # first in-session browser action doesn't pay the npx cold start.
+    if command -v node >/dev/null 2>&1; then
+        echo "pre-warming @playwright/mcp (browser channel)..."
+        npx -y @playwright/mcp@0.0.76 --version >/dev/null 2>&1 || true
+        echo "note: if this machine has no Chrome, run later:"
+        echo "  npx -y @playwright/mcp@0.0.76 install-browser"
+    else
+        echo "note: browser channel needs Node.js on this machine (optional)."
+    fi
+
     cat <<EOF
 
 Client installed.
