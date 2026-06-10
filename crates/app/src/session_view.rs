@@ -56,6 +56,53 @@ pub fn should_connect_viewer(view: SessionView) -> bool {
     view.shows_browser()
 }
 
+/// What the per-frame viewer-ws reconciler should do, given whether the
+/// browser panel is visible (`want`), whether a ws handle currently exists
+/// (`connected`), and whether a prior drop has blocked auto-reconnect
+/// (`retry_blocked`). PURE — drives `App::reconcile_viewer` so the lifecycle
+/// decision is unit-testable without a GUI.
+///
+/// The load-bearing rule: while the panel stays visible we connect at most
+/// once. After the ws drops (e.g. the agent runs `browser.enabled=false` so
+/// the screencast never starts), `retry_blocked` is set and we do NOT
+/// reconnect every frame — that would busy-loop the hub/agent. Hiding the
+/// panel disconnects AND clears the block, so toggling the browser away and
+/// back is the deliberate reconnect gesture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewerAction {
+    /// Open the viewer ws (rising edge: panel shown, no handle, not blocked).
+    Connect,
+    /// Drop the viewer ws (panel hidden while a handle is live).
+    Disconnect,
+    /// Do nothing this frame.
+    Idle,
+}
+
+/// Decide the reconcile action. Also reports whether the retry-block latch
+/// should be cleared (always cleared when the panel isn't wanted, so the next
+/// show can reconnect). Returns `(action, clear_retry_block)`.
+pub fn reconcile_viewer_action(
+    want: bool,
+    connected: bool,
+    retry_blocked: bool,
+) -> (ViewerAction, bool) {
+    if !want {
+        // Panel hidden / left session: drop any live ws and clear the latch.
+        let action = if connected {
+            ViewerAction::Disconnect
+        } else {
+            ViewerAction::Idle
+        };
+        return (action, true);
+    }
+    // Panel visible: connect once, unless a prior drop blocked retry.
+    if !connected && !retry_blocked {
+        (ViewerAction::Connect, false)
+    } else {
+        (ViewerAction::Idle, false)
+    }
+}
+
 /// Lower/upper bounds for the browser panel's share of the split, as a
 /// fraction of the total width. Keeps either panel from being dragged to
 /// nothing.
@@ -111,6 +158,53 @@ mod tests {
         assert!(should_connect_viewer(SessionView::Split));
         assert!(should_connect_viewer(SessionView::BrowserOnly));
         assert!(!should_connect_viewer(SessionView::TerminalOnly));
+    }
+
+    #[test]
+    fn reconcile_connects_on_rising_edge() {
+        // Panel shown, no ws, not blocked → connect; latch untouched.
+        assert_eq!(
+            reconcile_viewer_action(true, false, false),
+            (ViewerAction::Connect, false)
+        );
+    }
+
+    #[test]
+    fn reconcile_idle_when_already_connected() {
+        assert_eq!(
+            reconcile_viewer_action(true, true, false),
+            (ViewerAction::Idle, false)
+        );
+    }
+
+    #[test]
+    fn reconcile_blocked_does_not_reconnect() {
+        // The load-bearing fix: after a drop (blocked) with the panel still
+        // visible, we must NOT reconnect — no busy-loop against a
+        // never-streaming agent.
+        assert_eq!(
+            reconcile_viewer_action(true, false, true),
+            (ViewerAction::Idle, false)
+        );
+    }
+
+    #[test]
+    fn reconcile_hiding_panel_disconnects_and_clears_block() {
+        // Panel hidden with a live ws → disconnect AND clear the latch so the
+        // next show reconnects (toggle-away-and-back is the reconnect gesture).
+        assert_eq!(
+            reconcile_viewer_action(false, true, true),
+            (ViewerAction::Disconnect, true)
+        );
+    }
+
+    #[test]
+    fn reconcile_hidden_idle_still_clears_block() {
+        // Panel hidden with no ws: nothing to drop, but still clear the latch.
+        assert_eq!(
+            reconcile_viewer_action(false, false, true),
+            (ViewerAction::Idle, true)
+        );
     }
 
     #[test]

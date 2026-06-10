@@ -17,7 +17,9 @@ mod wire;
 
 use backend::{spawn, BackendEvent, BackendHandle, UiCommand};
 use config::HubConfig;
-use session_view::{should_connect_viewer, split_width_range, SessionView};
+use session_view::{
+    reconcile_viewer_action, should_connect_viewer, split_width_range, SessionView, ViewerAction,
+};
 use state::{apply_event, badge, FollowUp, Screen};
 use std::path::PathBuf;
 use terminal::{install_cjk_font, TerminalPanel};
@@ -100,6 +102,14 @@ struct App {
     /// `None` until the browser panel is first shown, dropped (→ hub
     /// `ViewerDetach` → agent stops screencast) when it's hidden again.
     viewer: Option<ViewerHandle>,
+    /// Latch: once the viewer ws drops (e.g. the agent has `browser.enabled=
+    /// false` so the screencast never starts, or a network blip), don't keep
+    /// auto-reconnecting it every frame while the panel stays visible — that
+    /// would busy-loop the hub/agent. The client intentionally does NOT
+    /// auto-reconnect (see `viewer/client.rs`); re-establishing is a deliberate
+    /// user action (toggle the browser panel away and back, which clears this).
+    /// Cleared when the browser panel is hidden or a new session opens.
+    viewer_retry_blocked: bool,
 }
 
 impl App {
@@ -126,6 +136,7 @@ impl App {
                     session_view: SessionView::default(),
                     browser: None,
                     viewer: None,
+                    viewer_retry_blocked: false,
                 }
             }
             Err(e) => App {
@@ -141,6 +152,7 @@ impl App {
                 session_view: SessionView::default(),
                 browser: None,
                 viewer: None,
+                viewer_retry_blocked: false,
             },
         }
     }
@@ -187,13 +199,25 @@ impl App {
     /// Reconcile the viewer ws with the current view: connect when the
     /// browser panel is visible, disconnect when it's hidden. Idempotent —
     /// called every frame; only acts on a change.
+    ///
+    /// After a drop we set `viewer_retry_blocked` so we don't reconnect on the
+    /// very next frame (the panel is still visible). The block is cleared the
+    /// moment the panel is hidden, so toggling the browser away and back is the
+    /// deliberate "reconnect" gesture (matching the client's no-auto-reconnect
+    /// contract; otherwise a `browser.enabled=false` agent would busy-loop the
+    /// viewer ws every frame).
     fn reconcile_viewer(&mut self, ctx: &egui::Context) {
         let want = matches!(self.screen, Screen::Session { .. })
             && should_connect_viewer(self.session_view);
-        match (want, self.viewer.is_some()) {
-            (true, false) => self.connect_viewer(ctx),
-            (false, true) => self.disconnect_viewer(),
-            _ => {}
+        let (action, clear_block) =
+            reconcile_viewer_action(want, self.viewer.is_some(), self.viewer_retry_blocked);
+        if clear_block {
+            self.viewer_retry_blocked = false;
+        }
+        match action {
+            ViewerAction::Connect => self.connect_viewer(ctx),
+            ViewerAction::Disconnect => self.disconnect_viewer(),
+            ViewerAction::Idle => {}
         }
     }
 
@@ -213,9 +237,13 @@ impl App {
                 ViewerEvent::Frame(jpeg) => panel.set_frame(ctx, &jpeg),
                 ViewerEvent::Disconnected => {
                     panel.mark_disconnected();
-                    // The client thread has exited; drop our handle so the
-                    // next show re-connects rather than reusing a dead ws.
+                    // The client thread has exited; drop our handle. Block an
+                    // immediate reconnect (the panel is still visible) so a
+                    // never-streaming agent doesn't busy-loop the viewer ws —
+                    // re-establishing is a deliberate toggle (cleared when the
+                    // panel is hidden). See `reconcile_viewer`.
                     self.viewer = None;
+                    self.viewer_retry_blocked = true;
                     break;
                 }
             }
@@ -259,8 +287,10 @@ impl App {
                 self.terminal = Some(TerminalPanel::new(80, 24));
                 self.browser = Some(BrowserPanel::new());
                 self.session_view = SessionView::default();
-                // A stale viewer from a previous session must not survive.
+                // A stale viewer from a previous session must not survive, and
+                // a fresh session starts with retry unblocked.
                 self.disconnect_viewer();
+                self.viewer_retry_blocked = false;
             }
 
             let screen = std::mem::replace(
