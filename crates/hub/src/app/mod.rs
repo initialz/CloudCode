@@ -27,6 +27,7 @@
 
 pub mod api;
 pub mod assets;
+pub mod viewer;
 
 use crate::AppState;
 use axum::{

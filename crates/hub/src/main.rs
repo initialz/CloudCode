@@ -10,6 +10,7 @@ mod registry;
 mod supervise;
 mod tunnel;
 mod update;
+mod viewer_session;
 mod ws_handler;
 
 use anyhow::{anyhow, Context};
@@ -237,12 +238,16 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
             "/api/files/delete",
             delete(app::api::files_delete).route_layer(user_gate.clone()),
         )
+        // Standalone screencast verify page. Explicit route so the `/*spa`
+        // wildcard below can't swallow it.
+        .route("/viewer", get(app::viewer::serve_viewer_html))
         .route("/", get(app::assets::serve_index))
         .route("/assets/*path", get(app::assets::serve_asset))
         .route("/*spa", get(app::assets::serve_spa));
 
     let app = Router::new()
         .route("/v1/pty/ws", get(pty_session::upgrade))
+        .route("/v1/viewer/ws", get(viewer_session::upgrade))
         .route("/v1/agent/ws", get(ws_handler::upgrade))
         .route("/healthz", get(|| async { "ok" }))
         .merge(app_router)
