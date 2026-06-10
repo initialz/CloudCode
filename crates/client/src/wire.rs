@@ -44,6 +44,7 @@ pub async fn connect(hub_url: &str, token: &str) -> Result<Wire> {
     let hello = ClientToHub::Hello {
         token: token.to_string(),
         version: PTY_PROTOCOL_VERSION.into(),
+        browser_capable: crate::cc_browser::which_node().is_some(),
     };
     sink.send(Message::Text(serde_json::to_string(&hello)?))
         .await

@@ -398,6 +398,7 @@ name = "cloudcode-agent"
 version = "1.28.0"
 dependencies = [
  "anyhow",
+ "axum",
  "base64",
  "chrono",
  "clap",

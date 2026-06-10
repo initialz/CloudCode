@@ -12,6 +12,8 @@ pub enum ClientToHub {
     Hello {
         token: String,
         version: String,
+        #[serde(default)]
+        browser_capable: bool,
     },
     /// Pre-session: bind this client connection to an agent. `None` lets the
     /// hub pick the first online agent (alphabetically). All subsequent

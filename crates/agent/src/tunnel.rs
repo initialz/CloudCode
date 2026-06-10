@@ -340,6 +340,13 @@ pub enum ServerMsg {
         /// extra env" instead of failing to parse.
         #[serde(default)]
         env: std::collections::HashMap<String, String>,
+        /// Whether the bound client can run a browser MCP subprocess
+        /// (i.e. `node` is available client-side). The agent only injects
+        /// the `cc-browser` MCP config into claude's launch when true.
+        /// `#[serde(default)]` so a pre-negotiation hub degrades to
+        /// "not browser-capable" (no MCP injection).
+        #[serde(default)]
+        browser_capable: bool,
     },
     PtyResize {
         session_id: Uuid,

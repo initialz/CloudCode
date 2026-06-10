@@ -205,6 +205,7 @@ impl PtyManager {
                 sandbox_mode,
                 tool,
                 env,
+                browser_capable,
             } => {
                 self.open_session(
                     session_id,
@@ -217,6 +218,7 @@ impl PtyManager {
                     sandbox_mode,
                     tool,
                     env,
+                    browser_capable,
                     tx,
                 )
                 .await;
@@ -540,6 +542,7 @@ impl PtyManager {
         sandbox_mode: Option<String>,
         tool: Option<String>,
         env: HashMap<String, String>,
+        browser_capable: bool,
         tx: mpsc::Sender<OutFrame>,
     ) {
         if let Err(e) = validate_name(&account, "account") {
@@ -600,26 +603,31 @@ impl PtyManager {
         // to the raw path in that pathological case.
         let cwd = std::fs::canonicalize(&cwd_raw).unwrap_or(cwd_raw);
 
-        // Inject the resident browser MCP endpoint config for this session.
+        // Inject the resident browser MCP endpoint config for this session —
+        // but only when the bound client announced it can run the browser MCP
+        // subprocess (`Hello.browser_capable` -> `PtyOpen.browser_capable`).
         // Mint a fresh token mapping this session_id in the shared endpoint
         // state, write the `--mcp-config` JSON under the workspace's
         // `.cloudcode/` dir, and append `--mcp-config <path>` to claude's
         // per-session args (forwarded to claude's argv via the bash wrapper
-        // alongside the other extra args). Task 12 will gate this on
-        // `browser_capable`; for now it's injected unconditionally.
-        let mcp_token = self.mcp.reserve(session_id);
-        let mcp_cfg = crate::mcp_endpoint::mcp_config_json(self.mcp_port, &mcp_token);
-        let mcp_cfg_path = cwd.join(".cloudcode").join("mcp-browser.json");
-        if let Some(parent) = mcp_cfg_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        // alongside the other extra args). When the client isn't
+        // browser-capable, we skip injection entirely so claude launches with
+        // no `cc-browser` MCP server configured.
+        if browser_capable {
+            let mcp_token = self.mcp.reserve(session_id);
+            let mcp_cfg = crate::mcp_endpoint::mcp_config_json(self.mcp_port, &mcp_token);
+            let mcp_cfg_path = cwd.join(".cloudcode").join("mcp-browser.json");
+            if let Some(parent) = mcp_cfg_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = std::fs::write(&mcp_cfg_path, &mcp_cfg) {
+                tracing::warn!(error = %e, "failed to write browser mcp config");
+            }
+            // Forwarded to claude's argv like the other extra args (the bash
+            // wrapper passes $@ through to the tool on first boot).
+            claude_args.push("--mcp-config".to_string());
+            claude_args.push(mcp_cfg_path.to_string_lossy().to_string());
         }
-        if let Err(e) = std::fs::write(&mcp_cfg_path, &mcp_cfg) {
-            tracing::warn!(error = %e, "failed to write browser mcp config");
-        }
-        // Forwarded to claude's argv like the other extra args (the bash
-        // wrapper passes $@ through to the tool on first boot).
-        claude_args.push("--mcp-config".to_string());
-        claude_args.push(mcp_cfg_path.to_string_lossy().to_string());
 
         // Open the PTY.
         let size = PtySize {

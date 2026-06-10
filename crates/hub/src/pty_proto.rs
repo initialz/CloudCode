@@ -13,6 +13,8 @@ pub enum ClientToHub {
     Hello {
         token: String,
         version: String,
+        #[serde(default)]
+        browser_capable: bool,
     },
     /// Pre-session: bind this client connection to an agent. `None` lets the
     /// hub pick the first online agent (alphabetically). All subsequent
@@ -252,6 +254,15 @@ mod browser_tests {
         let back: ClientToHub = serde_json::from_str(&json).unwrap();
         match back {
             ClientToHub::BrowserRpc { payload } => assert_eq!(payload, original),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn hello_without_browser_capable_defaults_false() {
+        let j = r#"{"type":"hello","token":"t","version":"1"}"#;
+        match serde_json::from_str::<ClientToHub>(j).unwrap() {
+            ClientToHub::Hello { browser_capable, .. } => assert!(!browser_capable),
             _ => panic!("wrong variant"),
         }
     }
