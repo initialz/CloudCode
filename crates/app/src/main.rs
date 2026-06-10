@@ -178,12 +178,29 @@ impl eframe::App for App {
             // borrow of `self` while mutating it (sending commands).
             let screen = self.screen.clone();
             match screen {
-                Screen::Connecting { hub_url } => {
+                Screen::Connecting {
+                    hub_url,
+                    reconnecting,
+                } => {
                     ui.vertical_centered(|ui| {
                         ui.add_space(ui.available_height() * 0.4);
                         ui.add(egui::Spinner::new().size(32.0));
                         ui.add_space(12.0);
-                        ui.label(format!("connecting to {hub_url}"));
+                        // A mid-session drop reads as "reconnecting…"
+                        // (the backend is in its backoff loop); a fresh
+                        // launch reads as "connecting to <host>".
+                        if reconnecting {
+                            let host = if hub_url.is_empty() {
+                                "reconnecting…".to_string()
+                            } else {
+                                format!("reconnecting to {hub_url}…")
+                            };
+                            ui.colored_label(egui::Color32::from_rgb(220, 170, 60), host);
+                            ui.add_space(4.0);
+                            ui.weak("the session will return to the workspace picker");
+                        } else {
+                            ui.label(format!("connecting to {hub_url}"));
+                        }
                     });
                 }
                 Screen::Picker {

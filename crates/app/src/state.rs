@@ -11,8 +11,14 @@ use cloudcode_proto::WorkspaceInfo;
 /// Which screen the app is currently showing.
 #[derive(Debug, Clone)]
 pub enum Screen {
-    /// Waiting for the hub `Welcome`. Holds the URL purely for display.
-    Connecting { hub_url: String },
+    /// Waiting for the hub `Welcome` — either the initial connect or a
+    /// reconnect after the wire died. `reconnecting` flips the status
+    /// line from "connecting to …" to "reconnecting …" so a mid-session
+    /// drop reads as a transient blip, not a fresh launch.
+    Connecting {
+        hub_url: String,
+        reconnecting: bool,
+    },
     /// Workspace picker. `account` is the hub-confirmed account name
     /// (shown in the header). `error` is a transient banner (e.g. a
     /// failed open or create) shown until the next successful action.
@@ -40,6 +46,16 @@ impl Screen {
     pub fn connecting(hub_url: impl Into<String>) -> Self {
         Screen::Connecting {
             hub_url: hub_url.into(),
+            reconnecting: false,
+        }
+    }
+
+    /// The "reconnecting after a mid-session drop" variant of the
+    /// connecting screen (greys the terminal, shows a reconnecting line).
+    pub fn reconnecting(hub_url: impl Into<String>) -> Self {
+        Screen::Connecting {
+            hub_url: hub_url.into(),
+            reconnecting: true,
         }
     }
 }
@@ -58,6 +74,9 @@ pub fn apply_event(screen: Screen, event: BackendEvent) -> (Screen, Vec<FollowUp
     // Best-effort account name carried across transitions so the picker
     // header keeps showing it even after a list refresh / error.
     let account = screen_account(&screen);
+    // The hub URL we last knew, carried into the reconnecting screen so
+    // its status line can name the host.
+    let hub_url = screen_hub_url(&screen);
 
     match (screen, event) {
         // Connected: leave the connecting screen for an empty picker and
@@ -151,18 +170,29 @@ pub fn apply_event(screen: Screen, event: BackendEvent) -> (Screen, Vec<FollowUp
         // ignore.
         (screen, BackendEvent::Connected { .. }) => (screen, vec![]),
 
-        // The wire died: drop back to a reconnect-style connecting
-        // screen (hub_url is unknown here, so leave it generic) unless
-        // we're already in a terminal Error.
+        // The wire died mid-session (or on the picker): drop into the
+        // reconnecting screen rather than a terminal Error, so the
+        // backend's backoff loop can recover us. The UI greys the
+        // terminal and shows a "reconnecting…" line; when the backend
+        // re-emits `Connected` we land back on the picker (the live tmux
+        // session, if any, is reattached by reopening the workspace).
+        //
+        // A terminal `Error` stays put — that's a fatal, user-dismissed
+        // state, not a recoverable drop.
         (Screen::Error { message }, BackendEvent::Disconnected) => {
             (Screen::Error { message }, vec![])
         }
-        (_, BackendEvent::Disconnected) => (
-            Screen::Error {
-                message: "disconnected from hub".to_string(),
-            },
-            vec![],
-        ),
+        (_, BackendEvent::Disconnected) => (Screen::reconnecting(hub_url), vec![]),
+    }
+}
+
+/// The hub URL a screen knows about, if any. Only the connecting screen
+/// carries it today; everything else yields an empty string (the
+/// reconnecting status line then omits the host, which is fine).
+fn screen_hub_url(screen: &Screen) -> String {
+    match screen {
+        Screen::Connecting { hub_url, .. } => hub_url.clone(),
+        _ => String::new(),
     }
 }
 
@@ -330,15 +360,57 @@ mod tests {
     }
 
     #[test]
-    fn disconnected_from_any_live_screen_goes_to_error() {
+    fn disconnected_from_any_live_screen_goes_to_reconnecting() {
+        // A mid-session / mid-picker drop must NOT strand the user on a
+        // terminal Error — it routes to the reconnecting screen so the
+        // backend's backoff loop can recover them to the picker.
         for screen in [
             Screen::connecting("http://h"),
             picker(Vec::new(), None),
             session(""),
         ] {
-            let (next, _) = apply_event(screen, BackendEvent::Disconnected);
-            assert!(matches!(next, Screen::Error { .. }));
+            let (next, follow) = apply_event(screen, BackendEvent::Disconnected);
+            match next {
+                Screen::Connecting { reconnecting, .. } => assert!(reconnecting),
+                other => panic!("expected reconnecting screen, got {:?}", other),
+            }
+            assert!(follow.is_empty());
         }
+    }
+
+    #[test]
+    fn disconnected_carries_hub_url_when_known() {
+        let (next, _) = apply_event(Screen::connecting("http://h"), BackendEvent::Disconnected);
+        match next {
+            Screen::Connecting { hub_url, reconnecting } => {
+                assert_eq!(hub_url, "http://h");
+                assert!(reconnecting);
+            }
+            other => panic!("expected reconnecting screen, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn disconnected_on_error_stays_error() {
+        let (next, _) = apply_event(
+            Screen::Error { message: "boom".into() },
+            BackendEvent::Disconnected,
+        );
+        assert!(matches!(next, Screen::Error { .. }));
+    }
+
+    #[test]
+    fn reconnecting_then_connected_returns_to_picker() {
+        // The full recovery path: a drop puts us in reconnecting, and the
+        // backend's re-`Welcome` (Connected) lands us back on the picker
+        // and re-requests the workspace list.
+        let (dropped, _) = apply_event(session(""), BackendEvent::Disconnected);
+        let (next, follow) = apply_event(
+            dropped,
+            BackendEvent::Connected { account: "me".into() },
+        );
+        assert!(matches!(next, Screen::Picker { .. }));
+        assert_eq!(follow, vec![FollowUp::ListWorkspaces]);
     }
 
     #[test]
