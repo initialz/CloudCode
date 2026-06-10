@@ -17,6 +17,7 @@ use base64::Engine;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -158,6 +159,20 @@ async fn relay_loop(
     let mut browser: Option<cc_browser::BrowserChannel> = None;
     let mcp_cmd = cc_browser::mcp_command();
     let (browser_out_tx, mut browser_out_rx) = tokio::sync::mpsc::channel::<String>(64);
+
+    // MCP handshake cache, owned by the RELAY LOOP (M3 review MEDIUM-2),
+    // not by any individual BrowserChannel: a channel teardown (consent
+    // deny, BrowserClosed) must not lose the cached initialize +
+    // notifications/initialized frames — claude never re-sends them on a
+    // live connection, so a later lazy-respawn or cold-start handoff
+    // needs this cache to replay into the fresh subprocess.
+    let handshake_cache: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Last URL claude navigated to (M3 headed warmup): captured from
+    // inbound `browser_navigate` tools/call frames so the handoff's
+    // synthetic warmup call can reopen the page the human is meant to
+    // see, instead of a blank window.
+    let mut last_url: Option<String> = None;
 
     // Session-scoped authorization gate (M2). The first browser frame
     // prompts the user with an inline consent pill; an approval then
@@ -344,7 +359,10 @@ async fn relay_loop(
                                 &wire.out_tx,
                                 &mut browser,
                                 &browser_out_tx,
+                                &mut browser_out_rx,
+                                &handshake_cache,
                                 &mut inflight,
+                                last_url.as_deref(),
                                 &payload,
                             )
                             .await;
@@ -364,8 +382,26 @@ async fn relay_loop(
                                     }
                                     Some((prog, args)) => {
                                         let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                                        match cc_browser::BrowserChannel::start(&prog, &argrefs, browser_out_tx.clone()) {
-                                            Ok(ch) => browser = Some(ch),
+                                        match cc_browser::BrowserChannel::start(&prog, &argrefs, browser_out_tx.clone(), handshake_cache.clone()) {
+                                            Ok(ch) => {
+                                                // M2 lazy-respawn gap (closed by M3 review
+                                                // MEDIUM-2): when this spawn follows an earlier
+                                                // teardown (deny / BrowserClosed), the fresh
+                                                // subprocess has never seen claude's MCP
+                                                // handshake — replay the cached one before the
+                                                // current frame is fed. No-op on true first
+                                                // boot (empty cache: the handshake frames are
+                                                // exactly what is arriving now).
+                                                if !handshake_cache.lock().expect("handshake cache mutex").is_empty() {
+                                                    let _ = replay_handshake(
+                                                        &ch,
+                                                        &mut browser_out_rx,
+                                                        &handshake_cache,
+                                                    )
+                                                    .await;
+                                                }
+                                                browser = Some(ch);
+                                            }
                                             Err(e) => {
                                                 // M2 review LOW-2: warn and fast-fail so the
                                                 // agent fails pending requests immediately.
@@ -384,6 +420,14 @@ async fn relay_loop(
                                         }
                                     }
                                 }
+                            }
+                            // Track the last navigated URL (M3 headed
+                            // warmup): the handoff's synthetic warmup
+                            // call re-opens this page in the visible
+                            // window so the human lands where claude
+                            // left off.
+                            if let Some(url) = extract_navigate_url(&payload) {
+                                last_url = Some(url);
                             }
                             // Record id → method before feeding (feed
                             // consumes the payload); only keep the entry
@@ -427,6 +471,18 @@ async fn relay_loop(
                 // dropped instead of being sent after BrowserClosed.
                 if let Some(payload) = out {
                     if browser.is_some() {
+                        // A straggler response to a client-synthesized warmup
+                        // call (run_handoff timed out waiting and moved on):
+                        // claude never issued that request — drop it instead
+                        // of forwarding a frame the agent endpoint cannot
+                        // correlate. (extract_id_key canonicalizes string ids
+                        // with their quotes: "\"cc-warmup-1\"".)
+                        if extract_id_key(&payload)
+                            .is_some_and(|id| id.starts_with("\"cc-warmup-"))
+                        {
+                            continue;
+                        }
+
                         // Clear any outstanding login-page hint pill before
                         // this new frame lands (auto-clears on next frame).
                         if hint_up {
@@ -567,11 +623,21 @@ fn clear_pill() {
 ///    handoff is not revoking browser consent).
 /// 2. **y** → restart the subprocess HEADED (visible window; cold-start
 ///    headed if no subprocess is running yet — e.g. claude called
-///    request_handoff as its very first browser action).
-/// 3. Pill swaps to "press Enter when done"; wait for a bare Enter.
-/// 4. Restart back HEADLESS, then answer the request with a success
-///    result telling claude to re-navigate (in-page state is lost on a
-///    restart; cookies persist via --user-data-dir).
+///    request_handoff as its very first browser action). On cold-start
+///    the cached MCP handshake is replayed manually (restart does its
+///    own replay internally).
+/// 3. Synthetic WARMUP tools/call (`browser_navigate` to the last URL
+///    claude visited, or about:blank): playwright-mcp launches its
+///    browser only inside the first tools/call — without this the
+///    promised visible window never opens while the relay is parked.
+///    Retries on the profile-lock race; on failure the Enter pill text
+///    warns that the window may not have opened.
+/// 4. Pill swaps to "press Enter when done"; wait for a bare Enter.
+/// 5. Restart back HEADLESS (lazy — no warmup: claude's next real
+///    tools/call launches the headless browser, M2 status quo), then
+///    answer the request with a success result telling claude to
+///    re-navigate (in-page state is lost on a restart; cookies persist
+///    via --user-data-dir).
 ///
 /// Restart failures surface to claude as `-32005` client errors and
 /// leave `browser = None` (the next browser frame lazy-respawns).
@@ -580,12 +646,16 @@ fn clear_pill() {
 /// will never arrive, so `inflight` is cleared; claude's other pending
 /// calls (it shouldn't have concurrent browser calls during a handoff)
 /// hit the agent-side timeout, which is acceptable.
+#[allow(clippy::too_many_arguments)]
 async fn run_handoff(
     bytes: &mut ByteRx,
     out_tx: &mpsc::Sender<OutFrame>,
     browser: &mut Option<cc_browser::BrowserChannel>,
     browser_out_tx: &mpsc::Sender<String>,
+    browser_out_rx: &mut mpsc::Receiver<String>,
+    handshake_cache: &Arc<Mutex<Vec<String>>>,
     inflight: &mut HashMap<String, String>,
+    last_url: Option<&str>,
     payload: &str,
 ) {
     // A handoff "notification" (no id) cannot be answered — drop it.
@@ -604,7 +674,8 @@ async fn run_handoff(
     }
 
     // 2. Switch to a HEADED browser. If a subprocess is running, restart
-    //    it (kill+wait, handshake replay); if not, cold-start headed.
+    //    it (handshake replayed internally); if not, cold-start headed
+    //    and replay the relay-owned handshake cache manually.
     let Some((prog, args)) = cc_browser::mcp_command_headed() else {
         send_browser_rpc(
             out_tx,
@@ -615,12 +686,31 @@ async fn run_handoff(
     };
     let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     inflight.clear(); // restart kills in-flight subprocess requests
+    let mut cold_start = false;
     let headed = match browser.take() {
         Some(ch) => ch.restart(&prog, &argrefs, browser_out_tx.clone()).await,
-        None => cc_browser::BrowserChannel::start(&prog, &argrefs, browser_out_tx.clone()),
+        None => {
+            cold_start = true;
+            cc_browser::BrowserChannel::start(
+                &prog,
+                &argrefs,
+                browser_out_tx.clone(),
+                handshake_cache.clone(),
+            )
+        }
     };
     match headed {
-        Ok(ch) => *browser = Some(ch),
+        Ok(ch) => {
+            if cold_start {
+                // Cold start never went through restart's internal
+                // replay; the fresh subprocess needs claude's cached
+                // handshake before it serves tools. Empty cache (claude
+                // truly never handshook — shouldn't happen for an
+                // allowed tools/call) degrades to the warmup failing.
+                let _ = replay_handshake(&ch, browser_out_rx, handshake_cache).await;
+            }
+            *browser = Some(ch);
+        }
         Err(e) => {
             send_browser_rpc(
                 out_tx,
@@ -635,10 +725,26 @@ async fn run_handoff(
         }
     }
 
-    // 3. The human works in the visible window; Enter hands it back.
-    wait_for_enter_pill(bytes, "浏览器已切到可见窗口,完成人工操作后按回车交还").await;
+    // 3. Warmup: actually open the window. Failure is non-fatal — the
+    //    human still gets the Enter pill (with a warning) and the
+    //    handoff flow completes either way.
+    let warmed = match browser.as_ref() {
+        Some(ch) => warmup_headed(ch, browser_out_rx, last_url).await,
+        None => false,
+    };
 
-    // 4. Switch back to HEADLESS.
+    // 4. The human works in the visible window; Enter hands it back.
+    let pill_text = if warmed {
+        "浏览器已切到可见窗口,完成人工操作后按回车交还"
+    } else {
+        "浏览器窗口可能未能打开 — 若无窗口请按回车交还并重试"
+    };
+    wait_for_enter_pill(bytes, pill_text).await;
+
+    // 5. Switch back to HEADLESS. Deliberately NO warmup here: the
+    //    headless relaunch stays lazy — claude's next real tools/call
+    //    initializes the browser (M2 status quo), and nobody needs to
+    //    SEE a headless window appear.
     let Some((prog, args)) = cc_browser::mcp_command() else {
         // Only reachable with an inconsistent CC_BROWSER_MCP* override.
         *browser = None;
@@ -653,7 +759,15 @@ async fn run_handoff(
     inflight.clear(); // nothing was fed while parked, but stay defensive
     let headless = match browser.take() {
         Some(ch) => ch.restart(&prog, &argrefs, browser_out_tx.clone()).await,
-        None => cc_browser::BrowserChannel::start(&prog, &argrefs, browser_out_tx.clone()),
+        // Unreachable in practice (step 2 always leaves Some), but if
+        // hit, the lazy path tolerates a missing replay until the next
+        // frame; keep it simple and just start.
+        None => cc_browser::BrowserChannel::start(
+            &prog,
+            &argrefs,
+            browser_out_tx.clone(),
+            handshake_cache.clone(),
+        ),
     };
     match headless {
         Ok(ch) => *browser = Some(ch),
@@ -671,7 +785,7 @@ async fn run_handoff(
         }
     }
 
-    // 5. Answer the request: tell claude the human is done.
+    // 6. Answer the request: tell claude the human is done.
     send_browser_rpc(
         out_tx,
         jsonrpc_client_result_text(
@@ -690,6 +804,180 @@ async fn send_browser_rpc(out_tx: &mpsc::Sender<OutFrame>, payload: String) {
     let _ = out_tx
         .send(OutFrame::Text(ClientToHub::BrowserRpc { payload }))
         .await;
+}
+
+/// Warmup the freshly-headed subprocess so the visible window actually
+/// appears (M3 review HIGH). playwright-mcp launches its browser ONLY
+/// inside the first `tools/call` handler — initialize/tools/list never
+/// do — so after the headed restart nothing is on screen until a
+/// tools/call arrives. While the handoff parks the relay, claude can't
+/// send one; we synthesize it: a `browser_navigate` to the last URL
+/// claude visited (or about:blank).
+///
+/// Lock-race mitigation (M3 review MEDIUM-1): the OLD subprocess tree
+/// exits via playwright-mcp's stdin-close watchdog (~0.3s typically, up
+/// to 15s force-kill under load) — `restart`'s done_rx resolving does
+/// NOT mean the old browser released the `--user-data-dir` profile
+/// lock. If the warmup lands inside that window, playwright answers
+/// "Browser is already in use"; retry with 2s/4s backoff, 3 attempts
+/// total (covers everything but the pathological 15s tail).
+///
+/// Returns true when the warmup response arrived (window should be up);
+/// false on feed failure / timeout / persistent lock error — callers
+/// degrade the Enter pill text but never abort the handoff.
+async fn warmup_headed(
+    chan: &cc_browser::BrowserChannel,
+    out_rx: &mut mpsc::Receiver<String>,
+    last_url: Option<&str>,
+) -> bool {
+    let url = last_url.unwrap_or("about:blank");
+    for attempt in 1u32..=3 {
+        if attempt > 1 {
+            // Backoff before re-trying the lock race: 2s then 4s.
+            tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt - 1))).await;
+        }
+        let frame = warmup_navigate_frame(attempt, url);
+        // String ids "cc-warmup-N" cannot collide with claude's numeric
+        // ids; extract_id_key canonicalizes to "\"cc-warmup-N\"".
+        let want = extract_id_key(&frame).expect("warmup frame has an id");
+        if chan.feed(frame).is_err() {
+            return false;
+        }
+        // Bounded wait: headed Chrome launch + page load can be slow,
+        // but must not park the handoff forever.
+        let Some(resp) =
+            pump_until_response(chan, out_rx, &want, std::time::Duration::from_secs(90)).await
+        else {
+            tracing::warn!(attempt, "headed warmup timed out");
+            return false;
+        };
+        // The response is SWALLOWED (never forwarded to the hub):
+        // claude never issued this request and must not see its reply.
+        if !resp.contains("Browser is already in use") {
+            return true;
+        }
+        tracing::warn!(attempt, "headed warmup hit the profile-lock race; retrying");
+    }
+    false
+}
+
+/// Synthetic warmup tools/call frame. Pure for testability; the string
+/// id namespace ("cc-warmup-N") is reserved to the client.
+fn warmup_navigate_frame(attempt: u32, url: &str) -> String {
+    let url_json = serde_json::Value::String(url.to_string());
+    format!(
+        r#"{{"jsonrpc":"2.0","id":"cc-warmup-{attempt}","method":"tools/call","params":{{"name":"browser_navigate","arguments":{{"url":{url_json}}}}}}}"#
+    )
+}
+
+/// Drain `out_rx` until the response with id key `want_id` arrives
+/// (returned, NOT forwarded) or `timeout` elapses (None).
+///
+/// The relay select! loop is parked while a handoff/replay runs — this
+/// helper is the only reader, so any server→client traffic that arrives
+/// mid-wait must be handled HERE or the subprocess wedges:
+/// - server-originated REQUESTS (frames with both "method" and "id" —
+///   e.g. playwright-mcp may send `roots/list` during its first
+///   tools/call init and await the reply, which claude cannot give
+///   while we're parked): answered locally with an empty result and fed
+///   straight back into the channel.
+/// - everything else (notifications, stale pre-restart responses whose
+///   requests `inflight.clear()` already wrote off): dropped.
+async fn pump_until_response(
+    chan: &cc_browser::BrowserChannel,
+    out_rx: &mut mpsc::Receiver<String>,
+    want_id: &str,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let frame = tokio::time::timeout_at(deadline, out_rx.recv()).await.ok()??;
+        if extract_id_key(&frame).as_deref() == Some(want_id) {
+            return Some(frame);
+        }
+        if let Some(reply) = answer_server_request(&frame) {
+            if chan.feed(reply).is_err() {
+                return None;
+            }
+            continue;
+        }
+        // Notification or unrelated response: drop (see doc comment).
+    }
+}
+
+/// Local stand-in reply for a server-originated request received while
+/// the relay is parked. `roots/list` gets the empty-roots shape it
+/// expects; anything else gets a generic empty result — enough to
+/// unblock the server's await without inventing capabilities. Returns
+/// None when `frame` is not a request (no method+id pair).
+fn answer_server_request(frame: &str) -> Option<String> {
+    let id_raw = extract_id_key(frame)?;
+    let method = extract_method(frame)?;
+    let result = if method == "roots/list" {
+        r#"{"roots":[]}"#
+    } else {
+        "{}"
+    };
+    Some(format!(
+        r#"{{"jsonrpc":"2.0","id":{id_raw},"result":{result}}}"#
+    ))
+}
+
+/// Replay the relay-owned handshake cache into a freshly started
+/// channel: feed each cached frame; for the `initialize` request, wait
+/// for (and swallow) its response so claude never sees a duplicate.
+/// Empty cache → trivially true.
+///
+/// NOTE: this intentionally duplicates the replay inside
+/// `BrowserChannel::restart`, which runs on the bare `McpProcess`
+/// BEFORE the pump task exists and therefore can't share this
+/// channel-level implementation; factoring them together would mean
+/// teaching restart to speak the channel API mid-construction.
+async fn replay_handshake(
+    chan: &cc_browser::BrowserChannel,
+    out_rx: &mut mpsc::Receiver<String>,
+    cache: &Arc<Mutex<Vec<String>>>,
+) -> bool {
+    let frames: Vec<String> = cache.lock().expect("handshake cache mutex").clone();
+    for frame in frames {
+        let init_id = if extract_method(&frame).as_deref() == Some("initialize") {
+            extract_id_key(&frame)
+        } else {
+            None // notifications/initialized: no response expected
+        };
+        if chan.feed(frame).is_err() {
+            return false;
+        }
+        if let Some(want) = init_id {
+            if pump_until_response(chan, out_rx, &want, std::time::Duration::from_secs(60))
+                .await
+                .is_none()
+            {
+                tracing::warn!("timed out waiting for replayed initialize response");
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Tolerant extraction of the navigation target from a
+/// `browser_navigate` tools/call: `params.arguments.url`. None for any
+/// other method/tool or malformed JSON.
+fn extract_navigate_url(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    if v.get("method")?.as_str()? != "tools/call" {
+        return None;
+    }
+    let params = v.get("params")?;
+    if params.get("name")?.as_str()? != "browser_navigate" {
+        return None;
+    }
+    params
+        .get("arguments")?
+        .get("url")?
+        .as_str()
+        .map(|s| s.to_string())
 }
 
 /// Tolerant extraction of `params.arguments.reason` from a
@@ -1047,12 +1335,27 @@ async fn upload_one_file(
 /// it tells the human they *may* want to call request_handoff; claude's
 /// flow is not altered in any way.
 ///
-/// Two patterns cover both the unescaped JSON form and the MCP text-
-/// content escaped form that playwright-mcp uses:
-///   `"type":"password"`  — DOM snapshot attribute (unescaped)
+/// Patterns (a dumb substring set, deliberately — no parsing):
+///   `"type":"password"`  — DOM-attribute form (unescaped)
 ///   `\"type\":\"password\"` — same attribute inside a JSON string value
+///   textbox lines mentioning a password label — playwright-mcp's REAL
+///   output shape is an aria-snapshot YAML inside the result's text
+///   content, e.g. `- textbox \"Password\" [ref=e12]` or
+///   `- textbox \"密码\"`; there is no `type=` attribute in that form,
+///   so we scan line-wise (both real newlines and the JSON-escaped
+///   `\n` sequence) for a `textbox` line containing a case-insensitive
+///   `password` or `密码`.
 pub fn looks_like_login_page(frame: &str) -> bool {
-    frame.contains(r#""type":"password""#) || frame.contains(r#"\"type\":\"password\""#)
+    if frame.contains(r#""type":"password""#) || frame.contains(r#"\"type\":\"password\""#) {
+        return true;
+    }
+    frame
+        .split('\n')
+        .flat_map(|s| s.split("\\n"))
+        .any(|line| {
+            let lower = line.to_ascii_lowercase();
+            lower.contains("textbox") && (lower.contains("password") || line.contains("密码"))
+        })
 }
 
 /// Workspace-side leaf name for a local path (basename), used both for
@@ -1117,9 +1420,10 @@ async fn winch_tick(_: &mut WinchHandle) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_handoff_reason, extract_id_key, extract_method, inject_handoff_tool,
-        is_handoff_call, jsonrpc_client_error, jsonrpc_client_result_text, looks_like_login_page,
-        method_is_passive, scan_consent_chunk, scan_for_enter, ConsentScan,
+        answer_server_request, extract_handoff_reason, extract_id_key, extract_method,
+        extract_navigate_url, inject_handoff_tool, is_handoff_call, jsonrpc_client_error,
+        jsonrpc_client_result_text, looks_like_login_page, method_is_passive, scan_consent_chunk,
+        scan_for_enter, warmup_navigate_frame, ConsentScan,
     };
 
     #[test]
@@ -1454,6 +1758,27 @@ mod tests {
     }
 
     #[test]
+    fn login_page_sniff_aria_snapshot_textbox_lines() {
+        // playwright-mcp's real shape: aria-snapshot YAML inside the
+        // result's text content, with JSON-escaped newlines.
+        assert!(looks_like_login_page(
+            r#"{"jsonrpc":"2.0","id":10,"result":{"content":[{"type":"text","text":"- textbox \"Username\"\n- textbox \"Password\" [ref=e12]\n- button \"Log in\""}]}}"#
+        ));
+        // Chinese label.
+        assert!(looks_like_login_page(
+            r#"{"result":{"content":[{"type":"text","text":"- textbox \"密码\" [ref=e7]"}]}}"#
+        ));
+        // Case-insensitive within a textbox line.
+        assert!(looks_like_login_page(
+            "- textbox \"Enter PASSWORD here\"\n- button \"submit\""
+        ));
+        // Real (unescaped) newlines also split into lines.
+        assert!(looks_like_login_page(
+            "- textbox \"User\"\n- textbox \"password\""
+        ));
+    }
+
+    #[test]
     fn plain_frame_does_not_match() {
         // Regular navigation result — no password field.
         assert!(!looks_like_login_page(
@@ -1465,5 +1790,116 @@ mod tests {
         assert!(!looks_like_login_page(
             r#"{"type":"text","text":"Enter your password below"}"#
         ));
+        // "password" and "textbox" on DIFFERENT lines never match.
+        assert!(!looks_like_login_page(
+            "- textbox \"Search\"\\n- text \"Forgot password?\""
+        ));
+    }
+
+    // ---- extract_navigate_url ----
+
+    #[test]
+    fn navigate_url_extracted() {
+        assert_eq!(
+            extract_navigate_url(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_navigate","arguments":{"url":"https://example.com/login"}}}"#
+            ),
+            Some("https://example.com/login".to_string())
+        );
+    }
+
+    #[test]
+    fn navigate_url_none_for_other_frames() {
+        // Different tool.
+        assert_eq!(
+            extract_navigate_url(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_click","arguments":{"ref":"e1"}}}"#
+            ),
+            None
+        );
+        // Different method, even with a url argument.
+        assert_eq!(
+            extract_navigate_url(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"name":"browser_navigate","arguments":{"url":"https://x"}}}"#
+            ),
+            None
+        );
+        // Missing url / non-string url / garbage.
+        assert_eq!(
+            extract_navigate_url(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_navigate","arguments":{}}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            extract_navigate_url(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_navigate","arguments":{"url":42}}}"#
+            ),
+            None
+        );
+        assert_eq!(extract_navigate_url("not json"), None);
+        assert_eq!(extract_navigate_url(""), None);
+    }
+
+    // ---- warmup_navigate_frame ----
+
+    #[test]
+    fn warmup_frame_shape() {
+        let frame = warmup_navigate_frame(1, "https://example.com/a?b=1");
+        let v: serde_json::Value = serde_json::from_str(&frame).expect("valid JSON");
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], "cc-warmup-1"); // STRING id: can't collide with claude's numeric ids
+        assert_eq!(v["method"], "tools/call");
+        assert_eq!(v["params"]["name"], "browser_navigate");
+        assert_eq!(v["params"]["arguments"]["url"], "https://example.com/a?b=1");
+        // The frame's own id round-trips through extract_id_key the way
+        // warmup_headed correlates it.
+        assert_eq!(extract_id_key(&frame), Some("\"cc-warmup-1\"".to_string()));
+    }
+
+    #[test]
+    fn warmup_frame_escapes_url_and_numbers_attempts() {
+        let frame = warmup_navigate_frame(2, "https://x/\"quote\"");
+        let v: serde_json::Value = serde_json::from_str(&frame).expect("valid JSON despite quotes");
+        assert_eq!(v["id"], "cc-warmup-2");
+        assert_eq!(v["params"]["arguments"]["url"], "https://x/\"quote\"");
+    }
+
+    // ---- answer_server_request ----
+
+    #[test]
+    fn server_request_roots_list_answered_with_empty_roots() {
+        let reply = answer_server_request(r#"{"jsonrpc":"2.0","id":7,"method":"roots/list"}"#)
+            .expect("a reply");
+        let v: serde_json::Value = serde_json::from_str(&reply).expect("valid JSON");
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["result"]["roots"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn server_request_unknown_method_gets_generic_empty_result() {
+        let reply = answer_server_request(
+            r#"{"jsonrpc":"2.0","id":"s1","method":"sampling/createMessage"}"#,
+        )
+        .expect("a reply");
+        let v: serde_json::Value = serde_json::from_str(&reply).expect("valid JSON");
+        assert_eq!(v["id"], "s1");
+        assert!(v["result"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn non_requests_are_not_answered() {
+        // Notification: method but no id.
+        assert_eq!(
+            answer_server_request(r#"{"jsonrpc":"2.0","method":"notifications/progress"}"#),
+            None
+        );
+        // Response: id but no method.
+        assert_eq!(
+            answer_server_request(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#),
+            None
+        );
+        // Garbage.
+        assert_eq!(answer_server_request("nope"), None);
     }
 }

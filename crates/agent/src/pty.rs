@@ -642,10 +642,15 @@ impl PtyManager {
                 .or_insert_with(|| {
                     // Self-heal across agent restarts: prefer the token already
                     // persisted in this workspace's mcp-browser.json — a claude
-                    // surviving in tmux still holds it in memory.
+                    // surviving in tmux still holds it in memory. Only adopt a
+                    // token in exactly the format we mint (32 ascii-hex chars,
+                    // Uuid::simple): a tampered/corrupt config must mint fresh
+                    // instead of smuggling an arbitrary (guessable) token into
+                    // the endpoint's auth map.
                     std::fs::read_to_string(cwd.join(".cloudcode").join("mcp-browser.json"))
                         .ok()
                         .and_then(|s| crate::mcp_endpoint::extract_token_from_config(&s))
+                        .filter(|t| crate::mcp_endpoint::is_valid_token(t))
                         .unwrap_or_else(|| Uuid::new_v4().simple().to_string())
                 })
                 .clone();

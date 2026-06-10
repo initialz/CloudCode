@@ -213,6 +213,15 @@ pub fn extract_token_from_config(json: &str) -> Option<String> {
     Some(token.to_string())
 }
 
+/// True for a well-formed workspace browser token: exactly 32 ASCII hex
+/// chars — the `Uuid::new_v4().simple()` format we mint. Guards the
+/// pty.rs self-heal adoption path against a tampered/corrupt
+/// mcp-browser.json smuggling an arbitrary string (e.g. an
+/// attacker-chosen guessable token) into the endpoint's token map.
+pub fn is_valid_token(token: &str) -> bool {
+    token.len() == 32 && token.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// Outcome of a claude POST. Mapped to HTTP status in the axum handler.
 ///
 /// Transport-level problems for a JSON-RPC *request* (unknown token,
@@ -629,6 +638,29 @@ mod tests {
         // URL ends with a trailing slash — the trailing segment is empty.
         let json = r#"{"mcpServers":{"cc-browser":{"url":"http://127.0.0.1:7110/mcp/"}}}"#;
         assert_eq!(extract_token_from_config(json), None);
+    }
+
+    #[test]
+    fn token_validation_accepts_minted_format() {
+        // Exactly what we mint: Uuid::new_v4().simple() = 32 lowercase hex.
+        let minted = uuid::Uuid::new_v4().simple().to_string();
+        assert!(is_valid_token(&minted));
+        // Uppercase hex is still hex (tolerated).
+        assert!(is_valid_token("ABCDEF0123456789abcdef0123456789"));
+    }
+
+    #[test]
+    fn token_validation_rejects_malformed() {
+        assert!(!is_valid_token("")); // empty
+        assert!(!is_valid_token("abc123")); // too short
+        assert!(!is_valid_token(&"a".repeat(31))); // 31 chars
+        assert!(!is_valid_token(&"a".repeat(33))); // 33 chars
+        assert!(!is_valid_token("g".repeat(32).as_str())); // non-hex letters
+        // Hyphenated form (32 chars INCLUDING dashes) is NOT the simple
+        // format we mint — dashes are not hex.
+        assert!(!is_valid_token("123e4567-e89b-12d3-a456-42661417"));
+        // Path traversal / arbitrary strings smuggled via a tampered config.
+        assert!(!is_valid_token("../../../../etc/passwd00000000000"));
     }
 
     #[test]

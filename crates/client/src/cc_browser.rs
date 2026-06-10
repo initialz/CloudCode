@@ -64,10 +64,19 @@ impl McpProcess {
         }
     }
 
-    /// Kill the subprocess AND await its exit. The wait matters: the
-    /// playwright profile (`--user-data-dir`) holds a single-instance
-    /// lock, and a restart on the same profile fails with "Browser is
-    /// already in use" unless the old process has fully exited.
+    /// Reap the npx wrapper and close our pipe ends. Be precise about
+    /// what this does and does NOT do: `start_kill` SIGKILLs only the
+    /// npx WRAPPER process — the real playwright-mcp server (and its
+    /// Chrome) is a grandchild that survives the kill. What actually
+    /// tears the server + browser down is this function consuming
+    /// `self`, which drops `self.stdin`: playwright-mcp watches its
+    /// stdin and on close runs a graceful shutdown (~0.3s typically,
+    /// with a 15s force-kill fallback under load). That teardown is
+    /// ASYNC relative to this function returning — `wait()` only reaps
+    /// the wrapper, so the profile (`--user-data-dir`) single-instance
+    /// lock may still be held briefly afterwards. Callers that respawn
+    /// on the same profile must tolerate a transient "Browser is
+    /// already in use" (see the warmup retry in relay.rs).
     #[allow(dead_code)]
     pub async fn shutdown(mut self) {
         let _ = self.child.start_kill();
@@ -101,14 +110,22 @@ fn json_method(frame: &str) -> Option<String> {
 /// claude never re-sends the handshake on a live connection, so after a
 /// `restart` (headless<->headed switch) the new subprocess must have the
 /// cached handshake replayed before it serves tools.
+///
+/// The cache is OWNED by the relay loop (M3 review MEDIUM-2) and merely
+/// shared into each channel: a teardown (`browser = None` on deny /
+/// BrowserClosed) drops the channel but not the cache, so a later
+/// lazy-respawn or cold-start handoff can still replay the handshake.
 #[allow(dead_code)]
 pub struct BrowserChannel {
     in_tx: mpsc::Sender<String>,
     /// Cached handshake frames in arrival order (at most 2: initialize,
-    /// notifications/initialized). Shared across restarts.
+    /// notifications/initialized). Shared with the relay loop and
+    /// across restarts.
     handshake: Arc<Mutex<Vec<String>>>,
-    /// Resolves when the pump task has exited — i.e. the subprocess has
-    /// been killed AND waited (profile lock released).
+    /// Resolves when the pump task has exited — i.e. the npx wrapper
+    /// has been reaped and our pipe ends dropped. NOTE: this does NOT
+    /// guarantee the real playwright-mcp server + browser have exited
+    /// or released the profile lock (see `McpProcess::shutdown`).
     done_rx: oneshot::Receiver<()>,
 }
 
@@ -118,10 +135,11 @@ impl BrowserChannel {
         program: &str,
         args: &[&str],
         out_tx: mpsc::Sender<String>,
+        handshake: Arc<Mutex<Vec<String>>>,
     ) -> std::io::Result<Self> {
         tracing::info!(program, ?args, "starting browser MCP subprocess");
         let proc = McpProcess::spawn(program, args)?;
-        Ok(Self::from_process(proc, out_tx, Arc::new(Mutex::new(Vec::new()))))
+        Ok(Self::from_process(proc, out_tx, handshake))
     }
 
     /// Wrap an already-spawned (and possibly already-handshaken) process
@@ -148,7 +166,10 @@ impl BrowserChannel {
                     }
                 }
             }
-            proc.shutdown().await; // kill + wait: profile lock released
+            // Reaps the npx wrapper + drops our stdin pipe; the real
+            // server + browser exit asynchronously via the stdin-close
+            // watchdog (see McpProcess::shutdown).
+            proc.shutdown().await;
             let _ = done_tx.send(());
         });
         Self { in_tx, handshake, done_rx }
@@ -164,10 +185,12 @@ impl BrowserChannel {
     }
 
     /// Cache the handshake frames for later replay. Cheap: once both
-    /// frames are cached (len >= 2) no further parsing happens.
+    /// frames are cached (len >= 2) no further parsing happens. Dedup
+    /// by equality: the relay-side replay (`replay_handshake`) re-feeds
+    /// cached frames through `feed`, which must not grow the cache.
     fn maybe_cache_handshake(&self, frame: &str) {
         let mut cache = self.handshake.lock().expect("handshake mutex");
-        if cache.len() >= 2 {
+        if cache.len() >= 2 || cache.iter().any(|f| f == frame) {
             return;
         }
         match json_method(frame).as_deref() {
@@ -178,11 +201,22 @@ impl BrowserChannel {
         }
     }
 
-    /// Stop the current subprocess (kill + wait, releasing the profile
-    /// lock) and start a new one with `program`/`args`, replaying the
-    /// cached MCP handshake so the live claude session continues
-    /// seamlessly. The replayed initialize RESPONSE is swallowed (claude
-    /// already has one). Outbound frames keep flowing to `out_tx`.
+    /// Retire the current subprocess and start a new one with
+    /// `program`/`args`, replaying the cached MCP handshake so the live
+    /// claude session continues seamlessly. The replayed initialize
+    /// RESPONSE is swallowed (claude already has one). Outbound frames
+    /// keep flowing to `out_tx`.
+    ///
+    /// HONESTY NOTE (M3 review MEDIUM-1): retiring the old subprocess
+    /// only reaps the npx WRAPPER; the real playwright-mcp server and
+    /// its browser exit asynchronously via the server's stdin-close
+    /// watchdog (~0.3s typically, up to 15s force-kill under load).
+    /// `done_rx` resolving therefore does NOT guarantee the old browser
+    /// has released the `--user-data-dir` profile lock when the
+    /// successor spawns. That race is harmless on the lazy (headless)
+    /// path — playwright-mcp launches its browser only inside the first
+    /// tools/call, well after the watchdog fires — and the headed
+    /// warmup call retries on "Browser is already in use" (relay.rs).
     pub async fn restart(
         self,
         program: &str,
@@ -191,12 +225,20 @@ impl BrowserChannel {
     ) -> std::io::Result<BrowserChannel> {
         let BrowserChannel { in_tx, handshake, done_rx } = self;
         // Dropping in_tx makes the old pump's in_rx yield None -> the
-        // pump kills + waits its child, then signals done_tx. Awaiting
-        // done_rx guarantees the old process has fully exited before the
-        // successor is spawned (same --user-data-dir refuses two
-        // instances).
+        // pump reaps the npx wrapper, drops the stdin pipe (the real
+        // teardown trigger — see McpProcess::shutdown), then signals
+        // done_tx. Bound the wait (M3 review LOW-1): if the old pump is
+        // wedged (e.g. blocked on a hung child read), proceed after 20s
+        // with a warning rather than hanging the handoff forever —
+        // accepting the risk that the old wrapper is still being
+        // reaped while the successor spawns.
         drop(in_tx);
-        let _ = done_rx.await;
+        if tokio::time::timeout(std::time::Duration::from_secs(20), done_rx)
+            .await
+            .is_err()
+        {
+            tracing::warn!("old browser pump did not exit within 20s; proceeding with restart");
+        }
 
         tracing::info!(program, ?args, "restarting browser MCP subprocess");
         let mut proc = McpProcess::spawn(program, args)?;
@@ -323,7 +365,8 @@ mod tests {
         }
         let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/echo-mcp.mjs");
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(8);
-        let chan = BrowserChannel::start("node", &[fixture], out_tx).expect("start channel");
+        let chan = BrowserChannel::start("node", &[fixture], out_tx, Arc::new(Mutex::new(Vec::new())))
+            .expect("start channel");
         chan.feed(r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#.to_string())
             .unwrap();
         let got = out_rx.recv().await.expect("a response frame");
@@ -343,7 +386,9 @@ mod tests {
         }
         let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/echo-mcp.mjs");
         let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(8);
-        let chan = BrowserChannel::start("node", &[fixture], out_tx.clone()).expect("start");
+        let cache = Arc::new(Mutex::new(Vec::new()));
+        let chan = BrowserChannel::start("node", &[fixture], out_tx.clone(), cache.clone())
+            .expect("start");
 
         // Normal handshake flow: initialize response reaches out_rx, and
         // both handshake frames get cached by feed().
@@ -378,6 +423,32 @@ mod tests {
         assert!(next.contains("echo"));
         // Nothing else queued in between.
         assert!(out_rx.try_recv().is_err());
+    }
+
+    /// The handshake cache is owned OUTSIDE the channel (M3 MEDIUM-2):
+    /// it must survive the channel being dropped (deny / BrowserClosed
+    /// teardown), and re-feeding a cached frame (the relay-side replay
+    /// path) must not duplicate entries.
+    #[tokio::test]
+    async fn shared_cache_survives_channel_drop_and_dedups() {
+        if which_node().is_none() {
+            return;
+        }
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/echo-mcp.mjs");
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::channel(8);
+        let cache = Arc::new(Mutex::new(Vec::new()));
+        let chan = BrowserChannel::start("node", &[fixture], out_tx, cache.clone())
+            .expect("start channel");
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        chan.feed(init.to_string()).unwrap();
+        let _ = out_rx.recv().await.expect("initialize response");
+        assert_eq!(cache.lock().unwrap().len(), 1);
+        // Replay path re-feeds the identical frame: cache must not grow.
+        chan.feed(init.to_string()).unwrap();
+        assert_eq!(cache.lock().unwrap().len(), 1);
+        // Cache outlives the channel.
+        drop(chan);
+        assert_eq!(cache.lock().unwrap().len(), 1);
     }
 
     #[test]
