@@ -183,7 +183,6 @@ impl BrowserChannel {
     /// cached MCP handshake so the live claude session continues
     /// seamlessly. The replayed initialize RESPONSE is swallowed (claude
     /// already has one). Outbound frames keep flowing to `out_tx`.
-    #[allow(dead_code)]
     pub async fn restart(
         self,
         program: &str,
@@ -289,7 +288,6 @@ fn strip_headless(args: Vec<String>) -> Vec<String> {
 /// same parsing as `CC_BROWSER_MCP`); otherwise derives from
 /// `mcp_command()` by stripping `--headless` (returned as-is when the
 /// token is absent). Returns None when `mcp_command()` does.
-#[allow(dead_code)]
 pub fn mcp_command_headed() -> Option<(String, Vec<String>)> {
     if let Ok(cmd) = std::env::var("CC_BROWSER_MCP_HEADED") {
         let mut parts = cmd.split_whitespace().map(|s| s.to_string());

@@ -321,21 +321,21 @@ async fn relay_loop(
                             // tracked in `inflight`: no subprocess
                             // response will ever correlate to this id.
                             //
-                            // Placeholder until M3 Task 3 wires the real
-                            // headed-switch flow: answer immediately with
-                            // a client-originated JSON-RPC error.
-                            if let Some(id) = extract_id_key(&payload) {
-                                let resp = jsonrpc_client_error(
-                                    &id,
-                                    -32004,
-                                    "handoff flow not yet wired (M3 T3)",
-                                );
-                                let _ = wire.out_tx
-                                    .send(OutFrame::Text(ClientToHub::BrowserRpc {
-                                        payload: resp,
-                                    }))
-                                    .await;
-                            }
+                            // While the handoff pills are up (and across
+                            // the headed/headless restarts), this await
+                            // parks every other select! arm — exactly
+                            // like the consent pill. Inbound frames
+                            // buffer in their channels and each re-enters
+                            // the gate/handoff dispatch once we return.
+                            run_handoff(
+                                bytes,
+                                &wire.out_tx,
+                                &mut browser,
+                                &browser_out_tx,
+                                &mut inflight,
+                                &payload,
+                            )
+                            .await;
                         } else {
                             if browser.is_none() {
                                 if let Some((prog, args)) = mcp_cmd.clone() {
@@ -435,19 +435,16 @@ async fn relay_loop(
 /// the relay loop's own recv arm then sees the closed channel on its
 /// next iteration and exits cleanly).
 async fn prompt_browser_consent(bytes: &mut ByteRx) -> bool {
-    let mut stdout = std::io::stdout();
-    // BEL to ring attention, save the cursor (DECSC), and hide it while
-    // the pill is up — same hide/show pairing as main.rs
-    // show_pill()/clear_pill(), but scoped to one line instead of a
-    // full-screen repaint.
-    let _ = stdout.write_all(b"\x07\x1b7\x1b[?25l");
-    // Fixed line near the top (row 2), cleared first so the pill sits on
-    // a clean background; bold yellow like show_pill's title line, reset
-    // after (show_pill's `\x1b[{row};1H … \x1b[0m` convention).
-    let text = "云端任务请求操作你的浏览器 — 允许? [y]允许 / [n]拒绝";
-    let _ = write!(stdout, "\x1b[2;1H\x1b[2K\x1b[1;33m  {text}  \x1b[0m");
-    let _ = stdout.flush();
+    prompt_pill(bytes, "云端任务请求操作你的浏览器 — 允许? [y]允许 / [n]拒绝").await
+}
 
+/// Generic y/n pill: draw `text`, block on a deliberate keypress answer
+/// (same chunk discipline as the consent prompt), clear the pill, return
+/// the answer. Shared by the browser consent prompt and the handoff
+/// confirmation — the same parking semantics apply (see
+/// `prompt_browser_consent`).
+async fn prompt_pill(bytes: &mut ByteRx, text: &str) -> bool {
+    draw_pill(text);
     let mut in_paste = false;
     let approved = loop {
         let Some(chunk) = bytes.recv().await else { break false };
@@ -457,11 +454,202 @@ async fn prompt_browser_consent(bytes: &mut ByteRx) -> bool {
             ConsentScan::Ignore => {} // swallowed — never forwarded to the PTY
         }
     };
+    clear_pill();
+    approved
+}
 
-    // Clear the pill line, restore the cursor (DECRC), show it again.
+/// Pill that waits for a deliberate Enter keypress (handoff "human is
+/// done" signal). Everything else — pastes, escape sequences, long
+/// blobs — is swallowed via the same conservative chunk discipline as
+/// the y/n pills. No client-side timeout: the agent endpoint's 600s
+/// request_handoff timeout bounds the whole exchange; if it fires,
+/// claude gets a clean timeout error while the human keeps the window.
+/// Also returns when stdin closes (the relay loop's own recv arm then
+/// sees the closed channel and exits cleanly) — we still proceed to
+/// restore the headless browser in that case.
+async fn wait_for_enter_pill(bytes: &mut ByteRx, text: &str) {
+    draw_pill(text);
+    let mut in_paste = false;
+    loop {
+        let Some(chunk) = bytes.recv().await else { break };
+        if scan_for_enter(&chunk, &mut in_paste) {
+            break;
+        }
+    }
+    clear_pill();
+}
+
+/// Draw an inline pill: BEL to ring attention, save the cursor (DECSC),
+/// hide it, then paint a bold-yellow line on row 2 — same hide/show
+/// pairing as main.rs show_pill()/clear_pill(), but scoped to one line
+/// instead of a full-screen repaint. Pair with `clear_pill`.
+fn draw_pill(text: &str) {
+    let mut stdout = std::io::stdout();
+    let _ = stdout.write_all(b"\x07\x1b7\x1b[?25l");
+    // Fixed line near the top (row 2), cleared first so the pill sits on
+    // a clean background; bold yellow like show_pill's title line, reset
+    // after (show_pill's `\x1b[{row};1H … \x1b[0m` convention).
+    let _ = write!(stdout, "\x1b[2;1H\x1b[2K\x1b[1;33m  {text}  \x1b[0m");
+    let _ = stdout.flush();
+}
+
+/// Clear the pill line, restore the cursor (DECRC), show it again.
+fn clear_pill() {
+    let mut stdout = std::io::stdout();
     let _ = stdout.write_all(b"\x1b[2;1H\x1b[2K\x1b8\x1b[?25h");
     let _ = stdout.flush();
-    approved
+}
+
+/// The human-handoff interaction flow, run when an allowed
+/// `request_handoff` tools/call arrives. The client itself is the
+/// server for this tool: it answers the JSON-RPC request directly and
+/// never feeds it to playwright-mcp.
+///
+/// 1. y/n pill with claude's reason. **n** → `-32003 user declined
+///    handoff` (the consent gate's grant is untouched — declining one
+///    handoff is not revoking browser consent).
+/// 2. **y** → restart the subprocess HEADED (visible window; cold-start
+///    headed if no subprocess is running yet — e.g. claude called
+///    request_handoff as its very first browser action).
+/// 3. Pill swaps to "press Enter when done"; wait for a bare Enter.
+/// 4. Restart back HEADLESS, then answer the request with a success
+///    result telling claude to re-navigate (in-page state is lost on a
+///    restart; cookies persist via --user-data-dir).
+///
+/// Restart failures surface to claude as `-32005` client errors and
+/// leave `browser = None` (the next browser frame lazy-respawns).
+///
+/// Each restart kills in-flight subprocess requests — their responses
+/// will never arrive, so `inflight` is cleared; claude's other pending
+/// calls (it shouldn't have concurrent browser calls during a handoff)
+/// hit the agent-side timeout, which is acceptable.
+async fn run_handoff(
+    bytes: &mut ByteRx,
+    out_tx: &mpsc::Sender<OutFrame>,
+    browser: &mut Option<cc_browser::BrowserChannel>,
+    browser_out_tx: &mpsc::Sender<String>,
+    inflight: &mut HashMap<String, String>,
+    payload: &str,
+) {
+    // A handoff "notification" (no id) cannot be answered — drop it.
+    let Some(id_raw) = extract_id_key(payload) else { return };
+    let reason = extract_handoff_reason(payload);
+
+    // 1. Ask the human.
+    let ask = format!("云端请求人工接管浏览器: {reason} — [y]打开窗口 / [n]拒绝");
+    if !prompt_pill(bytes, &ask).await {
+        send_browser_rpc(
+            out_tx,
+            jsonrpc_client_error(&id_raw, -32003, "user declined handoff"),
+        )
+        .await;
+        return;
+    }
+
+    // 2. Switch to a HEADED browser. If a subprocess is running, restart
+    //    it (kill+wait, handshake replay); if not, cold-start headed.
+    let Some((prog, args)) = cc_browser::mcp_command_headed() else {
+        send_browser_rpc(
+            out_tx,
+            jsonrpc_client_error(&id_raw, -32005, "headed browser unavailable"),
+        )
+        .await;
+        return;
+    };
+    let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    inflight.clear(); // restart kills in-flight subprocess requests
+    let headed = match browser.take() {
+        Some(ch) => ch.restart(&prog, &argrefs, browser_out_tx.clone()).await,
+        None => cc_browser::BrowserChannel::start(&prog, &argrefs, browser_out_tx.clone()),
+    };
+    match headed {
+        Ok(ch) => *browser = Some(ch),
+        Err(e) => {
+            send_browser_rpc(
+                out_tx,
+                jsonrpc_client_error(
+                    &id_raw,
+                    -32005,
+                    &format!("failed to switch browser to headed: {e}"),
+                ),
+            )
+            .await;
+            return; // browser stays None; next frame lazy-respawns
+        }
+    }
+
+    // 3. The human works in the visible window; Enter hands it back.
+    wait_for_enter_pill(bytes, "浏览器已切到可见窗口,完成人工操作后按回车交还").await;
+
+    // 4. Switch back to HEADLESS.
+    let Some((prog, args)) = cc_browser::mcp_command() else {
+        // Only reachable with an inconsistent CC_BROWSER_MCP* override.
+        *browser = None;
+        send_browser_rpc(
+            out_tx,
+            jsonrpc_client_error(&id_raw, -32005, "headless browser unavailable"),
+        )
+        .await;
+        return;
+    };
+    let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    inflight.clear(); // nothing was fed while parked, but stay defensive
+    let headless = match browser.take() {
+        Some(ch) => ch.restart(&prog, &argrefs, browser_out_tx.clone()).await,
+        None => cc_browser::BrowserChannel::start(&prog, &argrefs, browser_out_tx.clone()),
+    };
+    match headless {
+        Ok(ch) => *browser = Some(ch),
+        Err(e) => {
+            send_browser_rpc(
+                out_tx,
+                jsonrpc_client_error(
+                    &id_raw,
+                    -32005,
+                    &format!("failed to switch browser back to headless: {e}"),
+                ),
+            )
+            .await;
+            return; // browser stays None; next frame lazy-respawns
+        }
+    }
+
+    // 5. Answer the request: tell claude the human is done.
+    send_browser_rpc(
+        out_tx,
+        jsonrpc_client_result_text(
+            &id_raw,
+            "Human finished. Browser is headless again; cookies persisted. \
+             Re-navigate to continue.",
+        ),
+    )
+    .await;
+}
+
+/// Send a raw JSON-RPC payload to the hub as a BrowserRpc frame.
+/// Best-effort: a send failure means the WS is dead and the relay
+/// loop's own arms detect that on the next iteration.
+async fn send_browser_rpc(out_tx: &mpsc::Sender<OutFrame>, payload: String) {
+    let _ = out_tx
+        .send(OutFrame::Text(ClientToHub::BrowserRpc { payload }))
+        .await;
+}
+
+/// Tolerant extraction of `params.arguments.reason` from a
+/// request_handoff tools/call. Missing/garbage/empty → a placeholder so
+/// the pill always reads sensibly.
+fn extract_handoff_reason(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("params")?
+                .get("arguments")?
+                .get("reason")?
+                .as_str()
+                .map(|s| s.to_string())
+        })
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "(no reason given)".to_string())
 }
 
 /// Methods that flow without consent: protocol handshake and metadata.
@@ -555,6 +743,14 @@ fn jsonrpc_client_error(id_raw: &str, code: i64, message: &str) -> String {
     )
 }
 
+/// Build a client-originated JSON-RPC SUCCESS response whose result is
+/// a single MCP text content block (the shape tools/call results use).
+/// Same raw-id splicing convention as `jsonrpc_client_error`.
+fn jsonrpc_client_result_text(id_raw: &str, text: &str) -> String {
+    let result = serde_json::json!({ "content": [{ "type": "text", "text": text }] });
+    format!(r#"{{"jsonrpc":"2.0","id":{id_raw},"result":{result}}}"#)
+}
+
 /// What a stdin chunk means for the consent prompt.
 #[derive(Debug, PartialEq, Eq)]
 enum ConsentScan {
@@ -563,24 +759,38 @@ enum ConsentScan {
     Ignore,
 }
 
-/// Classify one raw stdin chunk for the consent prompt. Conservative by
+/// Shared pre-filter for the pill scanners: what kind of chunk is this?
+#[derive(Debug, PartialEq, Eq)]
+enum PillChunk {
+    /// Paste content, escape sequence/terminal reply, or a long plain
+    /// blob — swallow, never interpret as an answer.
+    Swallow,
+    /// Exactly one ESC byte: the bare Esc key.
+    EscKey,
+    /// A short plain chunk (<= 4 bytes): a deliberate keypress whose
+    /// bytes may be scanned for an answer.
+    Keys,
+}
+
+/// Classify one raw stdin chunk for a modal pill. Conservative by
 /// design: only a deliberate, bare keypress may answer.
 ///
-/// Threat model: bytes that merely *contain* y/n must never answer a
-/// consent prompt. A bracketed paste can carry any text ("yes please" in
-/// pasted prose would silently APPROVE browser access), and terminals
-/// emit unsolicited replies — e.g. a DSR status report `ESC [ 0 n`
-/// contains `n` and would spuriously DENY. So:
+/// Threat model: bytes that merely *contain* answer keys must never
+/// answer a pill. A bracketed paste can carry any text ("yes please" in
+/// pasted prose would silently APPROVE browser access; a pasted
+/// multi-line snippet would "press Enter" during a handoff), and
+/// terminals emit unsolicited replies — e.g. a DSR status report
+/// `ESC [ 0 n` contains `n` and would spuriously DENY. So:
 ///
 /// - Bracketed-paste regions (`ESC [ 200~` … `ESC [ 201~`) are tracked
 ///   across chunks via `in_paste` and swallowed wholesale.
 /// - Any chunk starting with ESC is an escape sequence (CSI/SS3, a
 ///   terminal reply, arrow key, paste marker) and is swallowed — never
 ///   byte-scanned for letters. The single exception: a chunk that is
-///   exactly one ESC byte is the Esc key → Deny.
+///   exactly one ESC byte is the Esc key.
 /// - Plain chunks answer only when short (<= 4 bytes, a normal keypress
 ///   chunk); longer plain blobs are unbracketed pastes → swallowed.
-fn scan_consent_chunk(chunk: &[u8], in_paste: &mut bool) -> ConsentScan {
+fn classify_pill_chunk(chunk: &[u8], in_paste: &mut bool) -> PillChunk {
     const PASTE_START: &[u8] = b"\x1b[200~";
     const PASTE_END: &[u8] = b"\x1b[201~";
 
@@ -591,7 +801,7 @@ fn scan_consent_chunk(chunk: &[u8], in_paste: &mut bool) -> ConsentScan {
         if chunk.windows(PASTE_END.len()).any(|w| w == PASTE_END) {
             *in_paste = false;
         }
-        return ConsentScan::Ignore;
+        return PillChunk::Swallow;
     }
 
     // A paste may open anywhere in a chunk (the terminal can coalesce
@@ -603,32 +813,55 @@ fn scan_consent_chunk(chunk: &[u8], in_paste: &mut bool) -> ConsentScan {
     {
         let after = &chunk[start + PASTE_START.len()..];
         *in_paste = !after.windows(PASTE_END.len()).any(|w| w == PASTE_END);
-        return ConsentScan::Ignore;
+        return PillChunk::Swallow;
     }
 
     if chunk.first() == Some(&0x1b) {
         // Bare Esc keypress.
         if chunk == [0x1b] {
-            return ConsentScan::Deny;
+            return PillChunk::EscKey;
         }
         // Any longer ESC-led chunk is an escape sequence (CSI/SS3, a
         // terminal reply like DSR `ESC [ 0 n`, arrow key) — swallow it,
         // never byte-scan it for answer letters.
-        return ConsentScan::Ignore;
+        return PillChunk::Swallow;
     }
 
     // Plain chunk: only a short, keypress-sized chunk may answer. Longer
     // plain chunks are unbracketed paste blobs — swallow them.
     if chunk.len() <= 4 {
-        for b in chunk {
-            match b {
-                b'y' | b'Y' => return ConsentScan::Approve,
-                b'n' | b'N' => return ConsentScan::Deny,
-                _ => {}
+        PillChunk::Keys
+    } else {
+        PillChunk::Swallow
+    }
+}
+
+/// Classify one raw stdin chunk for a y/n pill (consent + handoff
+/// confirmation). See `classify_pill_chunk` for the chunk discipline.
+fn scan_consent_chunk(chunk: &[u8], in_paste: &mut bool) -> ConsentScan {
+    match classify_pill_chunk(chunk, in_paste) {
+        PillChunk::Swallow => ConsentScan::Ignore,
+        PillChunk::EscKey => ConsentScan::Deny,
+        PillChunk::Keys => {
+            for b in chunk {
+                match b {
+                    b'y' | b'Y' => return ConsentScan::Approve,
+                    b'n' | b'N' => return ConsentScan::Deny,
+                    _ => {}
+                }
             }
+            ConsentScan::Ignore
         }
     }
-    ConsentScan::Ignore
+}
+
+/// True only for a deliberate, bare Enter keypress (`\r` or `\n` in a
+/// short plain chunk). Esc, escape sequences, pastes (including ones
+/// that contain newlines), and long blobs never count — same chunk
+/// discipline as `scan_consent_chunk`.
+fn scan_for_enter(chunk: &[u8], in_paste: &mut bool) -> bool {
+    classify_pill_chunk(chunk, in_paste) == PillChunk::Keys
+        && chunk.iter().any(|&b| b == b'\r' || b == b'\n')
 }
 
 /// Intercept a detected file drop: register one result channel per
@@ -810,8 +1043,9 @@ async fn winch_tick(_: &mut WinchHandle) -> Option<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_id_key, extract_method, inject_handoff_tool, is_handoff_call,
-        jsonrpc_client_error, method_is_passive, scan_consent_chunk, ConsentScan,
+        extract_handoff_reason, extract_id_key, extract_method, inject_handoff_tool,
+        is_handoff_call, jsonrpc_client_error, jsonrpc_client_result_text, method_is_passive,
+        scan_consent_chunk, scan_for_enter, ConsentScan,
     };
 
     #[test]
@@ -1016,16 +1250,111 @@ mod tests {
 
     #[test]
     fn client_error_shape() {
-        let frame = jsonrpc_client_error("5", -32004, "handoff flow not yet wired (M3 T3)");
+        let frame = jsonrpc_client_error("5", -32003, "user declined handoff");
         let v: serde_json::Value = serde_json::from_str(&frame).expect("valid JSON");
         assert_eq!(v["jsonrpc"], "2.0");
         assert_eq!(v["id"], 5);
-        assert_eq!(v["error"]["code"], -32004);
-        assert_eq!(v["error"]["message"], "handoff flow not yet wired (M3 T3)");
+        assert_eq!(v["error"]["code"], -32003);
+        assert_eq!(v["error"]["message"], "user declined handoff");
 
         // String id splices verbatim (id_raw carries its own quotes).
         let frame = jsonrpc_client_error("\"abc\"", -32003, "user declined");
         let v: serde_json::Value = serde_json::from_str(&frame).expect("valid JSON");
         assert_eq!(v["id"], "abc");
+    }
+
+    // ---- jsonrpc_client_result_text ----
+
+    #[test]
+    fn client_result_text_shape() {
+        let frame = jsonrpc_client_result_text("7", "Human finished.");
+        let v: serde_json::Value = serde_json::from_str(&frame).expect("valid JSON");
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 7);
+        let content = v["result"]["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "Human finished.");
+        assert!(v.get("error").is_none());
+
+        // String id splices verbatim (id_raw carries its own quotes);
+        // text with quotes/escapes survives via json! serialization.
+        let frame = jsonrpc_client_result_text("\"abc\"", "say \"hi\"\nnewline");
+        let v: serde_json::Value = serde_json::from_str(&frame).expect("valid JSON");
+        assert_eq!(v["id"], "abc");
+        assert_eq!(v["result"]["content"][0]["text"], "say \"hi\"\nnewline");
+    }
+
+    // ---- extract_handoff_reason ----
+
+    #[test]
+    fn handoff_reason_present() {
+        assert_eq!(
+            extract_handoff_reason(
+                r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"request_handoff","arguments":{"reason":"login needed"}}}"#
+            ),
+            "login needed"
+        );
+    }
+
+    #[test]
+    fn handoff_reason_missing_or_garbage_falls_back() {
+        // No arguments at all.
+        assert_eq!(
+            extract_handoff_reason(
+                r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"request_handoff"}}"#
+            ),
+            "(no reason given)"
+        );
+        // reason present but not a string.
+        assert_eq!(
+            extract_handoff_reason(
+                r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"request_handoff","arguments":{"reason":42}}}"#
+            ),
+            "(no reason given)"
+        );
+        // reason present but blank.
+        assert_eq!(
+            extract_handoff_reason(
+                r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"request_handoff","arguments":{"reason":"  "}}}"#
+            ),
+            "(no reason given)"
+        );
+        // Unparseable.
+        assert_eq!(extract_handoff_reason("not json"), "(no reason given)");
+        assert_eq!(extract_handoff_reason(""), "(no reason given)");
+    }
+
+    // ---- scan_for_enter ----
+
+    fn enter(chunk: &[u8]) -> bool {
+        let mut in_paste = false;
+        scan_for_enter(chunk, &mut in_paste)
+    }
+
+    #[test]
+    fn bare_enter_answers() {
+        assert!(enter(b"\r")); // CR (raw-mode Enter)
+        assert!(enter(b"\n")); // LF
+    }
+
+    #[test]
+    fn non_enter_chunks_do_not_answer() {
+        assert!(!enter(b"y")); // letters never end the handoff wait
+        assert!(!enter(b"\x1b")); // bare Esc is not Enter
+        assert!(!enter(b"\x1b[0n")); // DSR terminal reply: swallowed
+        assert!(!enter(b"\x1b[200~line1\nline2\x1b[201~")); // paste with \n: swallowed
+        assert!(!enter(b"hello\nworld")); // long plain blob: swallowed
+    }
+
+    #[test]
+    fn split_paste_with_newlines_never_presses_enter() {
+        let mut in_paste = false;
+        assert!(!scan_for_enter(b"\x1b[200~line1\n", &mut in_paste));
+        assert!(in_paste);
+        assert!(!scan_for_enter(b"line2\n\x1b[201~", &mut in_paste));
+        assert!(!in_paste);
+        // ...then a real keypress answers.
+        assert!(scan_for_enter(b"\r", &mut in_paste));
     }
 }

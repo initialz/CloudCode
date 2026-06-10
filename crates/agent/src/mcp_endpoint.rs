@@ -135,18 +135,31 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
 /// the consent prompt. Keep this generous.
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Method-aware timeout selection: `tools/call` gets the generous
-/// CALL_TIMEOUT; everything else (handshake, metadata, garbage) gets
-/// the short REQUEST_TIMEOUT.
+/// The human-handoff tool (`request_handoff`) blocks while a person
+/// does manual browser work — login flows take minutes, not seconds.
+/// The client side deliberately runs no timeout of its own, so this is
+/// the only bound on the handoff window.
+const HANDOFF_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Method-aware timeout selection, three tiers: `tools/call` for
+/// `request_handoff` gets the human-scale HANDOFF_TIMEOUT; any other
+/// `tools/call` gets the generous CALL_TIMEOUT; everything else
+/// (handshake, metadata, garbage) gets the short REQUEST_TIMEOUT.
 fn timeout_for(body: &str) -> Duration {
-    let is_call = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s == "tools/call"))
-        .unwrap_or(false);
-    if is_call {
-        CALL_TIMEOUT
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return REQUEST_TIMEOUT;
+    };
+    if v.get("method").and_then(|m| m.as_str()) != Some("tools/call") {
+        return REQUEST_TIMEOUT;
+    }
+    let tool = v
+        .get("params")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str());
+    if tool == Some("request_handoff") {
+        HANDOFF_TIMEOUT
     } else {
-        REQUEST_TIMEOUT
+        CALL_TIMEOUT
     }
 }
 
@@ -512,13 +525,28 @@ mod tests {
 
     #[test]
     fn timeout_for_is_method_aware() {
-        // tools/call gets the generous browser-launch/consent timeout.
+        // Tier 1: request_handoff blocks on a human — 600s window.
+        assert_eq!(
+            timeout_for(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"request_handoff","arguments":{"reason":"login"}}}"#
+            ),
+            HANDOFF_TIMEOUT
+        );
+        assert_eq!(HANDOFF_TIMEOUT, Duration::from_secs(600));
+        // Tier 2: other tools/call get the browser-launch/consent timeout.
+        assert_eq!(
+            timeout_for(
+                r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"browser_navigate"}}"#
+            ),
+            CALL_TIMEOUT
+        );
+        // tools/call without a params.name is still a plain tool call.
         assert_eq!(
             timeout_for(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#),
             CALL_TIMEOUT
         );
         assert_eq!(CALL_TIMEOUT, Duration::from_secs(120));
-        // Handshake/metadata keep the short timeout.
+        // Tier 3: handshake/metadata keep the short timeout.
         assert_eq!(
             timeout_for(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#),
             REQUEST_TIMEOUT
