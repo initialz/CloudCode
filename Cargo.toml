@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/hub", "crates/client", "crates/agent", "crates/daemon"]
+members = ["crates/proto", "crates/hub", "crates/client", "crates/agent", "crates/daemon"]
 
 [workspace.package]
 version = "1.28.0"
@@ -8,6 +8,7 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
+cloudcode-proto = { path = "crates/proto" }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -442,6 +442,7 @@ dependencies = [
  "base64",
  "bytes",
  "clap",
+ "cloudcode-proto",
  "crossterm",
  "dirs",
  "futures",
@@ -480,6 +481,7 @@ dependencies = [
  "chrono",
  "clap",
  "cloudcode-daemon",
+ "cloudcode-proto",
  "dashmap",
  "dirs",
  "flate2",
@@ -502,6 +504,15 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "cloudcode-proto"
+version = "1.28.0"
+dependencies = [
+ "serde",
+ "serde_json",
  "uuid",
 ]
 
