@@ -58,6 +58,12 @@ processes and a real `claude`, using the echo MCP stub on the client side.
 - Browser tools are injected only on first claude boot for a session; after a tmux
   reattach (CLOUDCODE_RESUME_CMD path) the `--mcp-config` is not re-applied, so a resumed
   session won't have cc-browser until a fresh session. (Revisit in M2.)
+  **FIXED in M2:** the wrapper actually does pass `--mcp-config` on resume too (`$@` is
+  forwarded to `eval "$RESUME_CMD"`), so idle-reattach works via re-reading the rewritten
+  `mcp-browser.json` (new token). Busy-reattach (claude still running in tmux) is fixed by
+  token REBIND on the open_session swap path: the prior handle's tokens are rebound to the
+  new session_id instead of unregistered, so the live claude keeps working; both tokens are
+  carried on the new handle (`PtyHandle.mcp_tokens`) and all unregistered on true close.
 - No auth gate / handoff / real browser yet — those are M2/M3. The client-side MCP
   subprocess is the echo stub (`test-fixtures/echo-mcp.mjs`), not a real browser driver.
 - Streamable-HTTP header nuances (Mcp-Session-Id, Accept negotiation) are not implemented;

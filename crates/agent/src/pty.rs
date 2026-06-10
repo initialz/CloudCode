@@ -64,9 +64,11 @@ struct PtyHandle {
     /// Stops the jsonl watcher task on drop. Held only for its
     /// Drop side-effect.
     _jsonl: crate::jsonl::WatcherHandle,
-    /// MCP browser token minted for this session (Some when browser_capable);
-    /// removed from the endpoint route map on close.
-    mcp_token: Option<String>,
+    /// All browser MCP tokens routing to this session — the freshly minted
+    /// one plus any inherited from a busy-reattach swap (the still-running
+    /// claude keeps its original token, rebound to the new session_id); all
+    /// unregistered from the endpoint route map on close.
+    mcp_tokens: Vec<String>,
 }
 
 impl PtyManager {
@@ -586,10 +588,19 @@ impl PtyManager {
         // old handle silently (the reader thread will see read==0 and exit
         // without emitting PtyClosed because we set a no-emit marker through
         // the absence of the entry in `sessions`).
+        //
+        // Busy-reattach: a claude may still be running inside tmux holding the
+        // prior handle's token in memory. Do NOT unregister it — that would
+        // kill the live claude's cc-browser MCP mid-flight. Instead REBIND each
+        // prior token to the (new) session_id so the running claude keeps
+        // working, and inherit the tokens into the new handle so close()
+        // cleans them all up.
+        let mut inherited_mcp_tokens: Vec<String> = Vec::new();
         if let Some((_, h)) = self.sessions.remove(&session_id) {
-            if let Some(tok) = &h.mcp_token {
-                self.mcp.unregister(tok);
+            for tok in &h.mcp_tokens {
+                self.mcp.rebind(tok, session_id);
             }
+            inherited_mcp_tokens.extend(h.mcp_tokens.iter().cloned());
         }
         let cwd_raw = self.workspace_root().join(&account).join(&workspace);
         if let Err(e) = std::fs::create_dir_all(&cwd_raw) {
@@ -623,7 +634,7 @@ impl PtyManager {
         // alongside the other extra args). When the client isn't
         // browser-capable, we skip injection entirely so claude launches with
         // no `cc-browser` MCP server configured.
-        let mut mcp_token = None;
+        let mut mcp_tokens: Vec<String> = Vec::new();
         if browser_capable {
             let token = self.mcp.reserve(session_id);
             let mcp_cfg = crate::mcp_endpoint::mcp_config_json(self.mcp_port, &token);
@@ -638,8 +649,11 @@ impl PtyManager {
             // wrapper passes $@ through to the tool on first boot).
             claude_args.push("--mcp-config".to_string());
             claude_args.push(mcp_cfg_path.to_string_lossy().to_string());
-            mcp_token = Some(token);
+            mcp_tokens.push(token);
         }
+        // Tokens inherited from a busy-reattach swap (already rebound above)
+        // ride along so close() unregisters every token routing here.
+        mcp_tokens.extend(inherited_mcp_tokens);
 
         // Open the PTY.
         let size = PtySize {
@@ -935,7 +949,7 @@ impl PtyManager {
             account: account.clone(),
             workspace: workspace.clone(),
             _jsonl: jsonl,
-            mcp_token,
+            mcp_tokens,
         });
         self.sessions.insert(session_id, handle.clone());
 
@@ -984,7 +998,7 @@ impl PtyManager {
         // Drop the handle; the reader thread will see read=0 and exit; tmux
         // session stays alive on the OS.
         if let Some((_, h)) = self.sessions.remove(&session_id) {
-            if let Some(tok) = &h.mcp_token {
+            for tok in &h.mcp_tokens {
                 self.mcp.unregister(tok);
             }
         }
@@ -1686,7 +1700,7 @@ fn pty_reader_loop(
         .unwrap_or(false);
     if still_us {
         if let Some((_, h)) = sessions.remove(&session_id) {
-            if let Some(tok) = &h.mcp_token {
+            for tok in &h.mcp_tokens {
                 mcp.unregister(tok);
             }
         }

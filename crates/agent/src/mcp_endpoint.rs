@@ -70,6 +70,15 @@ impl EndpointState {
         self.routes.remove(token);
     }
 
+    /// Point an existing token at a new session_id (busy-reattach: the
+    /// still-running claude keeps its original token while the hub-side
+    /// session identity changes). No-op if the token is unknown.
+    pub fn rebind(&self, token: &str, new_session_id: Uuid) {
+        if let Some(mut entry) = self.routes.get_mut(token) {
+            *entry.value_mut() = new_session_id;
+        }
+    }
+
     pub fn session_for(&self, token: &str) -> Option<Uuid> {
         self.routes.get(token).map(|r| *r.value())
     }
@@ -502,6 +511,17 @@ mod tests {
         let sid = uuid::Uuid::new_v4();
         let tok = st.reserve(sid);
         assert_eq!(st.session_for(&tok), Some(sid));
+    }
+
+    #[test]
+    fn rebind_points_token_at_new_session() {
+        let st = EndpointState::new();
+        let old_sid = Uuid::new_v4();
+        let new_sid = Uuid::new_v4();
+        let tok = st.reserve(old_sid);
+        st.rebind(&tok, new_sid);
+        assert_eq!(st.session_for(&tok), Some(new_sid));
+        st.rebind("unknown-token", new_sid); // no-op, no panic
     }
 
     #[test]
