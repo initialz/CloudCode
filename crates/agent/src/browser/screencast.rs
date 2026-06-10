@@ -43,16 +43,36 @@ use tokio_tungstenite::tungstenite::Message;
 // ---------------------------------------------------------------------------
 
 /// Parse the `GET /json` target array and return the `webSocketDebuggerUrl` of
-/// the best page target to screencast.
+/// the page target to screencast for a given session.
 ///
-/// Preference order:
-///   1. a `type == "page"` whose `url` is a *real* page (not `about:blank` /
-///      `chrome://…`) — first such wins;
-///   2. otherwise the first `type == "page"` at all;
-///   3. otherwise `None`.
+/// `target_hint` is the CDP **target id** (the `id` field of a `/json` entry) of
+/// the page belonging to the session being viewed, when the agent has been able
+/// to learn it (see [`EndpointState::page_hint_for`]). The `id`/`targetId` is
+/// the only per-target correlation field `/json` exposes — `browserContextId` is
+/// NOT in `/json`, only in CDP `Target.getTargets` (see the P4 page-mapping
+/// notes). So the hint we carry through the screencast path is a target id.
+///
+/// Behaviour:
+///   * **with a hint** — return the `webSocketDebuggerUrl` of the `type=="page"`
+///     whose `id` matches the hint. If no such page exists (it was closed, or
+///     the hint is stale), return `None` rather than leaking a different
+///     session's page: a hinted attach that can't find its page should fail
+///     closed, not silently screencast someone else's tab.
+///   * **without a hint** (`None`) — fall back to the active-page heuristic:
+///       1. a `type == "page"` whose `url` is a *real* page (not `about:blank` /
+///          `chrome://…`) — first such wins;
+///       2. otherwise the first `type == "page"` at all;
+///       3. otherwise `None`.
 ///
 /// Garbage / non-array input yields `None`.
-pub fn pick_page_target(targets_json: &str) -> Option<String> {
+///
+/// NOTE: in the agent's current default (non-`--isolated`) playwright-mcp
+/// config, all sessions share ONE browser context and ONE set of tabs, so
+/// `page_hint_for` returns `None` and this falls back to the active page. The
+/// hint pathway is the plumbing for an `--isolated` config where each session
+/// gets a distinct context/target (which is what actually closes the P2
+/// cross-page leak). See `docs/superpowers/plans/2026-06-10-p4-page-mapping-notes.md`.
+pub fn pick_page_for_session(targets_json: &str, target_hint: Option<&str>) -> Option<String> {
     let arr = serde_json::from_str::<Value>(targets_json).ok()?;
     let arr = arr.as_array()?;
 
@@ -63,7 +83,22 @@ pub fn pick_page_target(targets_json: &str) -> Option<String> {
             .map(str::to_string)
     };
 
-    // Pass 1: a real, non-blank page with a ws url.
+    // Hinted: only the page whose target id matches. Fail closed if absent — do
+    // NOT fall back to the active page, or a hinted viewer could be handed a
+    // different session's tab (the very leak this targeting closes).
+    if let Some(hint) = target_hint {
+        for t in arr {
+            if !is_page(t) {
+                continue;
+            }
+            if t.get("id").and_then(Value::as_str) == Some(hint) {
+                return ws_of(t);
+            }
+        }
+        return None;
+    }
+
+    // Unhinted fallback — Pass 1: a real, non-blank page with a ws url.
     for t in arr {
         if !is_page(t) {
             continue;
@@ -77,7 +112,7 @@ pub fn pick_page_target(targets_json: &str) -> Option<String> {
         }
     }
 
-    // Pass 2: the first page of any kind that has a ws url.
+    // Unhinted fallback — Pass 2: the first page of any kind that has a ws url.
     for t in arr {
         if is_page(t) {
             if let Some(ws) = ws_of(t) {
@@ -224,18 +259,25 @@ pub struct ScreencastSession {
 }
 
 impl ScreencastSession {
-    /// Connect to the active page target behind `cdp_http_url`, start a JPEG
+    /// Connect to the page target behind `cdp_http_url`, start a JPEG
     /// screencast, and stream decoded frames to `frame_tx`.
     ///
+    /// `target_hint` is the per-session page target id (when known); see
+    /// [`pick_page_for_session`]. `None` falls back to the active page.
+    ///
     /// Steps:
-    ///   1. `GET <cdp_http_url>/json` → [`pick_page_target`] → ws url (bail if
-    ///      none);
+    ///   1. `GET <cdp_http_url>/json` → [`pick_page_for_session`] → ws url (bail
+    ///      if none);
     ///   2. `connect_async` the page debugger ws;
     ///   3. send `Page.enable` + `Page.startScreencast`;
     ///   4. spawn a task that selects between the ws read stream (decode frames
     ///      → `frame_tx`, ack each) and a command receiver (forward queued
     ///      outgoing commands to the ws).
-    pub async fn start(cdp_http_url: &str, frame_tx: mpsc::Sender<Vec<u8>>) -> Result<Self> {
+    pub async fn start(
+        cdp_http_url: &str,
+        target_hint: Option<&str>,
+        frame_tx: mpsc::Sender<Vec<u8>>,
+    ) -> Result<Self> {
         let list_url = format!("{cdp_http_url}/json");
         let body = reqwest::get(&list_url)
             .await
@@ -244,7 +286,7 @@ impl ScreencastSession {
             .await
             .map_err(|e| anyhow!("reading {list_url} body: {e}"))?;
 
-        let ws_url = pick_page_target(&body)
+        let ws_url = pick_page_for_session(&body, target_hint)
             .ok_or_else(|| anyhow!("no suitable page target found at {list_url}"))?;
 
         let (ws, _) = tokio_tungstenite::connect_async(&ws_url)
@@ -362,7 +404,9 @@ impl ScreencastSession {
 mod tests {
     use super::*;
 
-    // --- pick_page_target -------------------------------------------------
+    // --- pick_page_for_session: unhinted fallback (active page) -----------
+    // These lock the legacy `pick_page_target` behaviour, now reached with
+    // `target_hint = None` (the agent's current default-config path).
 
     #[test]
     fn pick_prefers_real_page_over_blank() {
@@ -371,7 +415,10 @@ mod tests {
             {"type":"page","url":"about:blank","webSocketDebuggerUrl":"ws://blank"},
             {"type":"page","url":"https://example.com/","webSocketDebuggerUrl":"ws://real"}
         ]"#;
-        assert_eq!(pick_page_target(json), Some("ws://real".to_string()));
+        assert_eq!(
+            pick_page_for_session(json, None),
+            Some("ws://real".to_string())
+        );
     }
 
     #[test]
@@ -380,7 +427,10 @@ mod tests {
             {"type":"page","url":"chrome://newtab/","webSocketDebuggerUrl":"ws://newtab"},
             {"type":"page","url":"data:text/html,<h1>hi</h1>","webSocketDebuggerUrl":"ws://data"}
         ]"#;
-        assert_eq!(pick_page_target(json), Some("ws://data".to_string()));
+        assert_eq!(
+            pick_page_for_session(json, None),
+            Some("ws://data".to_string())
+        );
     }
 
     #[test]
@@ -390,7 +440,10 @@ mod tests {
             {"type":"page","url":"about:blank","webSocketDebuggerUrl":"ws://first"},
             {"type":"page","url":"chrome://gpu","webSocketDebuggerUrl":"ws://second"}
         ]"#;
-        assert_eq!(pick_page_target(json), Some("ws://first".to_string()));
+        assert_eq!(
+            pick_page_for_session(json, None),
+            Some("ws://first".to_string())
+        );
     }
 
     #[test]
@@ -399,15 +452,17 @@ mod tests {
             {"type":"background_page","url":"chrome-extension://x","webSocketDebuggerUrl":"ws://bg"},
             {"type":"service_worker","url":"y","webSocketDebuggerUrl":"ws://sw"}
         ]"#;
-        assert_eq!(pick_page_target(json), None);
+        assert_eq!(pick_page_for_session(json, None), None);
     }
 
     #[test]
     fn pick_none_on_garbage() {
-        assert_eq!(pick_page_target("not json at all"), None);
-        assert_eq!(pick_page_target("{}"), None);
-        assert_eq!(pick_page_target("42"), None);
-        assert_eq!(pick_page_target(""), None);
+        assert_eq!(pick_page_for_session("not json at all", None), None);
+        assert_eq!(pick_page_for_session("{}", None), None);
+        assert_eq!(pick_page_for_session("42", None), None);
+        assert_eq!(pick_page_for_session("", None), None);
+        // Garbage is None regardless of a hint, too.
+        assert_eq!(pick_page_for_session("not json", Some("T1")), None);
     }
 
     #[test]
@@ -416,7 +471,58 @@ mod tests {
             {"type":"page","url":"https://a.com/"},
             {"type":"page","url":"https://b.com/","webSocketDebuggerUrl":"ws://b"}
         ]"#;
-        assert_eq!(pick_page_target(json), Some("ws://b".to_string()));
+        assert_eq!(pick_page_for_session(json, None), Some("ws://b".to_string()));
+    }
+
+    // --- pick_page_for_session: hinted (per-session target id) ------------
+
+    #[test]
+    fn pick_hint_matches_that_target() {
+        // Two real pages; the hint must select its own, not the "active" first.
+        let json = r#"[
+            {"type":"page","id":"T_A","url":"https://a.com/","webSocketDebuggerUrl":"ws://a"},
+            {"type":"page","id":"T_B","url":"https://b.com/","webSocketDebuggerUrl":"ws://b"}
+        ]"#;
+        assert_eq!(
+            pick_page_for_session(json, Some("T_B")),
+            Some("ws://b".to_string())
+        );
+        assert_eq!(
+            pick_page_for_session(json, Some("T_A")),
+            Some("ws://a".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_hint_no_match_fails_closed() {
+        // A hint that matches nothing returns None — it must NOT fall back to
+        // the active page (that would hand a hinted viewer a different
+        // session's tab — the exact leak per-session targeting closes).
+        let json = r#"[
+            {"type":"page","id":"T_A","url":"https://a.com/","webSocketDebuggerUrl":"ws://a"}
+        ]"#;
+        assert_eq!(pick_page_for_session(json, Some("T_MISSING")), None);
+    }
+
+    #[test]
+    fn pick_hint_ignores_non_page_with_matching_id() {
+        // A non-page target carrying the same id must not be selected.
+        let json = r#"[
+            {"type":"iframe","id":"T_X","url":"https://x/","webSocketDebuggerUrl":"ws://iframe"},
+            {"type":"page","id":"T_X","url":"https://x/","webSocketDebuggerUrl":"ws://page"}
+        ]"#;
+        assert_eq!(
+            pick_page_for_session(json, Some("T_X")),
+            Some("ws://page".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_hint_matched_page_without_ws_is_none() {
+        let json = r#"[
+            {"type":"page","id":"T_A","url":"https://a.com/"}
+        ]"#;
+        assert_eq!(pick_page_for_session(json, Some("T_A")), None);
     }
 
     // --- CDP command builders --------------------------------------------
@@ -650,7 +756,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(800)).await;
 
         let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(8);
-        let session = ScreencastSession::start(&cdp, frame_tx)
+        let session = ScreencastSession::start(&cdp, None, frame_tx)
             .await
             .expect("screencast should start");
 
@@ -679,5 +785,174 @@ mod tests {
 
         session.stop().await;
         drop(mgr);
+    }
+
+    /// P4 Task 1 per-session page targeting — real Chrome + TWO playwright-mcp
+    /// (`--isolated`, distinct contexts per the page-mapping investigation).
+    ///
+    /// Two "sessions" each navigate to a distinct `data:` URL with a unique
+    /// marker. We learn each session's page **target id** by matching its marker
+    /// in `GET /json`, record it as the session's page hint, and assert that
+    /// [`pick_page_for_session`] with session A's hint selects A's page (and B's
+    /// hint selects B's) — i.e. the screencast would target THE RIGHT page, not
+    /// "the active page". We also drive a CDP `Page.captureScreenshot`-free
+    /// check by re-reading `/json` titles to confirm the chosen ws belongs to the
+    /// marker we expect. Proves the targeting logic end-to-end against the real
+    /// browser; the cross-session isolation here is the `--isolated` path that
+    /// actually closes the P2 leak.
+    ///
+    /// Run manually:
+    /// `cargo test -p cloudcode-agent per_session_page_targeting -- --ignored --nocapture`
+    /// Prereqs: real Chrome + `node`/`npx` on PATH (no internet; data: URLs).
+    #[tokio::test]
+    #[ignore = "requires real Chrome + npx playwright-mcp; run manually"]
+    async fn per_session_page_targeting_picks_the_owning_sessions_page() {
+        use crate::browser::chrome::ChromeManager;
+        use crate::browser::mcp_endpoint::{handle_post, EndpointState, PostOutcome};
+        use crate::config::BrowserConfig;
+        use serde_json::Value;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use uuid::Uuid;
+
+        // --- Real resident Chrome. ---
+        let cdp_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        // `--isolated` so each playwright-mcp owns a distinct context/target
+        // (the only mode in which per-session correlation is possible — see the
+        // P4 page-mapping notes). We drive the endpoint with an explicit
+        // mcp_command carrying the flag.
+        let cfg = BrowserConfig {
+            enabled: true,
+            chrome_path: None,
+            cdp_port,
+            mcp_port: 0,
+            mcp_command: None,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let chrome = Arc::new(ChromeManager::new(cfg.clone(), tmp.path()));
+        chrome.start().await.expect("Chrome should start");
+        let cdp = chrome.cdp_http_url();
+
+        let isolated_cmd = format!(
+            "npx -y @playwright/mcp@0.0.76 --cdp-endpoint {cdp} --isolated"
+        );
+        let cfg_iso = BrowserConfig {
+            mcp_command: Some(isolated_cmd),
+            ..cfg.clone()
+        };
+        let state = EndpointState::new(Arc::clone(&chrome), cfg_iso);
+
+        // --- Two sessions, A and B. ---
+        let sid_a = Uuid::new_v4();
+        let sid_b = Uuid::new_v4();
+        state.register("tok-a".into(), sid_a);
+        state.register("tok-b".into(), sid_b);
+
+        let marker_a = "P4MARKER_AAA";
+        let marker_b = "P4MARKER_BBB";
+
+        async fn drive(state: &EndpointState, token: &str, marker: &str) {
+            let init = format!(
+                r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-06-18","capabilities":{{}},"clientInfo":{{"name":"p4","version":"0"}}}}}}"#
+            );
+            assert!(matches!(
+                handle_post(token, init, state).await,
+                PostOutcome::Response(_)
+            ));
+            let _ = handle_post(
+                token,
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string(),
+                state,
+            )
+            .await;
+            let nav = format!(
+                r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"browser_navigate","arguments":{{"url":"data:text/html,<title>{marker}</title><h1>{marker}</h1>"}}}}}}"#
+            );
+            match handle_post(token, nav, state).await {
+                PostOutcome::Response(b) => {
+                    assert!(!b.contains("\"error\""), "navigate failed: {b}")
+                }
+                PostOutcome::Accepted => panic!("navigate should return a response"),
+            }
+        }
+
+        drive(&state, "tok-a", marker_a).await;
+        drive(&state, "tok-b", marker_b).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        // --- Learn each session's page target id from /json (match by marker in
+        //     the page url), and record it as the session's hint. ---
+        let body = reqwest::get(format!("{cdp}/json"))
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let arr: Vec<Value> = serde_json::from_str(&body).unwrap();
+        let id_for = |marker: &str| -> String {
+            arr.iter()
+                .find(|t| {
+                    t.get("type").and_then(Value::as_str) == Some("page")
+                        && t.get("url")
+                            .and_then(Value::as_str)
+                            .map(|u| u.contains(marker))
+                            .unwrap_or(false)
+                })
+                .and_then(|t| t.get("id").and_then(Value::as_str))
+                .unwrap_or_else(|| panic!("no page target carrying {marker}: {body}"))
+                .to_string()
+        };
+        let target_a = id_for(marker_a);
+        let target_b = id_for(marker_b);
+        assert_ne!(
+            target_a, target_b,
+            "--isolated must give A and B distinct page targets; got the same id ({target_a})"
+        );
+        state.record_page_hint(sid_a, target_a.clone());
+        state.record_page_hint(sid_b, target_b.clone());
+
+        // --- The actual assertion: picking with A's hint selects A's page ws,
+        //     with B's hint selects B's — and they differ. ---
+        let hint_a = state.page_hint_for(sid_a);
+        let hint_b = state.page_hint_for(sid_b);
+        let ws_a = pick_page_for_session(&body, hint_a.as_deref())
+            .expect("A's hint should resolve to A's page ws");
+        let ws_b = pick_page_for_session(&body, hint_b.as_deref())
+            .expect("B's hint should resolve to B's page ws");
+        assert_ne!(ws_a, ws_b, "A and B must screencast DIFFERENT pages");
+
+        // Confirm each chosen ws belongs to the expected marker by joining back
+        // through /json: the entry whose webSocketDebuggerUrl == ws_a must carry
+        // marker_a in its url, and likewise for B.
+        let url_of_ws = |ws: &str| -> String {
+            arr.iter()
+                .find(|t| t.get("webSocketDebuggerUrl").and_then(Value::as_str) == Some(ws))
+                .and_then(|t| t.get("url").and_then(Value::as_str))
+                .unwrap_or("")
+                .to_string()
+        };
+        assert!(
+            url_of_ws(&ws_a).contains(marker_a),
+            "A's chosen ws must be A's page (url={})",
+            url_of_ws(&ws_a)
+        );
+        assert!(
+            url_of_ws(&ws_b).contains(marker_b),
+            "B's chosen ws must be B's page (url={})",
+            url_of_ws(&ws_b)
+        );
+        eprintln!(
+            "per-session targeting OK: A→{} (target {target_a}), B→{} (target {target_b})",
+            url_of_ws(&ws_a),
+            url_of_ws(&ws_b)
+        );
+
+        state.end_session(sid_a);
+        state.end_session(sid_b);
+        drop(state);
+        drop(chrome);
     }
 }

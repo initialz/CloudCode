@@ -72,6 +72,21 @@ pub struct EndpointState {
     pending: Arc<DashMap<PendingKey, oneshot::Sender<String>>>,
     /// Live per-session playwright-mcp subprocesses, lazily started.
     sessions: Arc<DashMap<Uuid, SessionBrowser>>,
+    /// Per-session page hint for the viewer screencast (P4 Task 1): the CDP
+    /// page **target id** (the `id` field of a `GET /json` entry) of the page
+    /// belonging to this session's playwright-mcp. ViewerManager consults it via
+    /// [`page_hint_for`](Self::page_hint_for) to screencast THAT session's page
+    /// instead of "the active page" (closing the P2 cross-page leak).
+    ///
+    /// EMPTY by default: in the agent's current (non-`--isolated`)
+    /// playwright-mcp config every session shares one browser context and one
+    /// set of tabs, so there is no distinct per-session target to record and the
+    /// viewer falls back to the active page (documented residual risk; see
+    /// `docs/superpowers/plans/2026-06-10-p4-page-mapping-notes.md`). The map +
+    /// [`record_page_hint`](Self::record_page_hint) are the plumbing that makes
+    /// per-session targeting real the moment the stack runs `--isolated` (each
+    /// session then owns a distinct context/target).
+    page_hints: Arc<DashMap<Uuid, String>>,
     /// Resident Chrome handle: used to build the `--cdp-endpoint` URL the
     /// subprocess attaches to, and to consult readiness before first spawn.
     chrome: Arc<ChromeManager>,
@@ -85,6 +100,7 @@ impl EndpointState {
             routes: Arc::new(DashMap::new()),
             pending: Arc::new(DashMap::new()),
             sessions: Arc::new(DashMap::new()),
+            page_hints: Arc::new(DashMap::new()),
             chrome,
             cfg,
         }
@@ -138,7 +154,29 @@ impl EndpointState {
             // Drop aborts the pump → McpProcess drops → kill_on_drop.
             tracing::debug!(%session_id, "ended browser session subprocess");
         }
+        // Forget the screencast page hint so a later session reusing this id
+        // (or a stale viewer attach) can't target a now-dead target.
+        self.page_hints.remove(&session_id);
         self.fail_pending(session_id, "browser session ended");
+    }
+
+    /// Record the CDP page **target id** screencasts should use for this
+    /// session (P4 Task 1). Called when the agent can attribute a specific page
+    /// target to a session — i.e. when playwright-mcp runs `--isolated` and each
+    /// session owns a distinct context/target (see the P4 page-mapping notes).
+    /// In the current default config no distinct target exists, so this is not
+    /// called and [`page_hint_for`](Self::page_hint_for) returns `None`.
+    pub fn record_page_hint(&self, session_id: Uuid, target_id: String) {
+        self.page_hints.insert(session_id, target_id);
+    }
+
+    /// The screencast page target hint for `session_id`, if known. ViewerManager
+    /// passes this into [`pick_page_for_session`] so a viewer sees THAT session's
+    /// page. `None` (the default-config case) means fall back to the active page.
+    ///
+    /// [`pick_page_for_session`]: crate::browser::screencast::pick_page_for_session
+    pub fn page_hint_for(&self, session_id: Uuid) -> Option<String> {
+        self.page_hints.get(&session_id).map(|r| r.value().clone())
     }
 
     /// Resolve the pending request matching this response frame's id. Called
@@ -981,6 +1019,29 @@ mod tests {
         assert_eq!(st.session_for("tok-b"), Some(sid));
         st.unregister("tok-b");
         assert_eq!(st.session_for("tok-b"), None);
+    }
+
+    #[test]
+    fn page_hint_absent_by_default_then_recorded_then_cleared() {
+        // P4 Task 1: the screencast page hint is None until recorded (the
+        // default-config case), readable once recorded, and cleared on
+        // end_session so a reused id can't target a dead page.
+        let st = state_with_cmd(None);
+        let sid = Uuid::new_v4();
+        assert_eq!(st.page_hint_for(sid), None, "no hint before recording");
+
+        st.record_page_hint(sid, "TARGET_ABC".to_string());
+        assert_eq!(st.page_hint_for(sid), Some("TARGET_ABC".to_string()));
+
+        // Re-record overwrites (session navigated to a new target).
+        st.record_page_hint(sid, "TARGET_XYZ".to_string());
+        assert_eq!(st.page_hint_for(sid), Some("TARGET_XYZ".to_string()));
+
+        st.end_session(sid);
+        assert_eq!(st.page_hint_for(sid), None, "hint cleared on end_session");
+
+        // Unknown session is always None.
+        assert_eq!(st.page_hint_for(Uuid::new_v4()), None);
     }
 
     #[test]

@@ -15,10 +15,16 @@
 //! that connection's `OutFrame` sender and dropped when the connection ends,
 //! which stops every in-flight screencast (no cross-reconnect leaks).
 //!
-//! P2 ignores `session_id` for page selection (single active-page screencast,
-//! per the plan); it's carried through for the P4 per-session page mapping.
+//! P4 Task 1 wires `session_id` into page selection: `attach` resolves a
+//! per-session page hint from the [`EndpointState`] (the mcp endpoint that owns
+//! each session's playwright-mcp) and screencasts THAT session's page. When no
+//! hint is known — the agent's current default playwright-mcp config shares one
+//! browser context across sessions, so there is no distinct per-session target —
+//! it falls back to the active page (documented residual risk; see
+//! `docs/superpowers/plans/2026-06-10-p4-page-mapping-notes.md`).
 
 use crate::browser::chrome::ChromeManager;
+use crate::browser::mcp_endpoint::EndpointState;
 use crate::browser::screencast::ScreencastSession;
 use crate::pty::OutFrame;
 use crate::tunnel::{pack_pty_frame, ClientMsg, ViewerInputEvent, TAG_SCREENCAST_FRAME};
@@ -35,15 +41,20 @@ const FRAME_QUEUE: usize = 8;
 /// One hub connection's set of live screencasts, keyed by `viewer_session_id`.
 pub struct ViewerManager {
     chrome: Arc<ChromeManager>,
+    /// The mcp endpoint state, queried for each session's screencast page hint
+    /// (P4 Task 1). Shares Arc internals with the endpoint claude POSTs to, so a
+    /// hint recorded against a session is visible here.
+    mcp: EndpointState,
     /// The per-connection sender to the ws writer task (agent → hub).
     tx: mpsc::Sender<OutFrame>,
     sessions: DashMap<Uuid, ScreencastSession>,
 }
 
 impl ViewerManager {
-    pub fn new(chrome: Arc<ChromeManager>, tx: mpsc::Sender<OutFrame>) -> Self {
+    pub fn new(chrome: Arc<ChromeManager>, mcp: EndpointState, tx: mpsc::Sender<OutFrame>) -> Self {
         Self {
             chrome,
+            mcp,
             tx,
             sessions: DashMap::new(),
         }
@@ -54,7 +65,10 @@ impl ViewerManager {
     /// the viewer ws loop tears down promptly.
     ///
     /// `session_id` identifies the PTY/browser session the viewer asked to
-    /// watch; P2 screencasts the single active page and ignores it.
+    /// watch. We resolve that session's page target hint from the mcp endpoint
+    /// and screencast THAT page; if no hint is known (default config — sessions
+    /// share one browser context, so there is no distinct per-session target),
+    /// we fall back to the active page.
     pub async fn attach(&self, viewer_session_id: Uuid, session_id: Uuid) {
         // Replacing an existing attach for the same viewer: stop the old one.
         if let Some((_, old)) = self.sessions.remove(&viewer_session_id) {
@@ -62,9 +76,12 @@ impl ViewerManager {
         }
 
         let cdp_http_url = self.chrome.cdp_http_url();
+        // Per-session page hint (P4 Task 1). `None` → active-page fallback.
+        let hint = self.mcp.page_hint_for(session_id);
         let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE);
 
-        let session = match ScreencastSession::start(&cdp_http_url, frame_tx).await {
+        let session = match ScreencastSession::start(&cdp_http_url, hint.as_deref(), frame_tx).await
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -160,7 +177,7 @@ mod tests {
             mcp_command: None,
         };
         let tmp = tempfile::tempdir().unwrap();
-        let chrome = Arc::new(ChromeManager::new(cfg, tmp.path()));
+        let chrome = Arc::new(ChromeManager::new(cfg.clone(), tmp.path()));
         chrome
             .start()
             .await
@@ -183,10 +200,12 @@ mod tests {
         // Per-connection OutFrame channel — exactly what ws::run_once hands the
         // ViewerManager. The hub's viewer ws relay drains this same channel.
         let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(32);
-        let manager = ViewerManager::new(Arc::clone(&chrome), out_tx);
+        let mcp = EndpointState::new(Arc::clone(&chrome), cfg.clone());
+        let manager = ViewerManager::new(Arc::clone(&chrome), mcp, out_tx);
 
         let viewer_session_id = Uuid::new_v4();
-        let session_id = Uuid::new_v4(); // P2 ignores this for page selection
+        // No page hint recorded → active-page fallback (default config).
+        let session_id = Uuid::new_v4();
         manager.attach(viewer_session_id, session_id).await;
 
         // Drain OutFrames until the first Binary screencast frame (skip any

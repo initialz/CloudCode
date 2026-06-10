@@ -130,7 +130,11 @@ async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
     // Per-connection viewer manager: owns this connection's screencasts and
     // sends frames over `tx`. Dropped when `run_once` returns, which stops
     // every in-flight screencast — no screencast survives a reconnect.
-    let viewers = Arc::new(ViewerManager::new(state.chrome.clone(), tx.clone()));
+    let viewers = Arc::new(ViewerManager::new(
+        state.chrome.clone(),
+        state.mcp.clone(),
+        tx.clone(),
+    ));
 
     let read_result = read_loop(state.clone(), tx.clone(), viewers, &mut stream).await;
     // Abort the writer instead of awaiting it. read_loop spawns
