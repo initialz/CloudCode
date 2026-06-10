@@ -264,6 +264,19 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn session_opened_without_session_id_defaults_nil() {
+        // back-compat: an old hub that omits session_id must deserialize to nil.
+        let v: HubToClient = serde_json::from_value(json!({
+            "type": "session_opened", "agent": "a", "workspace": "w", "cwd": "/"
+        }))
+        .unwrap();
+        match v {
+            HubToClient::SessionOpened { session_id, .. } => assert!(session_id.is_nil()),
+            _ => panic!(),
+        }
+    }
+
     /// Helper: assert a value serializes to exactly `expected` JSON and
     /// round-trips back through deserialization (proving wire stability).
     fn assert_json<T>(value: &T, expected: serde_json::Value)

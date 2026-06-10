@@ -258,6 +258,18 @@ pub struct ScreencastSession {
     next_id: Arc<AtomicI64>,
 }
 
+impl Drop for ScreencastSession {
+    /// Abort the ws task on drop. Critical: dropping a `JoinHandle` only
+    /// DETACHES the task — without this, an abrupt agent↔hub disconnect (no
+    /// `ViewerDetach` delivered, so `stop()` never runs) would leak a CDP
+    /// screencast that keeps JPEG-encoding against Chrome until the page or
+    /// the agent process dies. With this, dropping ViewerManager on a
+    /// reconnect truly stops every in-flight screencast.
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 impl ScreencastSession {
     /// Connect to the page target behind `cdp_http_url`, start a JPEG
     /// screencast, and stream decoded frames to `frame_tx`.
