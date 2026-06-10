@@ -171,6 +171,13 @@ async fn relay_loop(
     );
     let mut gate = auth_gate::AuthGate::new(idle_timeout);
 
+    // In-flight request tracking (M3): id key → method, recorded when an
+    // inbound frame is fed to the subprocess and removed when its
+    // response comes back on `browser_out_rx`. Serves the tools/list
+    // response rewrite (request_handoff injection) — the response itself
+    // carries no method, so we correlate by id.
+    let mut inflight: HashMap<String, String> = HashMap::new();
+
     loop {
         tokio::select! {
             chunk = bytes.recv() => {
@@ -299,11 +306,36 @@ async fn relay_loop(
                             // clean JSON-RPC error instead of waiting
                             // out the endpoint timeout.
                             browser = None;
+                            inflight.clear();
                             let _ = wire.out_tx
                                 .send(OutFrame::Text(ClientToHub::BrowserClosed {
                                     reason: Some("denied by user".to_string()),
                                 }))
                                 .await;
+                        } else if is_handoff_call(&payload) {
+                            // request_handoff is served by the CLIENT
+                            // itself, never by playwright-mcp — intercept
+                            // AFTER the gate (it's a tools/call, so the
+                            // consent gate above already vetted it) and
+                            // INSTEAD of feeding the subprocess. Not
+                            // tracked in `inflight`: no subprocess
+                            // response will ever correlate to this id.
+                            //
+                            // Placeholder until M3 Task 3 wires the real
+                            // headed-switch flow: answer immediately with
+                            // a client-originated JSON-RPC error.
+                            if let Some(id) = extract_id_key(&payload) {
+                                let resp = jsonrpc_client_error(
+                                    &id,
+                                    -32004,
+                                    "handoff flow not yet wired (M3 T3)",
+                                );
+                                let _ = wire.out_tx
+                                    .send(OutFrame::Text(ClientToHub::BrowserRpc {
+                                        payload: resp,
+                                    }))
+                                    .await;
+                            }
                         } else {
                             if browser.is_none() {
                                 if let Some((prog, args)) = mcp_cmd.clone() {
@@ -319,20 +351,34 @@ async fn relay_loop(
                                     }
                                 }
                             }
+                            // Record id → method before feeding (feed
+                            // consumes the payload); only keep the entry
+                            // if the feed actually succeeded.
+                            let inflight_entry = match (
+                                extract_id_key(&payload),
+                                extract_method(&payload),
+                            ) {
+                                (Some(id), Some(method)) => Some((id, method)),
+                                _ => None, // notification or response: nothing to correlate
+                            };
                             if let Some(ch) = browser.as_ref() {
                                 if ch.feed(payload).is_err() {
                                     browser = None;
+                                    inflight.clear();
                                     let _ = wire.out_tx
                                         .send(OutFrame::Text(ClientToHub::BrowserClosed {
                                             reason: Some("browser subprocess unavailable".to_string()),
                                         }))
                                         .await;
+                                } else if let Some((id, method)) = inflight_entry {
+                                    inflight.insert(id, method);
                                 }
                             }
                         }
                     }
                     HubToClient::BrowserClosed { .. } => {
                         browser = None; // drop -> kill_on_drop reaps subprocess
+                        inflight.clear(); // no responses will arrive for these
                     }
                     _ => {}
                 }
@@ -343,6 +389,16 @@ async fn relay_loop(
                 // dropped instead of being sent after BrowserClosed.
                 if let Some(payload) = out {
                     if browser.is_some() {
+                        // Correlate the response to its request method via
+                        // `inflight`; a tools/list reply gains the
+                        // client-side request_handoff tool before claude
+                        // sees it. Anything else forwards unchanged.
+                        let payload = match extract_id_key(&payload)
+                            .and_then(|id| inflight.remove(&id))
+                        {
+                            Some(m) if m == "tools/list" => inject_handoff_tool(payload),
+                            _ => payload,
+                        };
                         let _ = wire.out_tx
                             .send(OutFrame::Text(ClientToHub::BrowserRpc { payload }))
                             .await;
@@ -429,6 +485,74 @@ fn method_is_passive(payload: &str) -> bool {
             _ => false,
         },
     }
+}
+
+/// JSON-RPC id as a canonical string key ("1", "\"abc\""), None for
+/// notifications/unparseable. Mirrors the agent's extract_id_key
+/// (mcp_endpoint.rs) so both ends correlate frames identically.
+fn extract_id_key(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    match v.get("id") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(id) => Some(id.to_string()), // numbers -> "1", strings -> "\"abc\""
+    }
+}
+
+/// JSON-RPC method name; None for responses (no method) or unparseable
+/// bodies.
+fn extract_method(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    Some(v.get("method")?.as_str()?.to_string())
+}
+
+/// True if this inbound frame is a tools/call for our client-side
+/// request_handoff tool (handled locally, never fed to playwright-mcp).
+fn is_handoff_call(body: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    v.get("method").and_then(|m| m.as_str()) == Some("tools/call")
+        && v.get("params")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str())
+            == Some("request_handoff")
+}
+
+/// Append the client-side request_handoff tool to a tools/list response.
+/// On any parse failure returns the input unchanged (defensive).
+///
+/// NOTE: this re-serializes claude-bound JSON, so key order may differ
+/// from the subprocess's original bytes. Acceptable here because the
+/// client IS the endpoint of this rewrite — we author the modified
+/// response; it is not opaque transit we must preserve byte-for-byte.
+fn inject_handoff_tool(response: String) -> String {
+    let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&response) else {
+        return response;
+    };
+    let Some(tools) = v
+        .get_mut("result")
+        .and_then(|r| r.get_mut("tools"))
+        .and_then(|t| t.as_array_mut())
+    else {
+        return response;
+    };
+    tools.push(serde_json::json!({
+        "name": "request_handoff",
+        "description": "Hand the browser to the human user (visible window) for login/CAPTCHA or anything requiring manual action. The browser restarts headed; in-page state is lost but cookies/logins persist. After the human finishes, the browser returns headless and you should re-navigate to continue.",
+        "inputSchema": {"type":"object","properties":{"reason":{"type":"string","description":"Why the human is needed (shown to them)"}},"required":["reason"]}
+    }));
+    serde_json::to_string(&v).unwrap_or(response)
+}
+
+/// Build a JSON-RPC response/error originating from the client itself
+/// (the client is the server for the request_handoff tool). `id_raw` is
+/// the raw id string as captured by extract_id_key, e.g. "1" or
+/// "\"abc\"" — spliced verbatim into the frame.
+fn jsonrpc_client_error(id_raw: &str, code: i64, message: &str) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":{id_raw},"error":{{"code":{code},"message":{msg}}}}}"#,
+        msg = serde_json::to_string(message).unwrap_or_else(|_| "\"error\"".to_string())
+    )
 }
 
 /// What a stdin chunk means for the consent prompt.
@@ -685,7 +809,10 @@ async fn winch_tick(_: &mut WinchHandle) -> Option<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{method_is_passive, scan_consent_chunk, ConsentScan};
+    use super::{
+        extract_id_key, extract_method, inject_handoff_tool, is_handoff_call,
+        jsonrpc_client_error, method_is_passive, scan_consent_chunk, ConsentScan,
+    };
 
     #[test]
     fn handshake_and_metadata_methods_are_passive() {
@@ -783,5 +910,122 @@ mod tests {
     #[test]
     fn short_plain_chunk_without_answer_key_is_ignored() {
         assert_eq!(scan(b"ab"), ConsentScan::Ignore);
+    }
+
+    // ---- extract_id_key ----
+
+    #[test]
+    fn id_key_number_and_string() {
+        assert_eq!(
+            extract_id_key(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#),
+            Some("1".to_string())
+        );
+        assert_eq!(
+            extract_id_key(r#"{"jsonrpc":"2.0","id":"abc","result":{}}"#),
+            Some("\"abc\"".to_string())
+        );
+    }
+
+    #[test]
+    fn id_key_none_for_notifications_null_and_garbage() {
+        // Notification: no id field.
+        assert_eq!(
+            extract_id_key(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#),
+            None
+        );
+        // Explicit null id is a notification per JSON-RPC conventions.
+        assert_eq!(extract_id_key(r#"{"jsonrpc":"2.0","id":null}"#), None);
+        assert_eq!(extract_id_key("not json"), None);
+        assert_eq!(extract_id_key(""), None);
+    }
+
+    // ---- extract_method ----
+
+    #[test]
+    fn method_extraction() {
+        assert_eq!(
+            extract_method(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#),
+            Some("tools/list".to_string())
+        );
+        // Response: no method.
+        assert_eq!(extract_method(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#), None);
+        // Non-string method / garbage.
+        assert_eq!(extract_method(r#"{"jsonrpc":"2.0","id":1,"method":42}"#), None);
+        assert_eq!(extract_method("nope"), None);
+    }
+
+    // ---- inject_handoff_tool ----
+
+    #[test]
+    fn inject_appends_handoff_and_preserves_existing_tools() {
+        let resp = r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"browser_navigate","description":"go","inputSchema":{"type":"object"}}]}}"#;
+        let out = inject_handoff_tool(resp.to_string());
+        let v: serde_json::Value = serde_json::from_str(&out).expect("output stays valid JSON");
+        let tools = v["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], "browser_navigate"); // existing tool preserved
+        assert_eq!(tools[1]["name"], "request_handoff");
+        assert_eq!(tools[1]["inputSchema"]["required"][0], "reason");
+        assert!(tools[1]["description"].as_str().unwrap().contains("cookies/logins persist"));
+        // Envelope intact.
+        assert_eq!(v["id"], 2);
+        assert_eq!(v["jsonrpc"], "2.0");
+    }
+
+    #[test]
+    fn inject_leaves_non_tools_list_json_unchanged() {
+        // Valid JSON but no result.tools array — e.g. an error response
+        // or a tools/call result.
+        let err = r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"nope"}}"#;
+        assert_eq!(inject_handoff_tool(err.to_string()), err);
+        let call_result = r#"{"jsonrpc":"2.0","id":4,"result":{"content":[]}}"#;
+        assert_eq!(inject_handoff_tool(call_result.to_string()), call_result);
+    }
+
+    #[test]
+    fn inject_leaves_garbage_unchanged() {
+        assert_eq!(inject_handoff_tool("not json".to_string()), "not json");
+        assert_eq!(inject_handoff_tool(String::new()), "");
+    }
+
+    // ---- is_handoff_call ----
+
+    #[test]
+    fn handoff_call_detected() {
+        assert!(is_handoff_call(
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"request_handoff","arguments":{"reason":"login needed"}}}"#
+        ));
+    }
+
+    #[test]
+    fn other_frames_are_not_handoff_calls() {
+        // tools/call for a different tool.
+        assert!(!is_handoff_call(
+            r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"browser_navigate"}}"#
+        ));
+        // Non-tools/call method, even if params.name matches.
+        assert!(!is_handoff_call(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/list","params":{"name":"request_handoff"}}"#
+        ));
+        // Garbage.
+        assert!(!is_handoff_call("not json"));
+        assert!(!is_handoff_call(""));
+    }
+
+    // ---- jsonrpc_client_error ----
+
+    #[test]
+    fn client_error_shape() {
+        let frame = jsonrpc_client_error("5", -32004, "handoff flow not yet wired (M3 T3)");
+        let v: serde_json::Value = serde_json::from_str(&frame).expect("valid JSON");
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 5);
+        assert_eq!(v["error"]["code"], -32004);
+        assert_eq!(v["error"]["message"], "handoff flow not yet wired (M3 T3)");
+
+        // String id splices verbatim (id_raw carries its own quotes).
+        let frame = jsonrpc_client_error("\"abc\"", -32003, "user declined");
+        let v: serde_json::Value = serde_json::from_str(&frame).expect("valid JSON");
+        assert_eq!(v["id"], "abc");
     }
 }
