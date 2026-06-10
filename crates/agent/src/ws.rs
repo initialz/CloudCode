@@ -99,6 +99,11 @@ async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
 
     let (tx, mut rx) = mpsc::channel::<OutFrame>(SEND_QUEUE);
 
+    // Arm the MCP endpoint so handle_post can emit BrowserRpc frames
+    // toward the hub on this live connection. Re-armed on every
+    // reconnect with the fresh sender.
+    state.mcp.set_hub_sender(tx.clone()).await;
+
     // Hand the live sender to the agent-level audit task. Cleared on
     // any return from this function so audit pauses (rather than
     // silently dropping events) until reconnect re-arms the slot.
@@ -179,6 +184,17 @@ where
                 }
                 Ok(ServerMsg::Rejected { reason }) => {
                     return Err(classify_reject(reason));
+                }
+                // MCP relay response from the bound client's subprocess.
+                // Correlate it to the blocked claude POST by JSON-RPC id
+                // and hand back the opaque payload. Intercepted here so it
+                // never reaches PtyManager::handle (which keeps a no-op
+                // arm only for match exhaustiveness).
+                Ok(ServerMsg::BrowserRpc {
+                    session_id,
+                    payload,
+                }) => {
+                    state.mcp.resolve_response(session_id, payload);
                 }
                 Ok(ServerMsg::UpdateAgent {
                     request_id,

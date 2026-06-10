@@ -1,26 +1,41 @@
-//! Resident localhost MCP HTTP/SSE endpoint. claude (the MCP client)
+//! Resident localhost MCP HTTP endpoint. claude (the MCP client)
 //! connects here; frames are tunneled to the bound CloudCode client
 //! over the existing agent<->hub ws as BrowserRpc.
+//!
+//! Transport: Streamable HTTP with POST-blocking. claude POSTs a
+//! JSON-RPC request; the endpoint forwards it to the bound client over
+//! the hub, BLOCKS until the matching response comes back (correlated
+//! by JSON-RPC `id`), then returns that response as the POST response
+//! body. JSON-RPC notifications (no `id`) are forwarded and get an
+//! immediate 202 with no body.
+//!
+//! The endpoint is a DUMB RELAY — it does NOT implement MCP semantics
+//! (initialize handshake, tool schemas, etc.). Those flow end-to-end
+//! between claude and the client's subprocess. The endpoint only:
+//! routes by token→session_id, correlates request/response by JSON-RPC
+//! `id`, and tunnels opaque JSON text.
 
 use dashmap::DashMap;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot, RwLock};
 use uuid::Uuid;
 
-/// Per-session routing: maps a claude-facing token to its session_id
-/// and the channel that delivers subprocess responses back to claude.
-#[allow(dead_code)]
-pub struct SessionRoute {
-    pub session_id: Uuid,
-    pub to_claude: mpsc::Sender<String>,
-}
+use crate::pty::OutFrame;
+use crate::tunnel::ClientMsg;
+
+/// Key correlating an in-flight claude request to its eventual response:
+/// (session_id, json-rpc id rendered canonically).
+type PendingKey = (Uuid, String);
 
 #[derive(Clone)]
 pub struct EndpointState {
-    routes: Arc<DashMap<String, SessionRoute>>,
-    /// Set once the agent ws is up: lets the endpoint emit ClientMsg
-    /// frames toward the hub.
-    to_hub: Arc<tokio::sync::RwLock<Option<mpsc::Sender<crate::pty::OutFrame>>>>,
+    /// claude-facing token -> session_id.
+    routes: Arc<DashMap<String, Uuid>>,
+    /// In-flight POST requests awaiting their response, by (session, id).
+    pending: Arc<DashMap<PendingKey, oneshot::Sender<String>>>,
+    /// Set once the agent ws is up: lets the endpoint emit frames to the hub.
+    to_hub: Arc<RwLock<Option<mpsc::Sender<OutFrame>>>>,
 }
 
 impl Default for EndpointState {
@@ -33,14 +48,15 @@ impl EndpointState {
     pub fn new() -> Self {
         Self {
             routes: Arc::new(DashMap::new()),
-            to_hub: Arc::new(tokio::sync::RwLock::new(None)),
+            pending: Arc::new(DashMap::new()),
+            to_hub: Arc::new(RwLock::new(None)),
         }
     }
 
+    /// Reserve a session route for a claude token (used at session open, Task 11).
     #[allow(dead_code)]
-    pub fn register(&self, token: String, session_id: Uuid, to_claude: mpsc::Sender<String>) {
-        self.routes
-            .insert(token, SessionRoute { session_id, to_claude });
+    pub fn register(&self, token: String, session_id: Uuid) {
+        self.routes.insert(token, session_id);
     }
 
     #[allow(dead_code)]
@@ -48,47 +64,126 @@ impl EndpointState {
         self.routes.remove(token);
     }
 
-    #[allow(dead_code)]
     pub fn session_for(&self, token: &str) -> Option<Uuid> {
-        self.routes.get(token).map(|r| r.session_id)
+        self.routes.get(token).map(|r| *r.value())
     }
 
-    /// Deliver a response frame (from hub/client) to claude's stream for
-    /// the given session_id. Returns false if no live route.
-    #[allow(dead_code)]
-    pub async fn deliver_to_claude(&self, session_id: Uuid, payload: String) -> bool {
-        // Collect the sender first to avoid holding the DashMap guard across await.
-        let target = self
-            .routes
-            .iter()
-            .find(|e| e.session_id == session_id)
-            .map(|e| e.to_claude.clone());
-        if let Some(tx) = target {
-            return tx.send(payload).await.is_ok();
-        }
-        false
-    }
-
-    #[allow(dead_code)]
-    pub async fn set_hub_sender(&self, tx: mpsc::Sender<crate::pty::OutFrame>) {
+    pub async fn set_hub_sender(&self, tx: mpsc::Sender<OutFrame>) {
         *self.to_hub.write().await = Some(tx);
     }
 
-    #[allow(dead_code)]
-    pub async fn send_to_hub(&self, frame: crate::pty::OutFrame) {
+    async fn send_to_hub(&self, frame: OutFrame) {
         if let Some(tx) = self.to_hub.read().await.as_ref() {
             let _ = tx.send(frame).await;
         }
     }
+
+    /// Resolve the pending request matching this response frame's id.
+    /// Called from ws.rs when a ServerMsg::BrowserRpc arrives. Returns
+    /// true if it matched an in-flight request; false otherwise (e.g. a
+    /// server-initiated notification, which M1 drops).
+    pub fn resolve_response(&self, session_id: Uuid, payload: String) -> bool {
+        let Some(id) = extract_id_key(&payload) else {
+            return false;
+        };
+        if let Some((_, tx)) = self.pending.remove(&(session_id, id)) {
+            return tx.send(payload).is_ok();
+        }
+        false
+    }
 }
 
-/// Bind the localhost MCP listener. Real MCP routes are added in Task 10;
-/// for now only `/healthz` exists so we can verify the listener is up.
+/// Extract the JSON-RPC `id` from a frame as a canonical string key.
+/// Returns None for notifications (no id) or unparseable bodies.
+fn extract_id_key(body: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    match v.get("id") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(id) => Some(id.to_string()), // numbers -> "1", strings -> "\"abc\""
+    }
+}
+
+/// Outcome of a claude POST. Mapped to HTTP status in the axum handler.
+pub enum PostOutcome {
+    /// A JSON-RPC response body to return (application/json, 200).
+    Response(String),
+    /// Notification accepted, no body (202).
+    Accepted,
+    /// Token not recognized (400/404).
+    UnknownToken,
+    /// No response arrived in time (504).
+    Timeout,
+}
+
+/// Core POST handler, factored out for unit testing.
+pub async fn handle_post(token: &str, body: String, state: &EndpointState) -> PostOutcome {
+    let Some(session_id) = state.session_for(token) else {
+        return PostOutcome::UnknownToken;
+    };
+    match extract_id_key(&body) {
+        Some(id) => {
+            let (tx, rx) = oneshot::channel();
+            state.pending.insert((session_id, id.clone()), tx);
+            state
+                .send_to_hub(OutFrame::Text(ClientMsg::BrowserRpc {
+                    session_id,
+                    payload: body,
+                }))
+                .await;
+            match tokio::time::timeout(Duration::from_secs(30), rx).await {
+                Ok(Ok(resp)) => PostOutcome::Response(resp),
+                _ => {
+                    state.pending.remove(&(session_id, id));
+                    PostOutcome::Timeout
+                }
+            }
+        }
+        None => {
+            // Notification: forward, no response expected.
+            state
+                .send_to_hub(OutFrame::Text(ClientMsg::BrowserRpc {
+                    session_id,
+                    payload: body,
+                }))
+                .await;
+            PostOutcome::Accepted
+        }
+    }
+}
+
+/// Bind the localhost MCP listener. POST `/mcp/:token` is the
+/// POST-blocking JSON-RPC relay; GET on the same path is rejected
+/// (M1 does not support server-initiated SSE). `/healthz` stays so we
+/// can verify the listener is up.
 pub async fn serve(state: EndpointState, port: u16) -> std::io::Result<()> {
-    use axum::routing::get;
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing::{get, post};
+
     let app = axum::Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .route(
+            "/mcp/:token",
+            post(
+                |Path(token): Path<String>, State(st): State<EndpointState>, body: String| async move {
+                    match handle_post(&token, body, &st).await {
+                        PostOutcome::Response(b) => (
+                            [(axum::http::header::CONTENT_TYPE, "application/json")],
+                            b,
+                        )
+                            .into_response(),
+                        PostOutcome::Accepted => StatusCode::ACCEPTED.into_response(),
+                        PostOutcome::UnknownToken => StatusCode::NOT_FOUND.into_response(),
+                        PostOutcome::Timeout => StatusCode::GATEWAY_TIMEOUT.into_response(),
+                    }
+                },
+            )
+            // M1 does not support server-initiated SSE; reject GET cleanly.
+            .get(|| async { StatusCode::METHOD_NOT_ALLOWED }),
+        )
         .with_state(state);
+
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     axum::serve(listener, app)
         .await
@@ -100,14 +195,84 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn endpoint_state_registers_and_resolves_token() {
+    async fn unknown_token_is_rejected() {
+        let state = EndpointState::new();
+        let out = handle_post(
+            "nope",
+            r#"{"jsonrpc":"2.0","id":1,"method":"x"}"#.to_string(),
+            &state,
+        )
+        .await;
+        assert!(matches!(out, PostOutcome::UnknownToken));
+    }
+
+    #[tokio::test]
+    async fn notification_is_accepted_without_response() {
         let state = EndpointState::new();
         let sid = Uuid::new_v4();
-        let (tx, _rx) = mpsc::channel(4);
-        state.register("tok-abc".into(), sid, tx);
-        assert_eq!(state.session_for("tok-abc"), Some(sid));
-        assert_eq!(state.session_for("nope"), None);
-        state.unregister("tok-abc");
-        assert_eq!(state.session_for("tok-abc"), None);
+        state.register("t".into(), sid);
+        let (hub_tx, mut hub_rx) = mpsc::channel(4);
+        state.set_hub_sender(hub_tx).await;
+        // notification: no id
+        let out = handle_post(
+            "t",
+            r#"{"jsonrpc":"2.0","method":"notify"}"#.to_string(),
+            &state,
+        )
+        .await;
+        assert!(matches!(out, PostOutcome::Accepted));
+        // it was still forwarded to the hub
+        let f = hub_rx.recv().await.expect("forwarded");
+        match f {
+            OutFrame::Text(ClientMsg::BrowserRpc { session_id, .. }) => assert_eq!(session_id, sid),
+            _ => panic!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn request_blocks_then_resolves_on_matching_response() {
+        let state = EndpointState::new();
+        let sid = Uuid::new_v4();
+        state.register("t".into(), sid);
+        let (hub_tx, mut hub_rx) = mpsc::channel(4);
+        state.set_hub_sender(hub_tx).await;
+
+        let st2 = state.clone();
+        let poster = tokio::spawn(async move {
+            handle_post(
+                "t",
+                r#"{"jsonrpc":"2.0","id":42,"method":"tools/list"}"#.to_string(),
+                &st2,
+            )
+            .await
+        });
+
+        // the request was forwarded to the hub
+        let fwd = hub_rx.recv().await.expect("forwarded to hub");
+        match fwd {
+            OutFrame::Text(ClientMsg::BrowserRpc { session_id, .. }) => assert_eq!(session_id, sid),
+            _ => panic!(),
+        }
+
+        // simulate the response coming back from the client via ws
+        let resolved = state.resolve_response(
+            sid,
+            r#"{"jsonrpc":"2.0","id":42,"result":{"tools":[]}}"#.to_string(),
+        );
+        assert!(resolved);
+
+        let outcome = poster.await.unwrap();
+        match outcome {
+            PostOutcome::Response(b) => assert!(b.contains("\"id\":42") && b.contains("tools")),
+            _ => panic!("expected a Response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn id_key_distinguishes_number_and_string() {
+        assert_eq!(extract_id_key(r#"{"id":1}"#), Some("1".to_string()));
+        assert_eq!(extract_id_key(r#"{"id":"a"}"#), Some("\"a\"".to_string()));
+        assert_eq!(extract_id_key(r#"{"method":"x"}"#), None);
+        assert_eq!(extract_id_key(r#"{"id":null}"#), None);
     }
 }

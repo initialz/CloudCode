@@ -477,7 +477,9 @@ impl PtyManager {
                 }
             }
             ServerMsg::Welcome { .. } | ServerMsg::Rejected { .. } | ServerMsg::Ping => {}
-            ServerMsg::BrowserRpc { .. } => { /* routed in Task 10 */ }
+            // Intercepted earlier in ws.rs read_loop (resolve_response);
+            // this no-op arm exists only for match exhaustiveness.
+            ServerMsg::BrowserRpc { .. } => {}
         }
     }
 
