@@ -650,6 +650,15 @@ impl PtyManager {
                         .unwrap_or_else(|| Uuid::new_v4().simple().to_string())
                 })
                 .clone();
+            // Re-point: if this stable workspace token was previously bound to
+            // a different (now-stale) session_id, reap that session's browser
+            // subprocess before register() overwrites the route — otherwise the
+            // old playwright-mcp leaks until agent exit.
+            if let Some(old_sid) = self.mcp.session_for(&token) {
+                if old_sid != session_id {
+                    self.mcp.end_session(old_sid);
+                }
+            }
             self.mcp.register(token.clone(), session_id);
             let mcp_cfg = crate::browser::mcp_endpoint::mcp_config_json(self.mcp_port, &token);
             let mcp_cfg_path = cwd.join(".cloudcode").join("mcp-browser.json");
@@ -1031,6 +1040,10 @@ impl PtyManager {
         // Drop the handle; the reader thread will see read=0 and exit; tmux
         // session stays alive on the OS.
         self.sessions.remove(&session_id);
+        // Reap this session's browser subprocess (if any). The workspace token
+        // route is left intact (re-point on the next open handles it), but the
+        // dead session's playwright-mcp must not outlive the closed session.
+        self.mcp.end_session(session_id);
         let _ = tx
             .send(OutFrame::Text(ClientMsg::PtyClosed {
                 session_id,
@@ -1345,6 +1358,12 @@ impl PtyManager {
                         .workspace_tokens
                         .remove(&(account.clone(), name.clone()))
                     {
+                        // Reap a still-live session's subprocess before dropping
+                        // the route: unregister only clears token→session, not
+                        // the playwright-mcp the session may still own.
+                        if let Some(sid) = self.mcp.session_for(&tok) {
+                            self.mcp.end_session(sid);
+                        }
                         self.mcp.unregister(&tok);
                     }
                     // Wipe claude's per-project conversation history so
@@ -1406,6 +1425,12 @@ impl PtyManager {
                         .workspace_tokens
                         .remove(&(account.clone(), name.clone()))
                     {
+                        // Reap a still-live session's subprocess before dropping
+                        // the route: unregister only clears token→session, not
+                        // the playwright-mcp the session may still own.
+                        if let Some(sid) = self.mcp.session_for(&tok) {
+                            self.mcp.end_session(sid);
+                        }
                         self.mcp.unregister(&tok);
                     }
                     // Keep ~/.claude/projects/<encoded-cwd>/ intact so

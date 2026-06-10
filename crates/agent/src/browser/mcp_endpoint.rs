@@ -130,6 +130,17 @@ impl EndpointState {
         }
     }
 
+    /// Tear down a session's browser subprocess (if any) and fail its
+    /// in-flight requests. Idempotent. Called on claude session close,
+    /// token re-point, and workspace delete/reset.
+    pub fn end_session(&self, session_id: Uuid) {
+        if self.sessions.remove(&session_id).is_some() {
+            // Drop aborts the pump → McpProcess drops → kill_on_drop.
+            tracing::debug!(%session_id, "ended browser session subprocess");
+        }
+        self.fail_pending(session_id, "browser session ended");
+    }
+
     /// Resolve the pending request matching this response frame's id. Called
     /// from the per-session pump when a frame arrives from the subprocess.
     /// Returns true if it matched an in-flight request; false otherwise (e.g. a
@@ -751,6 +762,70 @@ mod tests {
         assert!(!state.pending.contains_key(&(sid_a, "1".to_string())));
         assert!(!state.pending.contains_key(&(sid_a, "2".to_string())));
         assert!(state.pending.contains_key(&(sid_b, "3".to_string())));
+    }
+
+    #[tokio::test]
+    async fn end_session_removes_subprocess_and_fails_pending() {
+        // With node available we can lazily start a real (echo-stub) subprocess
+        // for the session, then prove end_session removes the live entry AND
+        // fails an in-flight request. Without node we still cover the
+        // fail_pending half (no live entry to remove).
+        let cmd = which_node().then(|| format!("node {}", echo_stub()));
+        let state = state_with_cmd(cmd.clone());
+        let sid = Uuid::new_v4();
+        state.register("t".into(), sid);
+
+        if cmd.is_some() {
+            // Lazily start the subprocess by feeding a notification.
+            let out = handle_post(
+                "t",
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string(),
+                &state,
+            )
+            .await;
+            assert!(matches!(out, PostOutcome::Accepted));
+            assert!(
+                state.sessions.contains_key(&sid),
+                "subprocess should be live before end_session"
+            );
+        }
+
+        // An in-flight request for this session must be failed by end_session.
+        let (tx, rx) = oneshot::channel::<String>();
+        state.pending.insert((sid, "1".to_string()), tx);
+
+        state.end_session(sid);
+
+        // Session subprocess entry gone (Drop aborts pump → kill_on_drop).
+        assert!(
+            !state.sessions.contains_key(&sid),
+            "end_session must remove the live session entry"
+        );
+        // The pending request received a JSON-RPC error (fail_pending path).
+        let body = rx.await.expect("pending oneshot received an error frame");
+        assert!(body.contains("-32002"), "expected error code in: {body}");
+        assert!(
+            body.contains("browser session ended"),
+            "expected end-session reason in: {body}"
+        );
+        assert!(
+            !state.pending.contains_key(&(sid, "1".to_string())),
+            "end_session must drain the pending entry"
+        );
+        // Full subprocess-kill is also covered by the #[ignore]d full-stack
+        // integration test; here we assert the bookkeeping is consistent.
+    }
+
+    #[tokio::test]
+    async fn end_session_on_unknown_id_is_noop() {
+        // Idempotent / safe: ending a session that was never started must not
+        // panic and must leave state untouched.
+        let state = state_with_cmd(None);
+        let unknown = Uuid::new_v4();
+        state.end_session(unknown); // no panic
+        assert!(!state.sessions.contains_key(&unknown));
+        // Second call is equally harmless.
+        state.end_session(unknown);
     }
 
     #[test]
