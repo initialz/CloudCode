@@ -73,7 +73,11 @@ impl EndpointState {
     }
 
     async fn send_to_hub(&self, frame: OutFrame) {
-        if let Some(tx) = self.to_hub.read().await.as_ref() {
+        // Clone the sender out, then drop the read guard BEFORE awaiting the
+        // send — otherwise a concurrent reconnect taking the write lock in
+        // set_hub_sender could be blocked behind an in-flight send.
+        let tx = self.to_hub.read().await.as_ref().cloned();
+        if let Some(tx) = tx {
             let _ = tx.send(frame).await;
         }
     }
