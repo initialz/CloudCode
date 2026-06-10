@@ -1,5 +1,5 @@
-//! Manages a local MCP-over-stdio subprocess (M1: an echo stub;
-//! M2: @playwright/mcp). Pipes opaque JSON-RPC frames (raw text) in/out.
+//! Manages a local MCP-over-stdio subprocess (M2: @playwright/mcp headless).
+//! Pipes opaque JSON-RPC frames (raw text) in/out.
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
@@ -115,64 +115,40 @@ impl BrowserChannel {
     }
 }
 
-/// Relative path of the M1 echo MCP stub, from a directory root.
-const ECHO_STUB_REL: &str = "test-fixtures/echo-mcp.mjs";
-
-/// Resolve the M1 echo-stub path robustly. Tries, in order:
-///   (a) `test-fixtures/echo-mcp.mjs` relative to CWD,
-///   (b) the same relative path under the current executable's directory
-///       and each ancestor up to 4 levels above it.
-/// Returns the first candidate that exists (as an absolute path where
-/// possible). Returns None if no candidate exists.
-fn resolve_echo_stub() -> Option<std::path::PathBuf> {
-    // (a) CWD-relative.
-    let cwd_cand = std::path::PathBuf::from(ECHO_STUB_REL);
-    if cwd_cand.is_file() {
-        return Some(std::fs::canonicalize(&cwd_cand).unwrap_or(cwd_cand));
-    }
-    // (b) exe dir and ancestors (target/debug -> ... -> workspace root).
-    if let Ok(exe) = std::env::current_exe() {
-        let mut dir = exe.parent();
-        for _ in 0..=4 {
-            let Some(d) = dir else { break };
-            let cand = d.join(ECHO_STUB_REL);
-            if cand.is_file() {
-                return Some(std::fs::canonicalize(&cand).unwrap_or(cand));
-            }
-            dir = d.parent();
-        }
-    }
-    None
-}
-
-/// Resolve the MCP subprocess command for M1. Defaults to the echo stub.
-/// The stub path is resolved robustly (CWD first, then walking up from the
-/// executable's directory). Override the whole command via `CC_BROWSER_MCP`
-/// (whitespace-separated). Returns None if `node` isn't available.
+/// Resolve the browser MCP subprocess command.
+/// Override entirely via `CC_BROWSER_MCP` (whitespace-separated).
 ///
-/// If the default stub can't be found at any candidate location, the
-/// CWD-relative default is returned anyway (so callers still get a command)
-/// and a warning is logged pointing at `CC_BROWSER_MCP`.
-#[allow(dead_code)]
-pub fn m1_mcp_command() -> Option<(String, Vec<String>)> {
+/// Default (M2): pinned `@playwright/mcp@0.0.76` via npx, headless, with a
+/// dedicated persistent profile under the client state dir.
+///
+/// The version is pinned to prevent silent npx drift. Note: do NOT use the
+/// unscoped third-party package `playwright-mcp` — that is a different,
+/// unrelated package. The correct scope is `@playwright/mcp`.
+///
+/// Returns None when node/npx is unavailable.
+pub fn mcp_command() -> Option<(String, Vec<String>)> {
     if let Ok(cmd) = std::env::var("CC_BROWSER_MCP") {
         let mut parts = cmd.split_whitespace().map(|s| s.to_string());
         let prog = parts.next()?;
         return Some((prog, parts.collect()));
     }
-    which_node()?;
-    let stub = match resolve_echo_stub() {
-        Some(p) => p.to_string_lossy().into_owned(),
-        None => {
-            tracing::warn!(
-                path = %ECHO_STUB_REL,
-                "echo MCP stub not found at resolved path; set CC_BROWSER_MCP to an absolute command"
-            );
-            ECHO_STUB_REL.to_string()
-        }
-    };
-    Some(("node".to_string(), vec![stub]))
+    which_node()?; // npx ships with node
+    let profile = dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("cloudcode")
+        .join("browser-profile");
+    Some((
+        "npx".to_string(),
+        vec![
+            "-y".to_string(),
+            "@playwright/mcp@0.0.76".to_string(), // pin: prevents npx drift; do NOT use unscoped playwright-mcp (third-party)
+            "--headless".to_string(),              // default is headed; must be explicit
+            "--user-data-dir".to_string(),
+            profile.to_string_lossy().to_string(),
+        ],
+    ))
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -204,5 +180,30 @@ mod tests {
             .unwrap();
         let got = out_rx.recv().await.expect("a response frame");
         assert!(got.contains("echo"));
+    }
+
+    /// Real playwright smoke test — spawns `@playwright/mcp@0.0.76` via npx
+    /// and sends an MCP initialize request. Marked `#[ignore]` so it does not
+    /// run in the normal suite; the npx cold-start can take well over 25s on
+    /// a fresh machine. Run manually:
+    ///   cargo test -p cloudcode-client -- --ignored playwright_mcp_initialize_roundtrips
+    #[tokio::test]
+    #[ignore = "spawns real @playwright/mcp via npx; run manually"]
+    async fn playwright_mcp_initialize_roundtrips() {
+        let Some((prog, args)) = mcp_command() else { return };
+        let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let mut proc = McpProcess::spawn(&prog, &argrefs).expect("spawn playwright mcp");
+        proc.feed(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#)
+            .await
+            .unwrap();
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            proc.next_frame(),
+        )
+        .await
+        .expect("npx cold start within 2min")
+        .expect("a frame");
+        assert!(resp.contains("Playwright"));
+        proc.shutdown().await;
     }
 }

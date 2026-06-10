@@ -156,7 +156,7 @@ async fn relay_loop(
     // `BrowserRpc` frame from the hub; output frames flow back to the
     // hub via `browser_out_rx` (forwarded in the select! arm below).
     let mut browser: Option<cc_browser::BrowserChannel> = None;
-    let mcp_cmd = cc_browser::m1_mcp_command();
+    let mcp_cmd = cc_browser::mcp_command();
     let (browser_out_tx, mut browser_out_rx) = tokio::sync::mpsc::channel::<String>(64);
 
     // Session-scoped authorization gate (M2). The first browser frame
