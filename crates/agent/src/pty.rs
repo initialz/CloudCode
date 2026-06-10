@@ -501,6 +501,9 @@ impl PtyManager {
             // Intercepted earlier in ws.rs read_loop (resolve_response);
             // this no-op arm exists only for match exhaustiveness.
             ServerMsg::BrowserRpc { .. } => {}
+            // Intercepted earlier in ws.rs read_loop (fail_pending);
+            // this no-op arm exists only for match exhaustiveness.
+            ServerMsg::BrowserClosed { .. } => {}
         }
     }
 

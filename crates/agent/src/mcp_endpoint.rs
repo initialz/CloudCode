@@ -88,6 +88,22 @@ impl EndpointState {
         }
     }
 
+    /// Fail every in-flight request for `session_id` with a JSON-RPC
+    /// error (e.g. after the client denied or tore down the channel).
+    pub fn fail_pending(&self, session_id: Uuid, reason: &str) {
+        let keys: Vec<PendingKey> = self
+            .pending
+            .iter()
+            .filter(|e| e.key().0 == session_id)
+            .map(|e| e.key().clone())
+            .collect();
+        for key in keys {
+            if let Some((k, tx)) = self.pending.remove(&key) {
+                let _ = tx.send(jsonrpc_error(&k.1, -32002, reason));
+            }
+        }
+    }
+
     /// Resolve the pending request matching this response frame's id.
     /// Called from ws.rs when a ServerMsg::BrowserRpc arrives. Returns
     /// true if it matched an in-flight request; false otherwise (e.g. a
@@ -434,6 +450,42 @@ mod tests {
             PostOutcome::Response(b) => assert!(b.contains("\"id\":42") && b.contains("tools")),
             _ => panic!("expected a Response"),
         }
+    }
+
+    #[tokio::test]
+    async fn fail_pending_fails_session_requests_and_leaves_other_session_intact() {
+        let state = EndpointState::new();
+        let sid_a = Uuid::new_v4();
+        let sid_b = Uuid::new_v4();
+
+        // Register two pending requests for session A
+        let (tx_a1, rx_a1) = oneshot::channel::<String>();
+        let (tx_a2, rx_a2) = oneshot::channel::<String>();
+        state.pending.insert((sid_a, "1".to_string()), tx_a1);
+        state.pending.insert((sid_a, "2".to_string()), tx_a2);
+
+        // Register one pending request for session B
+        let (tx_b, _rx_b) = oneshot::channel::<String>();
+        state.pending.insert((sid_b, "3".to_string()), tx_b);
+
+        // Fail all pending for session A
+        state.fail_pending(sid_a, "denied by user");
+
+        // Both session A receivers should get a -32002 error
+        let body_a1 = rx_a1.await.expect("a1 oneshot received");
+        assert!(body_a1.contains("-32002"), "expected -32002 in: {body_a1}");
+        assert!(body_a1.contains("denied by user"), "expected reason in: {body_a1}");
+
+        let body_a2 = rx_a2.await.expect("a2 oneshot received");
+        assert!(body_a2.contains("-32002"), "expected -32002 in: {body_a2}");
+        assert!(body_a2.contains("denied by user"), "expected reason in: {body_a2}");
+
+        // Session A entries should be removed from the map
+        assert!(!state.pending.contains_key(&(sid_a, "1".to_string())));
+        assert!(!state.pending.contains_key(&(sid_a, "2".to_string())));
+
+        // Session B entry should still be present
+        assert!(state.pending.contains_key(&(sid_b, "3".to_string())));
     }
 
     #[test]

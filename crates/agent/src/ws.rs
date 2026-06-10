@@ -196,6 +196,18 @@ where
                 }) => {
                     state.mcp.resolve_response(session_id, payload);
                 }
+                // Client's browser channel is gone (user denied, subprocess
+                // died, or client teardown). Fail every in-flight MCP
+                // request for this session so claude sees a clean JSON-RPC
+                // error instead of waiting out the 25s timeout.
+                // Intercepted here; PtyManager::handle has a no-op arm for
+                // match exhaustiveness.
+                Ok(ServerMsg::BrowserClosed { session_id, reason }) => {
+                    state.mcp.fail_pending(
+                        session_id,
+                        reason.as_deref().unwrap_or("browser channel closed"),
+                    );
+                }
                 Ok(ServerMsg::UpdateAgent {
                     request_id,
                     target_version,

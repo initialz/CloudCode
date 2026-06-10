@@ -1156,10 +1156,17 @@ where
             true
         }
         ClientToHub::BrowserClosed { reason } => {
-            // M1: no auth gate yet. Log and keep the connection alive.
-            // M2 will translate this into agent-side teardown / a denied
-            // MCP error toward claude.
-            tracing::debug!(?reason, "client closed browser channel (M1: noop)");
+            tracing::debug!(?reason, "client closed browser channel; forwarding BrowserClosed to agent");
+            if let (Some(conn), Some(active)) =
+                (ctx.selected_agent.as_ref(), ctx.active.as_ref())
+            {
+                let _ = conn
+                    .send(ServerMsg::BrowserClosed {
+                        session_id: active.session_id,
+                        reason,
+                    })
+                    .await;
+            }
             true
         }
         ClientToHub::Close => false,

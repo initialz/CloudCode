@@ -504,6 +504,16 @@ pub enum ServerMsg {
         session_id: Uuid,
         payload: String,
     },
+
+    /// The client's browser channel is gone (user denied, subprocess
+    /// died, or client teardown). The endpoint must fail this session's
+    /// in-flight MCP requests so claude gets a clean JSON-RPC error
+    /// instead of waiting out the 25s timeout.
+    BrowserClosed {
+        session_id: Uuid,
+        #[serde(default)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -541,6 +551,36 @@ mod browser_tests {
             ServerMsg::BrowserRpc { session_id, payload } => {
                 assert_eq!(session_id, sid);
                 assert_eq!(payload, original);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn browser_closed_roundtrip_byte_exact() {
+        use uuid::Uuid;
+        let sid = Uuid::new_v4();
+        let reason = Some("denied by user".to_string());
+
+        let s = ServerMsg::BrowserClosed { session_id: sid, reason: reason.clone() };
+        let j = serde_json::to_string(&s).unwrap();
+        assert!(j.contains("\"type\":\"browser_closed\""), "tag mismatch: {j}");
+        match serde_json::from_str::<ServerMsg>(&j).unwrap() {
+            ServerMsg::BrowserClosed { session_id, reason: r } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(r, reason);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // reason=None (the #[serde(default)] path)
+        let s2 = ServerMsg::BrowserClosed { session_id: sid, reason: None };
+        let j2 = serde_json::to_string(&s2).unwrap();
+        assert!(j2.contains("\"type\":\"browser_closed\""), "tag mismatch: {j2}");
+        match serde_json::from_str::<ServerMsg>(&j2).unwrap() {
+            ServerMsg::BrowserClosed { session_id, reason: r } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(r, None);
             }
             _ => panic!("wrong variant"),
         }

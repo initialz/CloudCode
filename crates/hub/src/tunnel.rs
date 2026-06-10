@@ -481,6 +481,16 @@ pub enum ServerMsg {
         session_id: Uuid,
         payload: String,
     },
+
+    /// The client's browser channel is gone (user denied, subprocess
+    /// died, or client teardown). The endpoint must fail this session's
+    /// in-flight MCP requests so claude gets a clean JSON-RPC error
+    /// instead of waiting out the 25s timeout.
+    BrowserClosed {
+        session_id: Uuid,
+        #[serde(default)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
