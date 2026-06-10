@@ -244,7 +244,12 @@ async fn relay_loop(
                                 let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
                                 match cc_browser::BrowserChannel::start(&prog, &argrefs, browser_out_tx.clone()) {
                                     Ok(ch) => browser = Some(ch),
-                                    Err(e) => tracing::warn!(error=%e, "failed to start browser MCP subprocess"),
+                                    Err(e) => tracing::warn!(
+                                        error = %e,
+                                        program = %prog,
+                                        args = ?args,
+                                        "failed to start browser MCP subprocess"
+                                    ),
                                 }
                             }
                         }

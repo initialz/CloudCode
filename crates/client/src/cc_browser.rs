@@ -83,6 +83,7 @@ impl BrowserChannel {
         args: &[&str],
         out_tx: mpsc::Sender<String>,
     ) -> std::io::Result<Self> {
+        tracing::info!(program, ?args, "starting browser MCP subprocess");
         let mut proc = McpProcess::spawn(program, args)?;
         let (in_tx, mut in_rx) = mpsc::channel::<String>(32);
         tokio::spawn(async move {
@@ -114,10 +115,44 @@ impl BrowserChannel {
     }
 }
 
-/// Resolve the MCP subprocess command for M1. Defaults to the echo stub
-/// (resolved relative to CWD, which is the workspace root during M1
-/// smoke testing). Override the whole command via `CC_BROWSER_MCP`
+/// Relative path of the M1 echo MCP stub, from a directory root.
+const ECHO_STUB_REL: &str = "test-fixtures/echo-mcp.mjs";
+
+/// Resolve the M1 echo-stub path robustly. Tries, in order:
+///   (a) `test-fixtures/echo-mcp.mjs` relative to CWD,
+///   (b) the same relative path under the current executable's directory
+///       and each ancestor up to 4 levels above it.
+/// Returns the first candidate that exists (as an absolute path where
+/// possible). Returns None if no candidate exists.
+fn resolve_echo_stub() -> Option<std::path::PathBuf> {
+    // (a) CWD-relative.
+    let cwd_cand = std::path::PathBuf::from(ECHO_STUB_REL);
+    if cwd_cand.is_file() {
+        return Some(std::fs::canonicalize(&cwd_cand).unwrap_or(cwd_cand));
+    }
+    // (b) exe dir and ancestors (target/debug -> ... -> workspace root).
+    if let Ok(exe) = std::env::current_exe() {
+        let mut dir = exe.parent();
+        for _ in 0..=4 {
+            let Some(d) = dir else { break };
+            let cand = d.join(ECHO_STUB_REL);
+            if cand.is_file() {
+                return Some(std::fs::canonicalize(&cand).unwrap_or(cand));
+            }
+            dir = d.parent();
+        }
+    }
+    None
+}
+
+/// Resolve the MCP subprocess command for M1. Defaults to the echo stub.
+/// The stub path is resolved robustly (CWD first, then walking up from the
+/// executable's directory). Override the whole command via `CC_BROWSER_MCP`
 /// (whitespace-separated). Returns None if `node` isn't available.
+///
+/// If the default stub can't be found at any candidate location, the
+/// CWD-relative default is returned anyway (so callers still get a command)
+/// and a warning is logged pointing at `CC_BROWSER_MCP`.
 #[allow(dead_code)]
 pub fn m1_mcp_command() -> Option<(String, Vec<String>)> {
     if let Ok(cmd) = std::env::var("CC_BROWSER_MCP") {
@@ -126,7 +161,17 @@ pub fn m1_mcp_command() -> Option<(String, Vec<String>)> {
         return Some((prog, parts.collect()));
     }
     which_node()?;
-    Some(("node".to_string(), vec!["test-fixtures/echo-mcp.mjs".to_string()]))
+    let stub = match resolve_echo_stub() {
+        Some(p) => p.to_string_lossy().into_owned(),
+        None => {
+            tracing::warn!(
+                path = %ECHO_STUB_REL,
+                "echo MCP stub not found at resolved path; set CC_BROWSER_MCP to an absolute command"
+            );
+            ECHO_STUB_REL.to_string()
+        }
+    };
+    Some(("node".to_string(), vec![stub]))
 }
 
 #[cfg(test)]

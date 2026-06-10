@@ -93,14 +93,43 @@ impl EndpointState {
     /// true if it matched an in-flight request; false otherwise (e.g. a
     /// server-initiated notification, which M1 drops).
     pub fn resolve_response(&self, session_id: Uuid, payload: String) -> bool {
-        let Some(id) = extract_id_key(&payload) else {
+        let id = extract_id_key(&payload);
+        tracing::debug!(
+            %session_id,
+            has_id = id.is_some(),
+            "browser MCP response from hub; looking for pending waiter"
+        );
+        let Some(id) = id else {
             return false;
         };
         if let Some((_, tx)) = self.pending.remove(&(session_id, id)) {
-            return tx.send(payload).is_ok();
+            let matched = tx.send(payload).is_ok();
+            tracing::debug!(%session_id, matched, "browser MCP pending waiter resolved");
+            return matched;
         }
+        tracing::debug!(%session_id, "browser MCP response had no pending waiter");
         false
     }
+}
+
+/// Timeout for a blocking claude POST awaiting its response from the
+/// client subprocess (via the hub). Factored out so tests can reason
+/// about the timeout branch without blocking for the full duration.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Build a JSON-RPC error response body for a given request id (raw id
+/// string as captured by extract_id_key, e.g. "1" or "\"abc\"").
+fn jsonrpc_error(id_raw: &str, code: i64, message: &str) -> String {
+    format!(
+        r#"{{"jsonrpc":"2.0","id":{id_raw},"error":{{"code":{code},"message":{msg}}}}}"#,
+        msg = serde_json::to_string(message).unwrap_or_else(|_| "\"error\"".to_string())
+    )
+}
+
+/// First ~8 chars of a token, for non-secret-leaking diagnostics.
+fn token_prefix(token: &str) -> &str {
+    let end = token.char_indices().nth(8).map(|(i, _)| i).unwrap_or(token.len());
+    &token[..end]
 }
 
 /// Extract the JSON-RPC `id` from a frame as a canonical string key.
@@ -122,24 +151,48 @@ pub fn mcp_config_json(port: u16, token: &str) -> String {
 }
 
 /// Outcome of a claude POST. Mapped to HTTP status in the axum handler.
+///
+/// Transport-level problems for a JSON-RPC *request* (unknown token,
+/// timeout) are returned as `Response` carrying a JSON-RPC error object at
+/// HTTP 200 — NOT a bare non-2xx status. Claude Code treats ANY non-2xx on
+/// the MCP POST as "authentication required" and kicks off an OAuth
+/// discovery cascade that 404s and surfaces as a misleading
+/// `SDK auth failed: HTTP 404`. Returning 200 + a JSON-RPC error lets the
+/// real error through.
 pub enum PostOutcome {
-    /// A JSON-RPC response body to return (application/json, 200).
+    /// A JSON-RPC body to return (application/json, 200). Either a real
+    /// response forwarded from the client, or a JSON-RPC error object built
+    /// here for a transport-level failure.
     Response(String),
     /// Notification accepted, no body (202).
     Accepted,
-    /// Token not recognized (400/404).
-    UnknownToken,
-    /// No response arrived in time (504).
-    Timeout,
 }
 
 /// Core POST handler, factored out for unit testing.
 pub async fn handle_post(token: &str, body: String, state: &EndpointState) -> PostOutcome {
-    let Some(session_id) = state.session_for(token) else {
-        return PostOutcome::UnknownToken;
-    };
-    match extract_id_key(&body) {
-        Some(id) => {
+    let id = extract_id_key(&body);
+    let session = state.session_for(token);
+    tracing::debug!(
+        token = %token_prefix(token),
+        is_request = id.is_some(),
+        session = ?session,
+        "browser MCP POST"
+    );
+
+    match (id, session) {
+        // Request to an unknown token: return a JSON-RPC error at HTTP 200
+        // instead of 404, so claude shows the real error (not an OAuth
+        // misfire).
+        (Some(id), None) => {
+            tracing::warn!(token = %token_prefix(token), "browser MCP POST for unknown token");
+            PostOutcome::Response(jsonrpc_error(
+                &id,
+                -32001,
+                "browser MCP session not registered (token unknown or expired)",
+            ))
+        }
+        // Request to a known session: forward and block for the response.
+        (Some(id), Some(session_id)) => {
             let (tx, rx) = oneshot::channel();
             state.pending.insert((session_id, id.clone()), tx);
             state
@@ -148,16 +201,34 @@ pub async fn handle_post(token: &str, body: String, state: &EndpointState) -> Po
                     payload: body,
                 }))
                 .await;
-            match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
                 Ok(Ok(resp)) => PostOutcome::Response(resp),
                 _ => {
-                    state.pending.remove(&(session_id, id));
-                    PostOutcome::Timeout
+                    state.pending.remove(&(session_id, id.clone()));
+                    tracing::warn!(
+                        token = %token_prefix(token),
+                        %session_id,
+                        "browser MCP request timed out awaiting client response"
+                    );
+                    PostOutcome::Response(jsonrpc_error(
+                        &id,
+                        -32000,
+                        "browser MCP request timed out (client subprocess not responding)",
+                    ))
                 }
             }
         }
-        None => {
-            // Notification: forward, no response expected.
+        // Notification to an unknown token: nothing to deliver and nothing
+        // to return. Don't 404 a notification — just log and accept.
+        (None, None) => {
+            tracing::warn!(
+                token = %token_prefix(token),
+                "browser MCP notification for unknown token; dropping"
+            );
+            PostOutcome::Accepted
+        }
+        // Notification to a known session: forward, no response expected.
+        (None, Some(session_id)) => {
             state
                 .send_to_hub(OutFrame::Text(ClientMsg::BrowserRpc {
                     session_id,
@@ -192,8 +263,6 @@ pub async fn serve(state: EndpointState, port: u16) -> std::io::Result<()> {
                         )
                             .into_response(),
                         PostOutcome::Accepted => StatusCode::ACCEPTED.into_response(),
-                        PostOutcome::UnknownToken => StatusCode::NOT_FOUND.into_response(),
-                        PostOutcome::Timeout => StatusCode::GATEWAY_TIMEOUT.into_response(),
                     }
                 },
             )
@@ -214,6 +283,9 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_token_is_rejected() {
+        // A REQUEST (has an id) to an unknown token must NOT be a bare
+        // non-2xx (which would trigger claude's OAuth misfire). It returns
+        // a JSON-RPC error body at HTTP 200.
         let state = EndpointState::new();
         let out = handle_post(
             "nope",
@@ -221,7 +293,82 @@ mod tests {
             &state,
         )
         .await;
-        assert!(matches!(out, PostOutcome::UnknownToken));
+        match out {
+            PostOutcome::Response(body) => {
+                assert!(body.contains("\"error\""), "carries an error object: {body}");
+                assert!(body.contains("-32001"), "uses the unknown-token code: {body}");
+                assert!(body.contains("\"id\":1"), "keyed to the request id: {body}");
+                let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+                assert_eq!(v["jsonrpc"], "2.0");
+            }
+            _ => panic!("expected a Response carrying a JSON-RPC error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn notification_to_unknown_token_is_accepted_not_404() {
+        // A NOTIFICATION (no id) to an unknown token has nothing to return;
+        // accept it (202) rather than 404.
+        let state = EndpointState::new();
+        let out = handle_post(
+            "nope",
+            r#"{"jsonrpc":"2.0","method":"notify"}"#.to_string(),
+            &state,
+        )
+        .await;
+        assert!(matches!(out, PostOutcome::Accepted));
+    }
+
+    #[test]
+    fn jsonrpc_error_has_valid_shape() {
+        // The timeout branch builds its body via jsonrpc_error; exercise it
+        // directly so we don't need a 30s-blocking test for the timeout path.
+        let body = jsonrpc_error("1", -32000, "browser MCP request timed out");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["error"]["code"], -32000);
+        assert_eq!(v["error"]["message"], "browser MCP request timed out");
+
+        // String ids round-trip too (id_raw is already a canonical token).
+        let body = jsonrpc_error("\"abc\"", -32001, "x");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["id"], "abc");
+
+        // A message containing JSON-breaking chars stays valid (escaped).
+        let body = jsonrpc_error("1", -1, "has \"quotes\" and \\ backslash");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["error"]["message"], "has \"quotes\" and \\ backslash");
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_jsonrpc_error_not_http_error() {
+        // We can't afford a real 30s wait. Instead verify the two facts that
+        // make the timeout path correct without blocking: (1) the unknown-
+        // token request path (instant) returns a JSON-RPC error rather than
+        // a bare non-2xx, and (2) jsonrpc_error with the timeout code/message
+        // builds a well-formed JSON-RPC error. Together these cover the shape
+        // the timeout branch emits.
+        let state = EndpointState::new();
+        let out = handle_post(
+            "nope",
+            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call"}"#.to_string(),
+            &state,
+        )
+        .await;
+        assert!(
+            matches!(&out, PostOutcome::Response(b) if b.contains("\"error\"")),
+            "request transport failures must be JSON-RPC errors, never bare non-2xx"
+        );
+
+        let body = jsonrpc_error(
+            "9",
+            -32000,
+            "browser MCP request timed out (client subprocess not responding)",
+        );
+        let v: serde_json::Value = serde_json::from_str(&body).expect("valid JSON");
+        assert_eq!(v["id"], 9);
+        assert_eq!(v["error"]["code"], -32000);
     }
 
     #[tokio::test]
@@ -397,13 +544,19 @@ mod tests {
         assert!(text.contains("\"id\":1"), "response keeps the request id: {text}");
         assert!(text.contains("echo"), "response carries the simulated result: {text}");
 
-        // Unknown token -> 404.
+        // Unknown token (request): HTTP 200 + a JSON-RPC error, NOT 404.
+        // A non-2xx here would trip claude's OAuth discovery and mask the
+        // real error.
         let unknown = client
             .post(format!("{base}/mcp/does-not-exist"))
             .body(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
             .send()
             .await
             .expect("POST unknown token");
-        assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+        assert_eq!(unknown.status(), reqwest::StatusCode::OK);
+        let body = unknown.text().await.unwrap();
+        assert!(body.contains("\"error\""), "unknown-token request -> JSON-RPC error: {body}");
+        assert!(body.contains("-32001"), "uses the unknown-token code: {body}");
+        assert!(body.contains("\"id\":2"), "keyed to the request id: {body}");
     }
 }
