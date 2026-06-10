@@ -42,6 +42,15 @@ pub struct PtyManager {
     tmux_conf: Option<PathBuf>,
     sessions: Arc<DashMap<Uuid, Arc<PtyHandle>>>,
     write_sessions: crate::fs::WriteSessions,
+    /// Resident localhost MCP endpoint. Shares `Arc` internals with the
+    /// `AppState.mcp` instance, so reserving a session route here is
+    /// visible to the HTTP handler that claude POSTs to. Used by
+    /// `open_session` to mint a per-session token + `--mcp-config`.
+    mcp: crate::mcp_endpoint::EndpointState,
+    /// Port the resident MCP endpoint listens on (config.mcp_port,
+    /// default 7110). Stored at construction because PtyManager doesn't
+    /// hold the full Config.
+    mcp_port: u16,
 }
 
 struct PtyHandle {
@@ -70,6 +79,11 @@ impl PtyManager {
         // just figures out whether sandbox is structurally possible
         // (macOS today) and stands the wrapper-path ready.
         _sandbox: SandboxConfig,
+        // Resident MCP endpoint (shared with AppState.mcp) and the port
+        // it listens on, so open_session can mint a per-session token and
+        // inject `--mcp-config` for claude.
+        mcp: crate::mcp_endpoint::EndpointState,
+        mcp_port: u16,
     ) -> Result<Self> {
         // Fail fast if tmux is not installed.
         let tmux_path = which::which(&tmux.executable).with_context(|| {
@@ -173,6 +187,8 @@ impl PtyManager {
             tmux_conf,
             sessions: Arc::new(DashMap::new()),
             write_sessions: crate::fs::new_write_sessions(),
+            mcp,
+            mcp_port,
         })
     }
 
@@ -519,7 +535,7 @@ impl PtyManager {
         workspace: String,
         cols: u16,
         rows: u16,
-        claude_args: Vec<String>,
+        mut claude_args: Vec<String>,
         sandbox: bool,
         sandbox_mode: Option<String>,
         tool: Option<String>,
@@ -583,6 +599,27 @@ impl PtyManager {
         // somehow vanished between create_dir_all and now; fall back
         // to the raw path in that pathological case.
         let cwd = std::fs::canonicalize(&cwd_raw).unwrap_or(cwd_raw);
+
+        // Inject the resident browser MCP endpoint config for this session.
+        // Mint a fresh token mapping this session_id in the shared endpoint
+        // state, write the `--mcp-config` JSON under the workspace's
+        // `.cloudcode/` dir, and append `--mcp-config <path>` to claude's
+        // per-session args (forwarded to claude's argv via the bash wrapper
+        // alongside the other extra args). Task 12 will gate this on
+        // `browser_capable`; for now it's injected unconditionally.
+        let mcp_token = self.mcp.reserve(session_id);
+        let mcp_cfg = crate::mcp_endpoint::mcp_config_json(self.mcp_port, &mcp_token);
+        let mcp_cfg_path = cwd.join(".cloudcode").join("mcp-browser.json");
+        if let Some(parent) = mcp_cfg_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&mcp_cfg_path, &mcp_cfg) {
+            tracing::warn!(error = %e, "failed to write browser mcp config");
+        }
+        // Forwarded to claude's argv like the other extra args (the bash
+        // wrapper passes $@ through to the tool on first boot).
+        claude_args.push("--mcp-config".to_string());
+        claude_args.push(mcp_cfg_path.to_string_lossy().to_string());
 
         // Open the PTY.
         let size = PtySize {

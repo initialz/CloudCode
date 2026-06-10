@@ -211,6 +211,13 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         .unwrap_or_else(name::default_agent_name);
     tracing::info!(agent = %name, "starting cloudcode-agent");
 
+    // The resident MCP endpoint state is shared between the PtyManager
+    // (which reserves a per-session token + writes the `--mcp-config`
+    // when launching claude) and AppState.mcp (which the HTTP handler and
+    // ws layer use). Build it FIRST so both hold the SAME instance.
+    let mcp = mcp_endpoint::EndpointState::new();
+    let mcp_port = config.mcp_port.unwrap_or(7110);
+
     let manager = Arc::new(PtyManager::new(
         config.claude.clone(),
         config.tools.tools.clone(),
@@ -218,6 +225,8 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         config.tmux.clone(),
         config.recording.clone(),
         config.sandbox.clone(),
+        mcp.clone(),
+        mcp_port,
     )?);
 
     // Process-level audit pipeline: watches ~/.claude/projects/ and
@@ -239,7 +248,7 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         config,
         manager,
         audit_slot,
-        mcp: mcp_endpoint::EndpointState::new(),
+        mcp,
     });
 
     // Resident localhost MCP HTTP/SSE endpoint. claude connects here;

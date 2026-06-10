@@ -54,9 +54,16 @@ impl EndpointState {
     }
 
     /// Reserve a session route for a claude token (used at session open, Task 11).
-    #[allow(dead_code)]
     pub fn register(&self, token: String, session_id: Uuid) {
         self.routes.insert(token, session_id);
+    }
+
+    /// Reserve a session route for a not-yet-connected claude. Generates a
+    /// random token, maps it to `session_id`, and returns the token.
+    pub fn reserve(&self, session_id: Uuid) -> String {
+        let token = Uuid::new_v4().simple().to_string();
+        self.register(token.clone(), session_id);
+        token
     }
 
     #[allow(dead_code)]
@@ -105,6 +112,14 @@ fn extract_id_key(body: &str) -> Option<String> {
         Some(serde_json::Value::Null) | None => None,
         Some(id) => Some(id.to_string()), // numbers -> "1", strings -> "\"abc\""
     }
+}
+
+/// Build the `--mcp-config` JSON claude should load for this session,
+/// pointing at the resident endpoint via Streamable HTTP.
+pub fn mcp_config_json(port: u16, token: &str) -> String {
+    format!(
+        r#"{{"mcpServers":{{"cc-browser":{{"type":"http","url":"http://127.0.0.1:{port}/mcp/{token}"}}}}}}"#
+    )
 }
 
 /// Outcome of a claude POST. Mapped to HTTP status in the axum handler.
@@ -270,6 +285,22 @@ mod tests {
             PostOutcome::Response(b) => assert!(b.contains("\"id\":42") && b.contains("tools")),
             _ => panic!("expected a Response"),
         }
+    }
+
+    #[test]
+    fn config_has_http_url_with_token() {
+        let s = mcp_config_json(7110, "abc123");
+        assert!(s.contains("\"type\":\"http\""));
+        assert!(s.contains("http://127.0.0.1:7110/mcp/abc123"));
+        let _: serde_json::Value = serde_json::from_str(&s).unwrap(); // valid JSON
+    }
+
+    #[test]
+    fn reserve_maps_token_to_session() {
+        let st = EndpointState::new();
+        let sid = uuid::Uuid::new_v4();
+        let tok = st.reserve(sid);
+        assert_eq!(st.session_for(&tok), Some(sid));
     }
 
     #[tokio::test]
