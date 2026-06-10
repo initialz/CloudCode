@@ -11,6 +11,11 @@ mod backend;
 mod config;
 mod state;
 mod terminal;
+// Browser-panel viewer ws client (P4 Task 2). The transport + channels
+// land here; the panel that drives them is Task 3, so the public surface
+// is unused until then — silence dead-code until it's wired in.
+#[allow(dead_code)]
+mod viewer;
 mod wire;
 
 use backend::{spawn, BackendEvent, BackendHandle, UiCommand};

@@ -21,6 +21,7 @@
 //! unregister and send `ServerMsg::ViewerDetach`.
 
 use crate::app::{self, USER_SESSION_COOKIE};
+use crate::auth;
 use crate::registry::AgentConn;
 use crate::tunnel::{ServerMsg, ViewerInputEvent};
 use crate::AppState;
@@ -43,6 +44,55 @@ const VIEWER_FRAME_QUEUE: usize = 64;
 pub struct ViewerQuery {
     /// The PTY session_id whose browser the viewer wants to watch.
     pub session: Uuid,
+    /// Optional account token, used by the native desktop app (which has
+    /// no browser cookie). When present it is validated EXACTLY as the
+    /// PTY ws Hello token is — `auth::authenticate` over a synthesized
+    /// `Authorization: Bearer <token>` header — and the resolved account
+    /// is subject to the same ownership guard as the cookie account. The
+    /// browser viewer page never sends this; it relies on the cookie.
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+/// Resolve the account name for a viewer connection, preferring the
+/// browser session cookie and falling back to a query-param token.
+///
+/// Both paths reuse the hub's existing, audited credential checks:
+///   - **cookie** → `state.user_auth.lookup` (same as the web verify
+///     page and `pty_session::upgrade`'s cookie pre-auth).
+///   - **token**  → `auth::authenticate` over a `Bearer <token>` header,
+///     the IDENTICAL validation `pty_session::authenticate` runs for the
+///     CLI client's Hello token. No weaker check is introduced.
+///
+/// Returns the authenticated account name, or `None` if neither
+/// credential resolves to a live account. The account-ownership guard in
+/// `handle_socket` still applies on top of this — authentication here
+/// only proves *who* the viewer is, not *what* they may watch.
+async fn resolve_viewer_account(
+    state: &AppState,
+    headers: &HeaderMap,
+    token: Option<&str>,
+) -> Option<String> {
+    // Cookie first: this is the browser viewer page's sole credential and
+    // matches the existing P2 behavior exactly.
+    if let Some(sid) = app::parse_cookie(headers, USER_SESSION_COOKIE) {
+        if let Some(account) = state.user_auth.lookup(&sid).await {
+            return Some(account);
+        }
+    }
+    // Token fallback (native desktop app). Validate it the same way
+    // `pty_session::authenticate` does: synthesize the `Authorization`
+    // header `auth::authenticate` expects and reuse that function verbatim.
+    if let Some(token) = token {
+        let mut hdrs = HeaderMap::new();
+        if let Ok(v) = axum::http::HeaderValue::from_str(&format!("Bearer {}", token)) {
+            hdrs.insert(axum::http::header::AUTHORIZATION, v);
+            if let Ok(account) = auth::authenticate(&state.db, &hdrs).await {
+                return Some(account.name);
+            }
+        }
+    }
+    None
 }
 
 /// Parse a browser-sent viewer-input JSON line into a `ViewerInputEvent`.
@@ -76,23 +126,24 @@ fn resolve_session_owner(state: &AppState, session_id: Uuid) -> Option<(String, 
     })
 }
 
-/// `GET /v1/viewer/ws?session=<id>` — resolve cookie auth *before* the upgrade
-/// (the request headers are gone once the socket is open), exactly as
-/// `pty_session::upgrade` does. Unlike the PTY endpoint there is no CLI / Hello
-/// token path: the viewer page is browser-only, so a valid `cc_user_session`
-/// cookie is the sole credential. No cookie / unknown session → reject the
-/// upgrade with `401` (never open the socket for an unauthenticated viewer).
+/// `GET /v1/viewer/ws?session=<id>[&token=<tok>]` — resolve auth *before*
+/// the upgrade (the request headers are gone once the socket is open),
+/// exactly as `pty_session::upgrade` does. Two credentials are accepted:
+///   - a `cc_user_session` cookie (the browser viewer page), and
+///   - a `?token=` query param (the native desktop app, which has no
+///     cookie) — validated with the SAME `auth::authenticate` the PTY ws
+///     uses for the CLI client's Hello token.
+/// Cookie takes precedence when both are present. No valid credential →
+/// reject the upgrade with `401` (never open the socket for an
+/// unauthenticated viewer). The account-ownership guard in `handle_socket`
+/// applies regardless of which credential authenticated the viewer.
 pub async fn upgrade(
     State(state): State<Arc<AppState>>,
     Query(q): Query<ViewerQuery>,
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let account = match app::parse_cookie(&headers, USER_SESSION_COOKIE) {
-        Some(sid) => state.user_auth.lookup(&sid).await,
-        None => None,
-    };
-    let Some(account) = account else {
+    let Some(account) = resolve_viewer_account(&state, &headers, q.token.as_deref()).await else {
         return (axum::http::StatusCode::UNAUTHORIZED, "login required").into_response();
     };
     ws.on_upgrade(move |socket| handle_socket(socket, state, account, q.session))
@@ -321,6 +372,55 @@ mod tests {
         assert!(parse_viewer_input(r#"{"kind":"mouse_move","x":1.0}"#).is_none());
         // Empty.
         assert!(parse_viewer_input("").is_none());
+    }
+
+    /// The token branch of `resolve_viewer_account` is a thin wrapper over
+    /// `auth::authenticate(&db, Bearer <token>)` — the IDENTICAL primitive
+    /// `pty_session::authenticate` uses for the CLI Hello token. This test
+    /// pins that the reused validation maps a token to its owning account
+    /// (and ONLY that account), which is the security-load-bearing bit: it
+    /// is what the downstream ownership guard (`owner_account != account`)
+    /// then compares against. A token for account A must resolve to A, so a
+    /// token for A can never satisfy the guard for B's session.
+    #[tokio::test]
+    async fn token_resolves_to_its_owning_account_only() {
+        use crate::auth;
+        use crate::db::Db;
+
+        // Temp-file sqlite (the hub crate has no in-memory test harness;
+        // a unique temp path keeps this self-contained and parallel-safe).
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("cc-viewer-auth-{}.sqlite", Uuid::new_v4()));
+        let db = Db::open(&path).await.expect("open temp db");
+
+        let token_a = auth::generate_token();
+        let token_b = auth::generate_token();
+        let hash_a = auth::hash_token(&token_a).unwrap();
+        let hash_b = auth::hash_token(&token_b).unwrap();
+        db.insert_account("alice", &hash_a, None, None).await.unwrap();
+        db.insert_account("bob", &hash_b, None, None).await.unwrap();
+
+        let resolve = |tok: &str| {
+            let mut hdrs = HeaderMap::new();
+            hdrs.insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&format!("Bearer {tok}")).unwrap(),
+            );
+            hdrs
+        };
+
+        // alice's token → alice (never bob).
+        let acct = auth::authenticate(&db, &resolve(&token_a)).await.unwrap();
+        assert_eq!(acct.name, "alice");
+        // bob's token → bob.
+        let acct = auth::authenticate(&db, &resolve(&token_b)).await.unwrap();
+        assert_eq!(acct.name, "bob");
+        // A garbage token authenticates as nobody.
+        assert!(auth::authenticate(&db, &resolve("cc_not_a_real_token"))
+            .await
+            .is_err());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
