@@ -70,7 +70,9 @@ pub enum ClientToHub {
         claude_args: Vec<String>,
         /// Which tool to launch in the first pane (claude / codex / …).
         /// `None` -> let the agent pick its default. New in v1.10.
-        #[serde(default)]
+        /// `skip_serializing_if` keeps the wire byte-identical to the
+        /// pre-extraction CLI client (omits the key rather than `null`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         tool: Option<String>,
     },
     /// In-session: split an extra tmux pane in the current session
