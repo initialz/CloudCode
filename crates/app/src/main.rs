@@ -9,20 +9,19 @@
 
 mod backend;
 mod config;
+mod session_view;
 mod state;
 mod terminal;
-// Browser-panel viewer ws client (P4 Task 2). The transport + channels
-// land here; the panel that drives them is Task 3, so the public surface
-// is unused until then — silence dead-code until it's wired in.
-#[allow(dead_code)]
 mod viewer;
 mod wire;
 
 use backend::{spawn, BackendEvent, BackendHandle, UiCommand};
 use config::HubConfig;
+use session_view::{should_connect_viewer, split_width_range, SessionView};
 use state::{apply_event, badge, FollowUp, Screen};
 use std::path::PathBuf;
 use terminal::{install_cjk_font, TerminalPanel};
+use viewer::{BrowserPanel, ViewerCommand, ViewerEvent, ViewerHandle};
 // `terminal::UiOutput` is referenced fully-qualified in the session arm.
 
 fn main() -> eframe::Result {
@@ -77,6 +76,11 @@ struct App {
     screen: Screen,
     /// `None` until config loads cleanly and the backend spawns.
     backend: Option<BackendHandle>,
+    /// Hub base URL + account token from config — threaded into the App so
+    /// the Session screen can open the *second* (viewer) ws lazily. The
+    /// backend already has its own copy for the PTY ws.
+    hub_url: String,
+    token: String,
     /// New-workspace form state on the picker.
     new_name: String,
     new_agent: String,
@@ -85,6 +89,17 @@ struct App {
     /// the session arm. Lives here (not in `Screen`) so the `state`
     /// reducer stays pure and unit-testable.
     terminal: Option<TerminalPanel>,
+    /// Which panel(s) the Session screen shows (terminal / split / browser).
+    /// Persisted across frames; reset to the default on each new session.
+    session_view: SessionView,
+    /// The browser (screencast) panel — decodes JPEG frames to a texture and
+    /// captures mouse/key/IME. Created on `SessionOpened`, torn down when we
+    /// leave the session (alongside `terminal`).
+    browser: Option<BrowserPanel>,
+    /// The *second* ws to the hub (the viewer/screencast). Opened LAZILY:
+    /// `None` until the browser panel is first shown, dropped (→ hub
+    /// `ViewerDetach` → agent stops screencast) when it's hidden again.
+    viewer: Option<ViewerHandle>,
 }
 
 impl App {
@@ -96,15 +111,21 @@ impl App {
         match cfg {
             Ok(cfg) => {
                 let hub_url = cfg.hub_url.clone();
+                let token = cfg.token.clone();
                 // Hand the egui context to the backend so it can wake us
                 // on incoming events from its own thread.
                 let backend = spawn(cfg, cc.egui_ctx.clone());
                 App {
-                    screen: Screen::connecting(hub_url),
+                    screen: Screen::connecting(hub_url.clone()),
                     backend: Some(backend),
+                    hub_url,
+                    token,
                     new_name: String::new(),
                     new_agent: String::new(),
                     terminal: None,
+                    session_view: SessionView::default(),
+                    browser: None,
+                    viewer: None,
                 }
             }
             Err(e) => App {
@@ -112,10 +133,92 @@ impl App {
                     message: format!("config error: {e:#}"),
                 },
                 backend: None,
+                hub_url: String::new(),
+                token: String::new(),
                 new_name: String::new(),
                 new_agent: String::new(),
                 terminal: None,
+                session_view: SessionView::default(),
+                browser: None,
+                viewer: None,
             },
+        }
+    }
+
+    /// Drop the viewer ws (best-effort `Close` → hub `ViewerDetach` → agent
+    /// stops the screencast), if one is open. Idempotent. Called when the
+    /// browser panel is hidden, the session ends, or the app quits.
+    fn disconnect_viewer(&mut self) {
+        if let Some(handle) = self.viewer.take() {
+            let _ = handle.cmd_tx.send(ViewerCommand::Close);
+            // Dropping `handle` also drops the command sender; the client
+            // thread sees the channel close and tears the ws down even if
+            // the explicit Close above didn't make it.
+        }
+        if let Some(panel) = &mut self.browser {
+            panel.mark_disconnected();
+        }
+    }
+
+    /// Open the viewer ws for the current session, if not already open. Needs
+    /// the session id (from `SessionOpened`); a no-op without one. Called when
+    /// the browser panel is first shown.
+    fn connect_viewer(&mut self, ctx: &egui::Context) {
+        if self.viewer.is_some() {
+            return; // already connected
+        }
+        let Screen::Session { session_id, .. } = &self.screen else {
+            return; // not in a session — nothing to watch
+        };
+        if session_id.is_empty() {
+            // No session id (older hub that didn't send one) — can't open the
+            // viewer ws. Leave the panel on its placeholder.
+            tracing::warn!("viewer: no session_id; browser panel unavailable");
+            return;
+        }
+        self.viewer = Some(ViewerHandle::connect(
+            self.hub_url.clone(),
+            self.token.clone(),
+            session_id.clone(),
+            ctx.clone(),
+        ));
+    }
+
+    /// Reconcile the viewer ws with the current view: connect when the
+    /// browser panel is visible, disconnect when it's hidden. Idempotent —
+    /// called every frame; only acts on a change.
+    fn reconcile_viewer(&mut self, ctx: &egui::Context) {
+        let want = matches!(self.screen, Screen::Session { .. })
+            && should_connect_viewer(self.session_view);
+        match (want, self.viewer.is_some()) {
+            (true, false) => self.connect_viewer(ctx),
+            (false, true) => self.disconnect_viewer(),
+            _ => {}
+        }
+    }
+
+    /// Drain queued viewer-ws events into the browser panel each frame:
+    /// frames become textures, a disconnect flips the placeholder on.
+    fn drain_viewer_events(&mut self, ctx: &egui::Context) {
+        let events: Vec<ViewerEvent> = match &self.viewer {
+            Some(h) => h.event_rx.try_iter().collect(),
+            None => return,
+        };
+        let Some(panel) = &mut self.browser else {
+            return;
+        };
+        for ev in events {
+            match ev {
+                ViewerEvent::Connected => panel.mark_connected(),
+                ViewerEvent::Frame(jpeg) => panel.set_frame(ctx, &jpeg),
+                ViewerEvent::Disconnected => {
+                    panel.mark_disconnected();
+                    // The client thread has exited; drop our handle so the
+                    // next show re-connects rather than reusing a dead ws.
+                    self.viewer = None;
+                    break;
+                }
+            }
         }
     }
 
@@ -147,10 +250,17 @@ impl App {
                 continue;
             }
 
-            // A new session: spin up a fresh terminal panel. 80×24 matches
-            // the hardcoded OpenSession size (Task 5 makes it dynamic).
+            // A new session: spin up a fresh terminal + browser panel and
+            // reset the view to the default split. 80×24 matches the
+            // hardcoded OpenSession size (Task 5 makes it dynamic). The
+            // viewer ws stays closed until the browser panel is first shown
+            // (lazy connect — see `reconcile_viewer`).
             if matches!(ev, BackendEvent::SessionOpened { .. }) {
                 self.terminal = Some(TerminalPanel::new(80, 24));
+                self.browser = Some(BrowserPanel::new());
+                self.session_view = SessionView::default();
+                // A stale viewer from a previous session must not survive.
+                self.disconnect_viewer();
             }
 
             let screen = std::mem::replace(
@@ -160,9 +270,12 @@ impl App {
                 },
             );
             let (next, follow_ups) = apply_event(screen, ev);
-            // Dropped out of the session view — release the terminal.
+            // Dropped out of the session view — release the terminal, the
+            // browser panel, and the viewer ws (→ agent stops screencast).
             if !matches!(next, Screen::Session { .. }) {
                 self.terminal = None;
+                self.browser = None;
+                self.disconnect_viewer();
             }
             self.screen = next;
             for f in follow_ups {
@@ -172,11 +285,147 @@ impl App {
             }
         }
     }
+
+    /// Render the Session screen: a header + view toolbar, then the split
+    /// (terminal | browser) layout, single-panel when collapsed. Terminal
+    /// input/resize go to the PTY ws; browser input goes to the viewer ws.
+    ///
+    /// Focus routing is egui's native single-focus: each panel calls
+    /// `request_focus()` on click on its own `allocate_painter` response
+    /// (distinct ids — the terminal's and the browser's regions never share
+    /// one), and both gate keyboard/IME capture on `has_focus()`, so typing
+    /// only ever reaches the clicked panel.
+    fn render_session(
+        &mut self,
+        ui: &mut egui::Ui,
+        agent: &str,
+        workspace: &str,
+        cwd: &str,
+    ) {
+        // --- Header + view toolbar ---
+        // A live-screencast dot: lit only when the browser is shown AND a
+        // frame has actually arrived (lazy-connect is up and streaming).
+        let browser_live = self.session_view.shows_browser()
+            && self.browser.as_ref().is_some_and(|p| p.has_frame());
+        ui.horizontal(|ui| {
+            ui.heading(format!("session: {workspace}@{agent}"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.weak(format!("cwd: {cwd}"));
+                ui.add_space(12.0);
+                if browser_live {
+                    ui.colored_label(egui::Color32::from_rgb(80, 200, 120), "● live");
+                    ui.add_space(8.0);
+                }
+                // Three-state toggle. `selectable_value` shows the current
+                // mode pressed. (Cmd/Ctrl+B cycles the same states.)
+                ui.selectable_value(
+                    &mut self.session_view,
+                    SessionView::BrowserOnly,
+                    "Browser",
+                );
+                ui.selectable_value(&mut self.session_view, SessionView::Split, "Split");
+                ui.selectable_value(
+                    &mut self.session_view,
+                    SessionView::TerminalOnly,
+                    "Terminal",
+                );
+            });
+        });
+        ui.separator();
+
+        let view = self.session_view;
+        match view {
+            SessionView::TerminalOnly => {
+                let avail = ui.available_size();
+                self.render_terminal(ui, avail);
+            }
+            SessionView::BrowserOnly => {
+                self.render_browser(ui);
+            }
+            SessionView::Split => {
+                // Browser on the right in a resizable SidePanel (egui
+                // persists its width by id), terminal fills the rest. The
+                // separator drag is bounded to [20%, 80%] of the width so
+                // neither panel can be collapsed away.
+                let total_w = ui.available_width();
+                let range = split_width_range(total_w);
+                egui::SidePanel::right("browser_panel")
+                    .resizable(true)
+                    .default_width((total_w * 0.5).clamp(*range.start(), *range.end()))
+                    .width_range(range)
+                    .show_inside(ui, |ui| {
+                        self.render_browser(ui);
+                    });
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    let avail = ui.available_size();
+                    self.render_terminal(ui, avail);
+                });
+            }
+        }
+    }
+
+    /// Draw the terminal panel and forward its captured input/resize to the
+    /// PTY ws. Focus is the panel's own (click-to-focus, gated internally).
+    fn render_terminal(&mut self, ui: &mut egui::Ui, avail: egui::Vec2) {
+        let output = if let Some(panel) = &mut self.terminal {
+            panel.ui(ui, avail, std::time::Instant::now())
+        } else {
+            ui.weak("(terminal not ready)");
+            terminal::UiOutput::default()
+        };
+        if !output.input.is_empty() {
+            self.send(UiCommand::SendInput(output.input));
+        }
+        if let Some(r) = output.resize {
+            self.send(UiCommand::Resize {
+                cols: r.cols,
+                rows: r.rows,
+            });
+        }
+    }
+
+    /// Draw the browser panel and forward its captured mouse/key/IME events
+    /// up the viewer ws. With no viewer handle (lazy connect pending / a
+    /// drop) the panel shows its placeholder and produces no events.
+    fn render_browser(&mut self, ui: &mut egui::Ui) {
+        let events = match &mut self.browser {
+            Some(panel) => panel.ui(ui),
+            None => {
+                ui.weak("(browser not ready)");
+                return;
+            }
+        };
+        if let Some(handle) = &self.viewer {
+            for ev in events {
+                let _ = handle.cmd_tx.send(ViewerCommand::SendInput(ev));
+            }
+        }
+    }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+
+        // Cmd/Ctrl+B cycles the Session view (Terminal → Split → Browser).
+        // Only meaningful in a session; harmless elsewhere. Consume the
+        // shortcut so it doesn't also reach the terminal as a Ctrl-B byte.
+        if matches!(self.screen, Screen::Session { .. })
+            && ctx.input_mut(|i| {
+                i.consume_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::COMMAND,
+                    egui::Key::B,
+                ))
+            })
+        {
+            self.session_view = self.session_view.cycle();
+        }
+
+        // Lazy viewer-ws lifecycle: open the second ws when the browser panel
+        // is visible, drop it (→ agent stops screencast) when hidden. Then
+        // pump any frames/disconnects into the panel.
+        self.reconcile_viewer(ctx);
+        self.drain_viewer_events(ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // Clone the screen out for rendering so we don't hold a
@@ -295,40 +544,9 @@ impl eframe::App for App {
                     agent,
                     workspace,
                     cwd,
-                    output: _,
+                    ..
                 } => {
-                    // Live terminal panel (Task 3). The VTE state machine
-                    // is fed PtyBytes in `drain_events`; here we just
-                    // render its current grid.
-                    ui.horizontal(|ui| {
-                        ui.heading(format!("session: {workspace}@{agent}"));
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| ui.weak(format!("cwd: {cwd}")),
-                        );
-                    });
-                    ui.separator();
-                    // The terminal owns its own scrollback (alacritty grid +
-                    // wheel scroll), so no egui ScrollArea — the panel sizes
-                    // itself to the remaining region (pixels → cols/rows).
-                    let avail = ui.available_size();
-                    let output = if let Some(panel) = &mut self.terminal {
-                        panel.ui(ui, avail, std::time::Instant::now())
-                    } else {
-                        ui.weak("(terminal not ready)");
-                        terminal::UiOutput::default()
-                    };
-                    // Keyboard/IME/paste bytes from the panel -> hub PTY.
-                    if !output.input.is_empty() {
-                        self.send(UiCommand::SendInput(output.input));
-                    }
-                    // Debounced pixel→grid resize -> hub PTY resize.
-                    if let Some(r) = output.resize {
-                        self.send(UiCommand::Resize {
-                            cols: r.cols,
-                            rows: r.rows,
-                        });
-                    }
+                    self.render_session(ui, &agent, &workspace, &cwd);
                 }
                 Screen::Error { message } => {
                     ui.vertical_centered(|ui| {
@@ -349,6 +567,9 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // Tear down both ws: the PTY (via the backend) and the viewer
+        // (→ hub ViewerDetach → agent stops screencast).
+        self.disconnect_viewer();
         self.send(UiCommand::Close);
     }
 }

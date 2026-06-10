@@ -130,6 +130,10 @@ pub struct BrowserPanel {
     /// egui id of the panel's focusable area, set on the first `ui()` call,
     /// so focus / IME routing can be reasoned about (Task 4 focus routing).
     focus_id: Option<egui::Id>,
+    /// Whether the viewer ws is currently believed to be connected. Drives
+    /// the placeholder text before the first frame arrives and after a drop.
+    /// Set by the App from `ViewerEvent::{Connected,Disconnected}` (Task 4).
+    connected: bool,
 }
 
 impl Default for BrowserPanel {
@@ -147,13 +151,29 @@ impl BrowserPanel {
             ime: ImeState::default(),
             image_rect: None,
             focus_id: None,
+            connected: false,
         }
     }
 
     /// Whether we have a decoded frame to show (vs. the idle placeholder).
-    #[allow(dead_code)]
     pub fn has_frame(&self) -> bool {
         self.texture.is_some()
+    }
+
+    /// Mark the viewer ws connected (frames expected) — flips the placeholder
+    /// from "not connected" to "connecting…" until the first frame lands.
+    pub fn mark_connected(&mut self) {
+        self.connected = true;
+    }
+
+    /// Mark the viewer ws disconnected: the panel keeps showing the last good
+    /// frame dimmed isn't worth the complexity here, so we drop the texture
+    /// and fall back to the placeholder, which now reads "disconnected".
+    pub fn mark_disconnected(&mut self) {
+        self.connected = false;
+        self.texture = None;
+        self.frame_dims = None;
+        self.image_rect = None;
     }
 
     /// Decode a screencast JPEG and update the texture in place.
@@ -182,6 +202,9 @@ impl BrowserPanel {
             }
         }
         self.frame_dims = Some((w, h));
+        // A frame implies a live ws (covers the case where the Frame event
+        // is drained before/without an explicit Connected).
+        self.connected = true;
     }
 
     /// Render the panel into `ui` and return the input events captured this
@@ -207,12 +230,18 @@ impl BrowserPanel {
 
         let frame = self.texture.as_ref().zip(self.frame_dims);
         let Some((texture, (fw, fh))) = frame else {
-            // No frame yet → placeholder, and nothing to capture.
+            // No frame yet → placeholder, and nothing to capture. The text
+            // reflects whether the ws is up (connecting/waiting) or down.
             self.image_rect = None;
+            let msg = if self.connected {
+                "connecting to browser…"
+            } else {
+                "browser idle / not connected"
+            };
             painter.text(
                 panel_rect.center(),
                 egui::Align2::CENTER_CENTER,
-                "browser idle / not connected",
+                msg,
                 egui::FontId::proportional(16.0),
                 egui::Color32::from_gray(140),
             );

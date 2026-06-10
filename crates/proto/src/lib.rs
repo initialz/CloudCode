@@ -163,6 +163,14 @@ pub enum HubToClient {
         agent: String,
         workspace: String,
         cwd: String,
+        /// The hub-minted session id for this PTY session. The native
+        /// desktop app needs it to open its second ws — the browser-panel
+        /// viewer (`/v1/viewer/ws?session=<id>`) — since that endpoint
+        /// keys the screencast by session id. The CLI client ignores it.
+        /// `#[serde(default)]` keeps older agents/clients that omit it
+        /// wire-compatible (it deserializes to the nil uuid).
+        #[serde(default)]
+        session_id: Uuid,
     },
     /// PTY session ended; client should drop raw mode and return to menu.
     SessionClosed {
@@ -535,8 +543,10 @@ mod tests {
                 agent: "a".into(),
                 workspace: "w".into(),
                 cwd: "/home/w".into(),
+                session_id: uuid::uuid!("11111111-2222-3333-4444-555555555555"),
             },
-            json!({"type": "session_opened", "agent": "a", "workspace": "w", "cwd": "/home/w"}),
+            json!({"type": "session_opened", "agent": "a", "workspace": "w", "cwd": "/home/w",
+                "session_id": "11111111-2222-3333-4444-555555555555"}),
         );
     }
 

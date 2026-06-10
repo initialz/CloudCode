@@ -36,6 +36,11 @@ pub enum Screen {
         /// Working directory the hub reported for the session. Carried
         /// for display now; Task 3's TerminalPanel can use it too.
         cwd: String,
+        /// Hub-minted PTY session id. The app needs it to open the
+        /// browser-panel viewer ws (`/v1/viewer/ws?session=<id>`) on lazy
+        /// connect (Task 4). Carried through the session state so the
+        /// reducer stays pure.
+        session_id: String,
         output: String,
     },
     /// Terminal failure — the connection is gone or the hub rejected us.
@@ -109,12 +114,14 @@ pub fn apply_event(screen: Screen, event: BackendEvent) -> (Screen, Vec<FollowUp
                 agent,
                 workspace,
                 cwd,
+                session_id,
             },
         ) => (
             Screen::Session {
                 agent,
                 workspace,
                 cwd,
+                session_id,
                 output: String::new(),
             },
             vec![],
@@ -139,6 +146,7 @@ pub fn apply_event(screen: Screen, event: BackendEvent) -> (Screen, Vec<FollowUp
                 agent,
                 workspace,
                 cwd,
+                session_id,
                 mut output,
             },
             BackendEvent::PtyBytes(bytes),
@@ -158,6 +166,7 @@ pub fn apply_event(screen: Screen, event: BackendEvent) -> (Screen, Vec<FollowUp
                     agent,
                     workspace,
                     cwd,
+                    session_id,
                     output,
                 },
                 vec![],
@@ -255,6 +264,7 @@ mod tests {
             agent: "a".into(),
             workspace: "w".into(),
             cwd: "/w".into(),
+            session_id: "sess-1".into(),
             output: output.into(),
         }
     }
@@ -312,6 +322,7 @@ mod tests {
                 agent: "agentA".into(),
                 workspace: "proj".into(),
                 cwd: "/home/proj".into(),
+                session_id: "sess-42".into(),
             },
         );
         match next {
@@ -319,11 +330,13 @@ mod tests {
                 agent,
                 workspace,
                 cwd,
+                session_id,
                 output,
             } => {
                 assert_eq!(agent, "agentA");
                 assert_eq!(workspace, "proj");
                 assert_eq!(cwd, "/home/proj");
+                assert_eq!(session_id, "sess-42");
                 assert!(output.is_empty());
             }
             other => panic!("expected session, got {:?}", other),

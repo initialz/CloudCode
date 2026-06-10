@@ -61,6 +61,9 @@ pub enum BackendEvent {
         agent: String,
         workspace: String,
         cwd: String,
+        /// Hub-minted PTY session id (as a string) — the app uses it to
+        /// open the browser-panel viewer ws (`/v1/viewer/ws?session=<id>`).
+        session_id: String,
     },
     SessionError(String),
     PtyBytes(Vec<u8>),
@@ -335,6 +338,7 @@ async fn handle_hub_frame(
             agent,
             workspace,
             cwd,
+            session_id,
         } => emit(
             event_tx,
             ctx,
@@ -342,6 +346,7 @@ async fn handle_hub_frame(
                 agent,
                 workspace,
                 cwd,
+                session_id: session_id.to_string(),
             },
         ),
         HubToClient::SessionError { message } => {

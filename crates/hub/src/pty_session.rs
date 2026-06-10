@@ -919,6 +919,7 @@ where
                     agent: conn.name.clone(),
                     workspace: workspace.clone(),
                     cwd,
+                    session_id,
                 },
             )
             .await;

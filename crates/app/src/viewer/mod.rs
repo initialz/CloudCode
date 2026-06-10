@@ -19,11 +19,8 @@ pub mod client;
 pub mod panel;
 pub mod proto;
 
-// Re-exported for the browser panel + Session screen to consume. Unused
-// until Task 4 wires the panel into the Session split layout.
-#[allow(unused_imports)]
+// Re-exported for the Session split layout (Task 4) to consume: the App
+// holds a `BrowserPanel` + an `Option<ViewerHandle>` and pumps
+// `ViewerEvent`s / `ViewerCommand`s between them.
 pub use client::{ViewerCommand, ViewerEvent, ViewerHandle};
-#[allow(unused_imports)]
 pub use panel::BrowserPanel;
-#[allow(unused_imports)]
-pub use proto::ViewerInputEvent;
