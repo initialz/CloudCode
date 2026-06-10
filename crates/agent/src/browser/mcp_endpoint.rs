@@ -511,16 +511,16 @@ pub async fn handle_post(token: &str, body: String, state: &EndpointState) -> Po
     }
 }
 
-/// Bind the localhost MCP listener. POST `/mcp/:token` is the POST-blocking
-/// JSON-RPC relay; GET on the same path is rejected (no server-initiated SSE).
-/// `/healthz` stays so we can verify the listener is up.
-pub async fn serve(state: EndpointState, port: u16) -> std::io::Result<()> {
+/// Build the axum router for the localhost MCP relay. POST `/mcp/:token` is the
+/// POST-blocking JSON-RPC relay; GET on the same path is rejected (no
+/// server-initiated SSE). `/healthz` stays so we can verify the listener is up.
+fn build_router(state: EndpointState) -> axum::Router {
     use axum::extract::{Path, State};
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use axum::routing::{get, post};
 
-    let app = axum::Router::new()
+    axum::Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route(
             "/mcp/:token",
@@ -539,11 +539,24 @@ pub async fn serve(state: EndpointState, port: u16) -> std::io::Result<()> {
             // No server-initiated SSE; reject GET cleanly.
             .get(|| async { StatusCode::METHOD_NOT_ALLOWED }),
         )
-        .with_state(state);
+        .with_state(state)
+}
 
+/// Bind the localhost MCP listener on `port` and serve until shutdown.
+pub async fn serve(state: EndpointState, port: u16) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     tracing::info!(port, "browser MCP endpoint listening on 127.0.0.1");
-    axum::serve(listener, app)
+    serve_on_listener(state, listener).await
+}
+
+/// Serve on an already-bound listener. Used by tests so they can bind `:0` and
+/// hand the live listener straight to `serve` — eliminating the bind/close/
+/// re-bind window that races a concurrently-assigned port across tests.
+pub async fn serve_on_listener(
+    state: EndpointState,
+    listener: tokio::net::TcpListener,
+) -> std::io::Result<()> {
+    axum::serve(listener, build_router(state))
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }
@@ -650,14 +663,15 @@ mod tests {
         let token = "tok-e2e";
         state.register(token.into(), sid);
 
-        let port = free_port();
+        // Bind :0 and hand the LIVE listener to serve — no close/re-bind window,
+        // so a concurrent test can never steal this port out from under us.
+        let (listener, base) = bound_listener().await;
         let serve_state = state.clone();
         tokio::spawn(async move {
-            let _ = serve(serve_state, port).await;
+            let _ = serve_on_listener(serve_state, listener).await;
         });
 
         let client = reqwest::Client::new();
-        let base = format!("http://127.0.0.1:{port}");
         assert_eq!(wait_healthz(&client, &base).await, "ok");
 
         // initialize handshake -> echo stub answers with serverInfo.
@@ -1117,9 +1131,28 @@ mod tests {
     }
 
     /// Grab a currently-free localhost TCP port by binding to :0.
+    ///
+    /// NOTE: this closes the listener, so the returned port is only *probably*
+    /// free — there's a window where another binder can take it. Use it only
+    /// where a bare port number is unavoidable (e.g. a CDP port handed to
+    /// Chrome). For our own `serve`, prefer [`bound_listener`], which keeps the
+    /// listener open and races nothing.
     fn free_port() -> u16 {
         let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
         l.local_addr().expect("local_addr").port()
+    }
+
+    /// Bind `127.0.0.1:0` and return the LIVE listener plus its `http://` base
+    /// URL. The listener stays open and is meant to be handed straight to
+    /// [`serve_on_listener`], so there is no bind/close/re-bind window for a
+    /// concurrent test to slip into — this is the race-free way to stand up the
+    /// endpoint in tests.
+    async fn bound_listener() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0u16))
+            .await
+            .expect("bind 127.0.0.1:0");
+        let port = listener.local_addr().expect("local_addr").port();
+        (listener, format!("http://127.0.0.1:{port}"))
     }
 
     /// Wait until `serve` has bound and `/healthz` answers.

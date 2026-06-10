@@ -129,3 +129,134 @@ impl ViewerManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::BrowserConfig;
+    use crate::tunnel::unpack_pty_frame;
+    use std::time::Duration;
+
+    /// P2 end-to-end (T1+T2) integration: drive the real agent-internal viewer
+    /// path against a real headless Chrome — `ViewerManager::attach` →
+    /// `ScreencastSession` → a `TAG_SCREENCAST_FRAME`-tagged binary frame lands
+    /// on the per-connection `OutFrame` channel keyed by the viewer_session_id —
+    /// then inject a viewer input (mouse + IME InsertText) and detach. This is
+    /// the agent half of the screencast pipe with NO hub/browser-UI: it proves
+    /// the same wiring the hub's viewer ws relay drives in production.
+    ///
+    /// Run manually:
+    /// `cargo test -p cloudcode-agent viewer_attach_streams -- --ignored --nocapture`
+    /// Prereqs: a real Chrome/Chromium install on PATH (no internet needed; the
+    /// page is a self-contained `data:` URL).
+    #[tokio::test]
+    #[ignore = "requires a real Chrome install; run manually"]
+    async fn viewer_attach_streams_tagged_jpeg_frame_and_accepts_input() {
+        let cfg = BrowserConfig {
+            enabled: true,
+            chrome_path: None,
+            cdp_port: 19245,
+            mcp_port: 7111,
+            mcp_command: None,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let chrome = Arc::new(ChromeManager::new(cfg, tmp.path()));
+        chrome
+            .start()
+            .await
+            .expect("Chrome should start and become ready");
+        let cdp = chrome.cdp_http_url();
+
+        // Open a non-blank page so the screencast has real pixels. Newer Chrome
+        // wants PUT on /json/new; older accepts GET. Try PUT first, GET fallback.
+        let data_url = "data:text/html,<h1 style=font-size:80px>P2-VIEWER</h1>";
+        let new_url = format!("{cdp}/json/new?{data_url}");
+        let http = reqwest::Client::new();
+        let opened = match http.put(&new_url).send().await {
+            Ok(r) if r.status().is_success() => true,
+            _ => matches!(http.get(&new_url).send().await, Ok(r) if r.status().is_success()),
+        };
+        assert!(opened, "failed to open a data: page target via /json/new");
+        // Give Chrome a moment to register + render the new target.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        // Per-connection OutFrame channel — exactly what ws::run_once hands the
+        // ViewerManager. The hub's viewer ws relay drains this same channel.
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(32);
+        let manager = ViewerManager::new(Arc::clone(&chrome), out_tx);
+
+        let viewer_session_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4(); // P2 ignores this for page selection
+        manager.attach(viewer_session_id, session_id).await;
+
+        // Drain OutFrames until the first Binary screencast frame (skip any
+        // interleaved Text). Must arrive within 5s. A ViewerClosed Text means
+        // the screencast failed to start — surface it loudly.
+        let frame = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match out_rx.recv().await {
+                    Some(OutFrame::Binary(b)) => break b,
+                    Some(OutFrame::Text(ClientMsg::ViewerClosed { reason, .. })) => {
+                        panic!("screencast closed before any frame: {reason:?}");
+                    }
+                    Some(OutFrame::Text(_)) => continue,
+                    None => panic!("OutFrame channel closed before any frame"),
+                }
+            }
+        })
+        .await
+        .expect("a screencast frame should arrive within 5s");
+
+        // Unpack the binary frame: TAG_SCREENCAST_FRAME, keyed by the
+        // viewer_session_id, payload is a raw JPEG (magic bytes FF D8).
+        let (tag, id, payload) =
+            unpack_pty_frame(&frame).expect("frame must unpack as [tag][16B id][payload]");
+        assert_eq!(
+            tag, TAG_SCREENCAST_FRAME,
+            "binary frame must carry the screencast tag 0x03"
+        );
+        assert_eq!(
+            id, viewer_session_id,
+            "frame must be keyed by the viewer_session_id"
+        );
+        assert!(payload.len() >= 2, "JPEG payload too short");
+        assert_eq!(
+            &payload[0..2],
+            &[0xFF, 0xD8],
+            "payload must start with JPEG magic bytes FF D8; got {:02X} {:02X}",
+            payload[0],
+            payload[1]
+        );
+        eprintln!(
+            "got TAG_SCREENCAST_FRAME (0x{tag:02X}) viewer={id} JPEG {} bytes, magic {:02X} {:02X}",
+            payload.len(),
+            payload[0],
+            payload[1]
+        );
+
+        // Inject viewer input down the same path the hub relay uses: a mouse
+        // move and an IME InsertText (Chinese). Must not panic; must NOT trip a
+        // ViewerClosed error on the channel.
+        manager.input(viewer_session_id, &ViewerInputEvent::MouseMove { x: 20.0, y: 20.0 });
+        manager.input(
+            viewer_session_id,
+            &ViewerInputEvent::InsertText { text: "你好".into() },
+        );
+        // Input to an unknown viewer is a harmless no-op (no panic).
+        manager.input(Uuid::new_v4(), &ViewerInputEvent::MouseMove { x: 0.0, y: 0.0 });
+
+        // Drain briefly: confirm the channel is still alive and hasn't surfaced
+        // an error ViewerClosed off the input path.
+        match tokio::time::timeout(Duration::from_millis(300), out_rx.recv()).await {
+            Ok(Some(OutFrame::Text(ClientMsg::ViewerClosed { reason, .. }))) => {
+                panic!("unexpected ViewerClosed after input: {reason:?}");
+            }
+            // More frames or a quiet channel are both fine.
+            _ => {}
+        }
+
+        // Detach tears down the CDP ws + read task (no leak).
+        manager.detach(viewer_session_id).await;
+        drop(chrome);
+    }
+}
