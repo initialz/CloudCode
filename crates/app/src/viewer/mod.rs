@@ -11,14 +11,19 @@
 //!   down (`ViewerEvent::Frame`) and `ViewerInputEvent`s up, bridged to the
 //!   egui UI over channels via [`client::ViewerHandle`].
 //!
-//! Rendering frames to textures and capturing egui input is Task 3; this
-//! module is wiring + transport only.
+//! - [`panel`]  — the browser panel: decodes JPEG frames to an egui
+//!   texture, draws them letterboxed, and captures mouse/keyboard/IME into
+//!   `ViewerInputEvent`s (Task 3). Wired into the Session split in Task 4.
 
 pub mod client;
+pub mod panel;
 pub mod proto;
 
-// Re-exported for Task 3 (the browser panel) to consume. Unused until then.
+// Re-exported for the browser panel + Session screen to consume. Unused
+// until Task 4 wires the panel into the Session split layout.
 #[allow(unused_imports)]
 pub use client::{ViewerCommand, ViewerEvent, ViewerHandle};
+#[allow(unused_imports)]
+pub use panel::BrowserPanel;
 #[allow(unused_imports)]
 pub use proto::ViewerInputEvent;

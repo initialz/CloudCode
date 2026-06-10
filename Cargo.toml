@@ -41,6 +41,7 @@ ratatui = "0.28"
 crossterm = { version = "0.28", features = ["event-stream"] }
 alacritty_terminal = "0.25"
 unicode-width = "0.1"
+zune-jpeg = "0.5"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "chrono", "macros"] }
 notify = { version = "6", default-features = false, features = ["macos_fsevent"] }
