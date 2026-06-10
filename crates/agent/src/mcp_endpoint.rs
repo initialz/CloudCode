@@ -66,7 +66,6 @@ impl EndpointState {
         token
     }
 
-    #[allow(dead_code)]
     pub fn unregister(&self, token: &str) {
         self.routes.remove(token);
     }
@@ -301,6 +300,16 @@ mod tests {
         let sid = uuid::Uuid::new_v4();
         let tok = st.reserve(sid);
         assert_eq!(st.session_for(&tok), Some(sid));
+    }
+
+    #[test]
+    fn unregister_clears_route() {
+        let st = EndpointState::new();
+        let sid = uuid::Uuid::new_v4();
+        let tok = st.reserve(sid);
+        assert_eq!(st.session_for(&tok), Some(sid));
+        st.unregister(&tok);
+        assert_eq!(st.session_for(&tok), None);
     }
 
     #[tokio::test]

@@ -64,6 +64,9 @@ struct PtyHandle {
     /// Stops the jsonl watcher task on drop. Held only for its
     /// Drop side-effect.
     _jsonl: crate::jsonl::WatcherHandle,
+    /// MCP browser token minted for this session (Some when browser_capable);
+    /// removed from the endpoint route map on close.
+    mcp_token: Option<String>,
 }
 
 impl PtyManager {
@@ -580,7 +583,11 @@ impl PtyManager {
         // old handle silently (the reader thread will see read==0 and exit
         // without emitting PtyClosed because we set a no-emit marker through
         // the absence of the entry in `sessions`).
-        let _ = self.sessions.remove(&session_id);
+        if let Some((_, h)) = self.sessions.remove(&session_id) {
+            if let Some(tok) = &h.mcp_token {
+                self.mcp.unregister(tok);
+            }
+        }
         let cwd_raw = self.workspace_root().join(&account).join(&workspace);
         if let Err(e) = std::fs::create_dir_all(&cwd_raw) {
             let _ = tx
@@ -613,9 +620,10 @@ impl PtyManager {
         // alongside the other extra args). When the client isn't
         // browser-capable, we skip injection entirely so claude launches with
         // no `cc-browser` MCP server configured.
+        let mut mcp_token = None;
         if browser_capable {
-            let mcp_token = self.mcp.reserve(session_id);
-            let mcp_cfg = crate::mcp_endpoint::mcp_config_json(self.mcp_port, &mcp_token);
+            let token = self.mcp.reserve(session_id);
+            let mcp_cfg = crate::mcp_endpoint::mcp_config_json(self.mcp_port, &token);
             let mcp_cfg_path = cwd.join(".cloudcode").join("mcp-browser.json");
             if let Some(parent) = mcp_cfg_path.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -627,6 +635,7 @@ impl PtyManager {
             // wrapper passes $@ through to the tool on first boot).
             claude_args.push("--mcp-config".to_string());
             claude_args.push(mcp_cfg_path.to_string_lossy().to_string());
+            mcp_token = Some(token);
         }
 
         // Open the PTY.
@@ -923,6 +932,7 @@ impl PtyManager {
             account: account.clone(),
             workspace: workspace.clone(),
             _jsonl: jsonl,
+            mcp_token,
         });
         self.sessions.insert(session_id, handle.clone());
 
@@ -957,11 +967,12 @@ impl PtyManager {
         // already been replaced by a fresh handle).
         let sessions = self.sessions.clone();
         let tx_out = tx.clone();
+        let mcp = self.mcp.clone();
         let _ = std::thread::Builder::new()
             .name(format!("pty-reader-{}", session_id))
             .spawn(move || {
                 pty_reader_loop(
-                    handle, reader, session_id, sessions, tx_out, recorder, child,
+                    handle, reader, session_id, sessions, tx_out, recorder, child, mcp,
                 )
             });
     }
@@ -969,7 +980,11 @@ impl PtyManager {
     async fn close(&self, session_id: Uuid, tx: mpsc::Sender<OutFrame>) {
         // Drop the handle; the reader thread will see read=0 and exit; tmux
         // session stays alive on the OS.
-        self.sessions.remove(&session_id);
+        if let Some((_, h)) = self.sessions.remove(&session_id) {
+            if let Some(tok) = &h.mcp_token {
+                self.mcp.unregister(tok);
+            }
+        }
         let _ = tx
             .send(OutFrame::Text(ClientMsg::PtyClosed {
                 session_id,
@@ -1637,6 +1652,7 @@ fn pty_reader_loop(
     tx_out: mpsc::Sender<OutFrame>,
     mut recorder: Option<Recorder>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    mcp: crate::mcp_endpoint::EndpointState,
 ) {
     let mut buf = [0u8; 4096];
     loop {
@@ -1666,7 +1682,11 @@ fn pty_reader_loop(
         .map(|e| Arc::ptr_eq(e.value(), &handle))
         .unwrap_or(false);
     if still_us {
-        sessions.remove(&session_id);
+        if let Some((_, h)) = sessions.remove(&session_id) {
+            if let Some(tok) = &h.mcp_token {
+                mcp.unregister(tok);
+            }
+        }
         let _ = child.try_wait();
         let _ = tx_out.blocking_send(OutFrame::Text(ClientMsg::PtyClosed {
             session_id,
