@@ -6,3 +6,4 @@ Cargo.lock.bak
 hub.toml
 config.toml
 audit.jsonl
+.playwright-mcp/
