@@ -1,4 +1,5 @@
 mod audit;
+mod browser;
 mod config;
 mod fs;
 mod jsonl;
