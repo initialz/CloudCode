@@ -3,6 +3,24 @@
 Validates the reverse browser-RPC channel end to end with real hub + agent + client
 processes and a real `claude`, using the echo MCP stub on the client side.
 
+> **✅ VALIDATED 2026-06-10** by petez on PeteMacBookPro (all three processes local,
+> branch `feature/local-browser-m1` @ c95be51): claude connected to `cc-browser`,
+> `tools/call echo text="hello"` returned `echo: hello` through the full chain.
+>
+> **Gotchas hit during validation (read before re-running):**
+> 1. **Fresh session required after agent restart.** Tokens live in agent memory;
+>    a tmux-reattached claude keeps its original (now-dead) token. Reset the
+>    workspace / open a new one after restarting the agent.
+> 2. **Launch the client with the stub command pinned** if in doubt:
+>    `export CC_BROWSER_MCP="node /abs/path/to/test-fixtures/echo-mcp.mjs"` before
+>    starting `cloudcode`. (Default resolution walks up from the binary, but the
+>    env var removes all ambiguity.)
+> 3. **Must use the Rust CLI client** — webterm has no browser channel in M1;
+>    sessions opened via the browser SPA will time out on MCP calls.
+> 4. claude treats any non-2xx on the MCP POST as "auth required" and goes into a
+>    misleading OAuth-discovery failure — that's why the endpoint returns transport
+>    errors as JSON-RPC errors at HTTP 200 (fixed in 535113b/c95be51).
+
 ## Prereqs
 - `node` installed on the CLIENT machine (the laptop running `cloudcode`). The client
   advertises `browser_capable` by probing for `node` on PATH (`cc_browser::which_node`),
