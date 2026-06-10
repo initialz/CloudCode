@@ -196,6 +196,23 @@ pub fn mcp_config_json(port: u16, token: &str) -> String {
     )
 }
 
+/// Pull the token back out of a previously written mcp-browser.json so an
+/// agent restart re-adopts it instead of minting a fresh one (a claude
+/// surviving in tmux still holds this token in memory).
+pub fn extract_token_from_config(json: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let url = v
+        .get("mcpServers")?
+        .get("cc-browser")?
+        .get("url")?
+        .as_str()?;
+    let token = url.rsplit('/').next()?;
+    if token.is_empty() {
+        return None;
+    }
+    Some(token.to_string())
+}
+
 /// Outcome of a claude POST. Mapped to HTTP status in the axum handler.
 ///
 /// Transport-level problems for a JSON-RPC *request* (unknown token,
@@ -566,6 +583,52 @@ mod tests {
         assert!(s.contains("\"type\":\"http\""));
         assert!(s.contains("http://127.0.0.1:7110/mcp/abc123"));
         let _: serde_json::Value = serde_json::from_str(&s).unwrap(); // valid JSON
+    }
+
+    #[test]
+    fn extract_token_roundtrip() {
+        // The main self-heal path: write a config with mcp_config_json,
+        // then read back the token — must round-trip exactly.
+        let json = mcp_config_json(7110, "abc123");
+        assert_eq!(
+            extract_token_from_config(&json),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_token_garbage_json_returns_none() {
+        assert_eq!(extract_token_from_config("not json at all"), None);
+        assert_eq!(extract_token_from_config(""), None);
+        assert_eq!(extract_token_from_config("{]"), None);
+    }
+
+    #[test]
+    fn extract_token_missing_fields_returns_none() {
+        // Missing mcpServers entirely.
+        assert_eq!(extract_token_from_config(r#"{"other":"value"}"#), None);
+        // mcpServers present but no cc-browser key.
+        assert_eq!(
+            extract_token_from_config(r#"{"mcpServers":{"other":{}}}"#),
+            None
+        );
+        // cc-browser present but no url field.
+        assert_eq!(
+            extract_token_from_config(r#"{"mcpServers":{"cc-browser":{"type":"http"}}}"#),
+            None
+        );
+        // url present but not a string.
+        assert_eq!(
+            extract_token_from_config(r#"{"mcpServers":{"cc-browser":{"url":42}}}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_token_empty_token_returns_none() {
+        // URL ends with a trailing slash — the trailing segment is empty.
+        let json = r#"{"mcpServers":{"cc-browser":{"url":"http://127.0.0.1:7110/mcp/"}}}"#;
+        assert_eq!(extract_token_from_config(json), None);
     }
 
     #[test]
