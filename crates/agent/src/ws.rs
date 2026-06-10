@@ -1,3 +1,4 @@
+use crate::browser::viewer::ViewerManager;
 use crate::pty::OutFrame;
 use crate::tunnel::{
     unpack_pty_frame, ClientMsg, RejectReason, ServerMsg, PROTOCOL_VERSION, TAG_PTY_INPUT,
@@ -126,7 +127,12 @@ async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
         let _ = sink.close().await;
     });
 
-    let read_result = read_loop(state.clone(), tx.clone(), &mut stream).await;
+    // Per-connection viewer manager: owns this connection's screencasts and
+    // sends frames over `tx`. Dropped when `run_once` returns, which stops
+    // every in-flight screencast — no screencast survives a reconnect.
+    let viewers = Arc::new(ViewerManager::new(state.chrome.clone(), tx.clone()));
+
+    let read_result = read_loop(state.clone(), tx.clone(), viewers, &mut stream).await;
     // Abort the writer instead of awaiting it. read_loop spawns
     // detached tasks (PtyManager::handle) that each hold their own
     // tx clone — those tasks survive the connection and only drop
@@ -147,6 +153,7 @@ async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
 async fn read_loop<S>(
     state: Arc<AppState>,
     tx: mpsc::Sender<OutFrame>,
+    viewers: Arc<ViewerManager>,
     stream: &mut S,
 ) -> Result<(), RunError>
 where
@@ -227,6 +234,32 @@ where
                             }
                         }
                     });
+                }
+                // Viewer screencast control. Attach/Detach touch the CDP ws
+                // (await) so they're spawned; Input is a non-blocking enqueue
+                // into the live screencast and runs inline. The ViewerManager
+                // is per-connection (frames go out over this `tx`), so these
+                // never reach PtyManager.
+                Ok(ServerMsg::ViewerAttach {
+                    viewer_session_id,
+                    session_id,
+                }) => {
+                    let viewers = viewers.clone();
+                    tokio::spawn(async move {
+                        viewers.attach(viewer_session_id, session_id).await;
+                    });
+                }
+                Ok(ServerMsg::ViewerDetach { viewer_session_id }) => {
+                    let viewers = viewers.clone();
+                    tokio::spawn(async move {
+                        viewers.detach(viewer_session_id).await;
+                    });
+                }
+                Ok(ServerMsg::ViewerInput {
+                    viewer_session_id,
+                    event,
+                }) => {
+                    viewers.input(viewer_session_id, &event);
                 }
                 // Stateful, ordered frames (the FsWriteInit → FsWriteChunk…
                 // → eof upload sequence) MUST run in arrival order. Spawning

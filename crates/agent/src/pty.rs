@@ -512,6 +512,11 @@ impl PtyManager {
                 }
             }
             ServerMsg::Welcome { .. } | ServerMsg::Rejected { .. } | ServerMsg::Ping => {}
+            // Viewer screencast control frames are handled in `ws::read_loop`
+            // by the per-connection ViewerManager and never reach here.
+            ServerMsg::ViewerAttach { .. }
+            | ServerMsg::ViewerDetach { .. }
+            | ServerMsg::ViewerInput { .. } => {}
         }
     }
 

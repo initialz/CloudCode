@@ -23,10 +23,10 @@
 // zero-warning bar isn't tripped before the consumers land.
 #![allow(dead_code)]
 
+use crate::tunnel::ViewerInputEvent;
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
@@ -34,45 +34,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_tungstenite::tungstenite::Message;
 
-// ---------------------------------------------------------------------------
-// Viewer input event (shared with the protocol in Task 2 — keep it clean).
-// ---------------------------------------------------------------------------
-
-/// A single user-input event captured by the viewer page, expressed in viewport
-/// pixels. The viewer (Task 3) does the canvas→viewport scaling before sending.
-///
-/// `#[serde(tag = "kind", rename_all = "snake_case")]` gives a flat, JS-friendly
-/// wire shape, e.g. `{"kind":"mouse_move","x":10,"y":20}`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum ViewerInputEvent {
-    /// Pointer moved (no button change).
-    MouseMove { x: f64, y: f64 },
-    /// A mouse button went down or up at `(x, y)`.
-    MouseButton {
-        x: f64,
-        y: f64,
-        /// CDP button name: `left` / `right` / `middle` / `none`.
-        button: String,
-        /// `true` = pressed, `false` = released.
-        down: bool,
-        /// CDP `clickCount` (1 = single, 2 = double, …).
-        click_count: u32,
-    },
-    /// Scroll wheel; `dx`/`dy` are CDP deltaX/deltaY.
-    Wheel { x: f64, y: f64, dx: f64, dy: f64 },
-    /// A key went down or up.
-    Key {
-        key: String,
-        code: String,
-        text: String,
-        down: bool,
-        /// CDP modifiers bitmask (Alt=1, Ctrl=2, Meta=4, Shift=8).
-        modifiers: i64,
-    },
-    /// Commit a whole string (IME composition end / paste).
-    InsertText { text: String },
-}
+// `ViewerInputEvent` is the canonical agent↔hub protocol type, defined in
+// `crate::tunnel` (P2 Task 2). It's imported here so `input_to_cdp` and the
+// `ScreencastSession::input` path map the same wire shape the hub forwards.
 
 // ---------------------------------------------------------------------------
 // Pure helper: pick the best page target.

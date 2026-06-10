@@ -1,5 +1,6 @@
 use crate::tunnel::{
     pack_pty_frame, unpack_pty_frame, ClientMsg, ServerMsg, TAG_PTY_INPUT, TAG_PTY_OUTPUT,
+    TAG_SCREENCAST_FRAME,
 };
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -54,6 +55,7 @@ impl AgentRegistry {
                     id: NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed),
                     send,
                     sessions: DashMap::new(),
+                    viewer_sessions: DashMap::new(),
                     workspace_requests: DashMap::new(),
                     fs_read_streams: DashMap::new(),
                 });
@@ -81,6 +83,11 @@ impl AgentRegistry {
                 }));
             }
         }
+        // Dropping the frame senders closes each viewer's channel, which
+        // ends its ws relay loop (the viewer sees the stream stop). No
+        // sentinel needed — the receiver observing a closed channel is the
+        // signal.
+        conn.viewer_sessions.clear();
         conn.workspace_requests.clear();
         // Drain any in-flight FsRead streams: send a terminal error
         // chunk so the HTTP handler closes its response body promptly
@@ -131,6 +138,10 @@ pub struct AgentConn {
     send: mpsc::Sender<OutgoingFrame>,
     /// Active PTY sessions hosted by this agent, keyed by session_id.
     sessions: DashMap<Uuid, mpsc::Sender<PtyEventOut>>,
+    /// Active browser screencast viewers, keyed by viewer_session_id. Each
+    /// `TAG_SCREENCAST_FRAME` binary frame (a raw JPEG) is forwarded to the
+    /// matching sender; the viewer ws relay loop holds the receiver.
+    viewer_sessions: DashMap<Uuid, mpsc::Sender<bytes::Bytes>>,
     /// One-shot reply slots for workspace_list / create / delete / update by request_id.
     workspace_requests: DashMap<Uuid, oneshot::Sender<ClientMsg>>,
     /// Streaming reply slots for `FsRead`: many `FsReadChunk` frames per
@@ -173,6 +184,17 @@ impl AgentConn {
 
     pub fn unregister_session(&self, session_id: Uuid) {
         self.sessions.remove(&session_id);
+    }
+
+    /// Register a screencast frame sink for `viewer_session_id`. The viewer
+    /// ws relay loop (P2 Task 3) holds the receiver and forwards each JPEG
+    /// out to the browser.
+    pub fn register_viewer(&self, viewer_session_id: Uuid, tx: mpsc::Sender<bytes::Bytes>) {
+        self.viewer_sessions.insert(viewer_session_id, tx);
+    }
+
+    pub fn unregister_viewer(&self, viewer_session_id: Uuid) {
+        self.viewer_sessions.remove(&viewer_session_id);
     }
 
     pub fn register_workspace_request(&self, request_id: Uuid, tx: oneshot::Sender<ClientMsg>) {
@@ -246,34 +268,64 @@ impl AgentConn {
                     }
                 }
             }
+            Routing::Viewer(vid) => {
+                // The agent's screencast ended. Drop the viewer's frame
+                // channel so its ws relay loop observes a closed channel and
+                // ends — same close-by-drop signal as the agent-disconnect
+                // path in `unregister`. (`reason` is logged for diagnostics
+                // but not forwarded; the viewer just sees the stream stop.)
+                if let ClientMsg::ViewerClosed { reason, .. } = &frame {
+                    tracing::debug!(viewer = %vid, reason = ?reason, "viewer screencast closed by agent");
+                }
+                self.viewer_sessions.remove(&vid);
+            }
             Routing::Discard => {}
         }
     }
 
-    /// Handle an incoming binary frame from the agent. Only TAG_PTY_OUTPUT is
-    /// expected; payload is forwarded to the matching session's PTY channel.
+    /// Handle an incoming binary frame from the agent, dispatching on the tag:
     ///
-    /// Uses `try_send` — a slow webterm consumer drops PTY output
+    ///   * `TAG_PTY_OUTPUT` — PTY output, forwarded to the matching session's
+    ///     PTY channel (keyed by session_id).
+    ///   * `TAG_SCREENCAST_FRAME` — a raw JPEG, forwarded to the matching
+    ///     viewer's frame channel (here `sid` is the viewer_session_id).
+    ///
+    /// Uses `try_send` everywhere — a slow webterm / viewer consumer drops
     /// frames instead of blocking the entire agent read loop.
     pub fn handle_binary_frame(&self, raw: &[u8]) {
         let Some((tag, sid, payload)) = unpack_pty_frame(raw) else {
             tracing::warn!("malformed binary frame from agent");
             return;
         };
-        if tag != TAG_PTY_OUTPUT {
-            tracing::warn!(tag, "unexpected binary tag from agent");
-            return;
-        }
-        let tx = self.sessions.get(&sid).map(|e| e.value().clone());
-        if let Some(tx) = tx {
-            let bytes = Bytes::copy_from_slice(payload);
-            if let Err(mpsc::error::TrySendError::Full(_)) =
-                tx.try_send(PtyEventOut::Output(bytes))
-            {
-                tracing::warn!(session = %sid, "pty output channel full; dropping frame");
+        match tag {
+            TAG_PTY_OUTPUT => {
+                let tx = self.sessions.get(&sid).map(|e| e.value().clone());
+                if let Some(tx) = tx {
+                    let bytes = Bytes::copy_from_slice(payload);
+                    if let Err(mpsc::error::TrySendError::Full(_)) =
+                        tx.try_send(PtyEventOut::Output(bytes))
+                    {
+                        tracing::warn!(session = %sid, "pty output channel full; dropping frame");
+                    }
+                } else {
+                    tracing::trace!(session = %sid, "binary frame for unknown session");
+                }
             }
-        } else {
-            tracing::trace!(session = %sid, "binary frame for unknown session");
+            TAG_SCREENCAST_FRAME => {
+                // `sid` is the viewer_session_id for screencast frames.
+                let tx = self.viewer_sessions.get(&sid).map(|e| e.value().clone());
+                if let Some(tx) = tx {
+                    let bytes = Bytes::copy_from_slice(payload);
+                    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(bytes) {
+                        tracing::warn!(viewer = %sid, "viewer frame channel full; dropping frame");
+                    }
+                } else {
+                    tracing::trace!(viewer = %sid, "screencast frame for unknown viewer");
+                }
+            }
+            other => {
+                tracing::warn!(tag = other, "unexpected binary tag from agent");
+            }
         }
     }
 }
@@ -284,6 +336,9 @@ enum Routing {
     /// `FsReadChunk` stream: many frames per request_id, routed via the
     /// mpsc-backed `fs_read_streams` map (oneshot can't carry a stream).
     FsStream(Uuid),
+    /// `ViewerClosed`: the agent's screencast for this viewer_session_id
+    /// ended; close the viewer's frame channel so its ws relay loop exits.
+    Viewer(Uuid),
     Discard,
 }
 
@@ -303,6 +358,9 @@ fn classify(frame: &ClientMsg) -> Routing {
         | ClientMsg::FsWriteResult { request_id, .. }
         | ClientMsg::FsDeleteResult { request_id, .. } => Routing::Workspace(*request_id),
         ClientMsg::FsReadChunk { request_id, .. } => Routing::FsStream(*request_id),
+        ClientMsg::ViewerClosed {
+            viewer_session_id, ..
+        } => Routing::Viewer(*viewer_session_id),
         ClientMsg::Hello { .. }
         | ClientMsg::Pong
         | ClientMsg::Message { .. }
@@ -332,6 +390,7 @@ mod tests {
             id: 0,
             send,
             sessions: DashMap::new(),
+            viewer_sessions: DashMap::new(),
             workspace_requests: DashMap::new(),
             fs_read_streams: DashMap::new(),
         })
@@ -390,5 +449,65 @@ mod tests {
             got,
             ClientMsg::FsReadChunk { error: Some(ref e), .. } if e == "boom"
         ));
+    }
+
+    #[tokio::test]
+    async fn screencast_frame_routes_to_viewer() {
+        let conn = mk_conn();
+        let vid = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel::<Bytes>(8);
+        conn.register_viewer(vid, tx);
+
+        // A TAG_SCREENCAST_FRAME keyed by viewer_session_id → viewer channel.
+        let jpeg = [0xFFu8, 0xD8, 0x01, 0x02, 0x03];
+        let frame = pack_pty_frame(TAG_SCREENCAST_FRAME, vid, &jpeg);
+        conn.handle_binary_frame(&frame);
+
+        let got = rx.recv().await.expect("viewer frame");
+        assert_eq!(&got[..], &jpeg[..]);
+    }
+
+    #[tokio::test]
+    async fn pty_output_still_routes_to_session() {
+        let conn = mk_conn();
+        let sid = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel::<PtyEventOut>(8);
+        conn.register_session(sid, tx);
+
+        let payload = [b'h', b'i'];
+        let frame = pack_pty_frame(TAG_PTY_OUTPUT, sid, &payload);
+        conn.handle_binary_frame(&frame);
+
+        let got = rx.recv().await.expect("pty output");
+        match got {
+            PtyEventOut::Output(b) => assert_eq!(&b[..], &payload[..]),
+            other => panic!("expected Output, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_binary_tag_does_not_panic() {
+        let conn = mk_conn();
+        let sid = Uuid::new_v4();
+        // Unknown tag 0x7F: must be dropped with a warn, no panic.
+        let frame = pack_pty_frame(0x7F, sid, &[1, 2, 3]);
+        conn.handle_binary_frame(&frame);
+        // A frame too short to even unpack: also no panic.
+        conn.handle_binary_frame(&[0x03, 0x00]);
+    }
+
+    #[tokio::test]
+    async fn viewer_closed_removes_viewer_route() {
+        let conn = mk_conn();
+        let vid = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel::<Bytes>(8);
+        conn.register_viewer(vid, tx);
+        assert!(conn.viewer_sessions.contains_key(&vid));
+
+        conn.handle_text_frame(ClientMsg::ViewerClosed {
+            viewer_session_id: vid,
+            reason: Some("page closed".into()),
+        });
+        assert!(!conn.viewer_sessions.contains_key(&vid));
     }
 }

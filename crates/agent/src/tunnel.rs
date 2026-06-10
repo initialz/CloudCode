@@ -1,14 +1,15 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "12";
+pub const PROTOCOL_VERSION: &str = "13";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
 //
-//   [0]      1 byte   tag (TAG_PTY_INPUT | TAG_PTY_OUTPUT)
-//   [1..17]  16 bytes session_id (uuid raw bytes)
-//   [17..]   payload (raw PTY bytes; no further structure)
+//   [0]      1 byte   tag (TAG_PTY_INPUT | TAG_PTY_OUTPUT | TAG_SCREENCAST_FRAME)
+//   [1..17]  16 bytes id (uuid raw bytes): session_id for PTY tags, or
+//            viewer_session_id for TAG_SCREENCAST_FRAME
+//   [17..]   payload (raw PTY bytes, or a raw JPEG for screencast frames)
 //
 // One agent connection multiplexes multiple sessions over the same WS, so
 // every binary frame is keyed by session_id.
@@ -16,6 +17,7 @@ pub const PROTOCOL_VERSION: &str = "12";
 
 pub const TAG_PTY_INPUT: u8 = 0x01; // hub → agent : keystrokes for PTY master
 pub const TAG_PTY_OUTPUT: u8 = 0x02; // agent → hub : output read from PTY master
+pub const TAG_SCREENCAST_FRAME: u8 = 0x03; // agent → hub : JPEG frame for a viewer_session_id
 pub const PTY_FRAME_PREFIX_LEN: usize = 1 + 16;
 
 pub fn pack_pty_frame(tag: u8, session_id: Uuid, payload: &[u8]) -> Vec<u8> {
@@ -35,6 +37,44 @@ pub fn unpack_pty_frame(buf: &[u8]) -> Option<(u8, Uuid, &[u8])> {
     let mut sid = [0u8; 16];
     sid.copy_from_slice(&buf[1..17]);
     Some((tag, Uuid::from_bytes(sid), &buf[PTY_FRAME_PREFIX_LEN..]))
+}
+
+/// A single user-input event captured by the viewer page, expressed in viewport
+/// pixels. The viewer (P2 Task 3) does the canvas→viewport scaling before
+/// sending. This is the canonical definition shared across the agent↔hub
+/// protocol; `browser::screencast` re-exports it via `use crate::tunnel::*`.
+///
+/// `#[serde(tag = "kind", rename_all = "snake_case")]` gives a flat, JS-friendly
+/// wire shape, e.g. `{"kind":"mouse_move","x":10,"y":20}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ViewerInputEvent {
+    /// Pointer moved (no button change).
+    MouseMove { x: f64, y: f64 },
+    /// A mouse button went down or up at `(x, y)`.
+    MouseButton {
+        x: f64,
+        y: f64,
+        /// CDP button name: `left` / `right` / `middle` / `none`.
+        button: String,
+        /// `true` = pressed, `false` = released.
+        down: bool,
+        /// CDP `clickCount` (1 = single, 2 = double, …).
+        click_count: u32,
+    },
+    /// Scroll wheel; `dx`/`dy` are CDP deltaX/deltaY.
+    Wheel { x: f64, y: f64, dx: f64, dy: f64 },
+    /// A key went down or up.
+    Key {
+        key: String,
+        code: String,
+        text: String,
+        down: bool,
+        /// CDP modifiers bitmask (Alt=1, Ctrl=2, Meta=4, Shift=8).
+        modifiers: i64,
+    },
+    /// Commit a whole string (IME composition end / paste).
+    InsertText { text: String },
 }
 
 /// Frames sent from the agent to the hub (text JSON).
@@ -220,6 +260,13 @@ pub enum ClientMsg {
         deleted: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+
+    /// The agent's screencast for this viewer ended (page closed / CDP error).
+    ViewerClosed {
+        viewer_session_id: Uuid,
+        #[serde(default)]
+        reason: Option<String>,
     },
 }
 
@@ -480,6 +527,22 @@ pub enum ServerMsg {
         workspace: String,
         paths: Vec<String>,
     },
+
+    /// A viewer wants to watch `session_id`'s browser. Agent starts a
+    /// CDP screencast and streams frames back tagged with viewer_session_id.
+    ViewerAttach {
+        viewer_session_id: Uuid,
+        session_id: Uuid,
+    },
+    /// Stop the screencast for this viewer.
+    ViewerDetach {
+        viewer_session_id: Uuid,
+    },
+    /// Human input from the viewer, injected into the browser via CDP.
+    ViewerInput {
+        viewer_session_id: Uuid,
+        event: ViewerInputEvent,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -488,4 +551,197 @@ pub enum RejectReason {
     NameTaken,
     AuthFailed,
     VersionMismatch,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn binary_tags_are_stable() {
+        assert_eq!(TAG_PTY_INPUT, 0x01);
+        assert_eq!(TAG_PTY_OUTPUT, 0x02);
+        assert_eq!(TAG_SCREENCAST_FRAME, 0x03);
+    }
+
+    #[test]
+    fn screencast_frame_packs_keyed_by_viewer_id() {
+        let vid = Uuid::new_v4();
+        let jpeg = [0xFFu8, 0xD8, 0xDE, 0xAD];
+        let frame = pack_pty_frame(TAG_SCREENCAST_FRAME, vid, &jpeg);
+        let (tag, id, payload) = unpack_pty_frame(&frame).expect("unpacks");
+        assert_eq!(tag, TAG_SCREENCAST_FRAME);
+        assert_eq!(id, vid);
+        assert_eq!(payload, &jpeg);
+    }
+
+    #[test]
+    fn viewer_attach_roundtrip() {
+        let vid = Uuid::new_v4();
+        let sid = Uuid::new_v4();
+        let msg = ServerMsg::ViewerAttach {
+            viewer_session_id: vid,
+            session_id: sid,
+        };
+        let s = serde_json::to_string(&msg).unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["type"], "viewer_attach");
+        assert_eq!(v["viewer_session_id"], vid.to_string());
+        assert_eq!(v["session_id"], sid.to_string());
+        let back: ServerMsg = serde_json::from_str(&s).unwrap();
+        assert!(matches!(
+            back,
+            ServerMsg::ViewerAttach { viewer_session_id, session_id }
+                if viewer_session_id == vid && session_id == sid
+        ));
+    }
+
+    #[test]
+    fn viewer_detach_roundtrip() {
+        let vid = Uuid::new_v4();
+        let msg = ServerMsg::ViewerDetach {
+            viewer_session_id: vid,
+        };
+        let s = serde_json::to_string(&msg).unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["type"], "viewer_detach");
+        let back: ServerMsg = serde_json::from_str(&s).unwrap();
+        assert!(matches!(
+            back,
+            ServerMsg::ViewerDetach { viewer_session_id } if viewer_session_id == vid
+        ));
+    }
+
+    #[test]
+    fn viewer_input_roundtrip_all_variants() {
+        let vid = Uuid::new_v4();
+        let events = vec![
+            ViewerInputEvent::MouseMove { x: 1.0, y: 2.0 },
+            ViewerInputEvent::MouseButton {
+                x: 3.0,
+                y: 4.0,
+                button: "left".into(),
+                down: true,
+                click_count: 2,
+            },
+            ViewerInputEvent::Wheel {
+                x: 5.0,
+                y: 6.0,
+                dx: -1.0,
+                dy: 120.0,
+            },
+            ViewerInputEvent::Key {
+                key: "a".into(),
+                code: "KeyA".into(),
+                text: "a".into(),
+                down: false,
+                modifiers: 8,
+            },
+            ViewerInputEvent::InsertText {
+                text: "你好".into(),
+            },
+        ];
+        for ev in events {
+            let msg = ServerMsg::ViewerInput {
+                viewer_session_id: vid,
+                event: ev.clone(),
+            };
+            let s = serde_json::to_string(&msg).unwrap();
+            let v: Value = serde_json::from_str(&s).unwrap();
+            assert_eq!(v["type"], "viewer_input");
+            // The inner event is flattened under `event` with its own `kind`.
+            assert!(v["event"]["kind"].is_string());
+            let back: ServerMsg = serde_json::from_str(&s).unwrap();
+            match back {
+                ServerMsg::ViewerInput {
+                    viewer_session_id,
+                    event,
+                } => {
+                    assert_eq!(viewer_session_id, vid);
+                    assert_eq!(event, ev);
+                }
+                other => panic!("expected ViewerInput, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn viewer_input_event_wire_tags() {
+        // Lock the snake_case `kind` discriminants the JS viewer emits.
+        let cases = [
+            (
+                ViewerInputEvent::MouseMove { x: 0.0, y: 0.0 },
+                "mouse_move",
+            ),
+            (
+                ViewerInputEvent::MouseButton {
+                    x: 0.0,
+                    y: 0.0,
+                    button: "left".into(),
+                    down: true,
+                    click_count: 1,
+                },
+                "mouse_button",
+            ),
+            (
+                ViewerInputEvent::Wheel {
+                    x: 0.0,
+                    y: 0.0,
+                    dx: 0.0,
+                    dy: 0.0,
+                },
+                "wheel",
+            ),
+            (
+                ViewerInputEvent::Key {
+                    key: "a".into(),
+                    code: "KeyA".into(),
+                    text: "a".into(),
+                    down: true,
+                    modifiers: 0,
+                },
+                "key",
+            ),
+            (
+                ViewerInputEvent::InsertText { text: "x".into() },
+                "insert_text",
+            ),
+        ];
+        for (ev, kind) in cases {
+            let v: Value = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
+            assert_eq!(v["kind"], kind);
+        }
+    }
+
+    #[test]
+    fn viewer_closed_roundtrip() {
+        let vid = Uuid::new_v4();
+        // With a reason.
+        let msg = ClientMsg::ViewerClosed {
+            viewer_session_id: vid,
+            reason: Some("page closed".into()),
+        };
+        let s = serde_json::to_string(&msg).unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["type"], "viewer_closed");
+        assert_eq!(v["viewer_session_id"], vid.to_string());
+        assert_eq!(v["reason"], "page closed");
+        let back: ClientMsg = serde_json::from_str(&s).unwrap();
+        assert!(matches!(
+            back,
+            ClientMsg::ViewerClosed { viewer_session_id, reason: Some(r) }
+                if viewer_session_id == vid && r == "page closed"
+        ));
+
+        // `reason` defaults to None when absent (back-compat).
+        let from_min: ClientMsg = serde_json::from_str(&format!(
+            r#"{{"type":"viewer_closed","viewer_session_id":"{vid}"}}"#
+        ))
+        .unwrap();
+        assert!(matches!(
+            from_min,
+            ClientMsg::ViewerClosed { reason: None, .. }
+        ));
+    }
 }

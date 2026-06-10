@@ -1,14 +1,15 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "12";
+pub const PROTOCOL_VERSION: &str = "13";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
 //
-//   [0]      1 byte   tag (TAG_PTY_INPUT | TAG_PTY_OUTPUT)
-//   [1..17]  16 bytes session_id (uuid raw bytes)
-//   [17..]   payload (raw PTY bytes; no further structure)
+//   [0]      1 byte   tag (TAG_PTY_INPUT | TAG_PTY_OUTPUT | TAG_SCREENCAST_FRAME)
+//   [1..17]  16 bytes id (uuid raw bytes): session_id for PTY tags, or
+//            viewer_session_id for TAG_SCREENCAST_FRAME
+//   [17..]   payload (raw PTY bytes, or a raw JPEG for screencast frames)
 //
 // One agent connection multiplexes multiple sessions over the same WS, so
 // every binary frame is keyed by session_id.
@@ -16,6 +17,7 @@ pub const PROTOCOL_VERSION: &str = "12";
 
 pub const TAG_PTY_INPUT: u8 = 0x01; // hub → agent : keystrokes for PTY master
 pub const TAG_PTY_OUTPUT: u8 = 0x02; // agent → hub : output read from PTY master
+pub const TAG_SCREENCAST_FRAME: u8 = 0x03; // agent → hub : JPEG frame for a viewer_session_id
 pub const PTY_FRAME_PREFIX_LEN: usize = 1 + 16;
 
 pub fn pack_pty_frame(tag: u8, session_id: Uuid, payload: &[u8]) -> Vec<u8> {
@@ -35,6 +37,44 @@ pub fn unpack_pty_frame(buf: &[u8]) -> Option<(u8, Uuid, &[u8])> {
     let mut sid = [0u8; 16];
     sid.copy_from_slice(&buf[1..17]);
     Some((tag, Uuid::from_bytes(sid), &buf[PTY_FRAME_PREFIX_LEN..]))
+}
+
+/// A single user-input event captured by the viewer page, expressed in viewport
+/// pixels. The viewer (P2 Task 3) does the canvas→viewport scaling before
+/// sending. This is the canonical definition shared across the agent↔hub
+/// protocol; `browser::screencast` re-exports it via `use crate::tunnel::*`.
+///
+/// `#[serde(tag = "kind", rename_all = "snake_case")]` gives a flat, JS-friendly
+/// wire shape, e.g. `{"kind":"mouse_move","x":10,"y":20}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ViewerInputEvent {
+    /// Pointer moved (no button change).
+    MouseMove { x: f64, y: f64 },
+    /// A mouse button went down or up at `(x, y)`.
+    MouseButton {
+        x: f64,
+        y: f64,
+        /// CDP button name: `left` / `right` / `middle` / `none`.
+        button: String,
+        /// `true` = pressed, `false` = released.
+        down: bool,
+        /// CDP `clickCount` (1 = single, 2 = double, …).
+        click_count: u32,
+    },
+    /// Scroll wheel; `dx`/`dy` are CDP deltaX/deltaY.
+    Wheel { x: f64, y: f64, dx: f64, dy: f64 },
+    /// A key went down or up.
+    Key {
+        key: String,
+        code: String,
+        text: String,
+        down: bool,
+        /// CDP modifiers bitmask (Alt=1, Ctrl=2, Meta=4, Shift=8).
+        modifiers: i64,
+    },
+    /// Commit a whole string (IME composition end / paste).
+    InsertText { text: String },
 }
 
 /// Frames sent from the agent to the hub (text JSON).
@@ -217,6 +257,13 @@ pub enum ClientMsg {
         deleted: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+
+    /// The agent's screencast for this viewer ended (page closed / CDP error).
+    ViewerClosed {
+        viewer_session_id: Uuid,
+        #[serde(default)]
+        reason: Option<String>,
     },
 }
 
@@ -456,6 +503,22 @@ pub enum ServerMsg {
         account: String,
         workspace: String,
         paths: Vec<String>,
+    },
+
+    /// A viewer wants to watch `session_id`'s browser. Agent starts a
+    /// CDP screencast and streams frames back tagged with viewer_session_id.
+    ViewerAttach {
+        viewer_session_id: Uuid,
+        session_id: Uuid,
+    },
+    /// Stop the screencast for this viewer.
+    ViewerDetach {
+        viewer_session_id: Uuid,
+    },
+    /// Human input from the viewer, injected into the browser via CDP.
+    ViewerInput {
+        viewer_session_id: Uuid,
+        event: ViewerInputEvent,
     },
 }
 
