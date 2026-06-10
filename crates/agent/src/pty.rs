@@ -650,6 +650,14 @@ impl PtyManager {
             if let Err(e) = std::fs::write(&mcp_cfg_path, &mcp_cfg) {
                 tracing::warn!(error = %e, "failed to write browser mcp config");
             }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &mcp_cfg_path,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
             claude_args.push("--mcp-config".to_string());
             claude_args.push(mcp_cfg_path.to_string_lossy().to_string());
         }
