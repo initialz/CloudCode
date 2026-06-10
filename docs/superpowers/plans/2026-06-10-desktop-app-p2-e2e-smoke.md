@@ -84,3 +84,9 @@
 - **proto 未抽共享 crate**：agent↔hub 帧仍是「双文件逐字镜像」（tunnel.rs 锁步），P3 抽 crate 时收编。
 </content>
 </invoke>
+
+## 安全说明(P2 审查补充)
+
+- **单活动页 = 多账户共享 agent 下的跨页泄漏(P4 硬性关闭项)**:P2 的 agent 忽略 `session_id`、投屏"共享 Chrome 的当前活动页"。鉴权门校验的是 *session 归属*(账户 A 不能看账户 B 的 session),但不校验 *页归属*。若一个 agent 被 allowlist 给多个账户(`account_allowed_agents` 是多对多),他们共用一个 Chrome,账户 A 看自己 session 时可能看到账户 B 的页面。
+  - **现实风险低**:这违反 CloudCode 的 solo-use 模型(README:一用户→一订阅→一 agent)。单用户单 agent 部署下不存在此问题。
+  - **P4 必修**:per-session 页映射(`ViewerAttach` 已携带 `session_id`,P4 据此选页)是关闭此泄漏的安全硬性要求,不只是功能。
