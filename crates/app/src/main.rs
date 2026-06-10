@@ -10,12 +10,14 @@
 mod backend;
 mod config;
 mod state;
+mod terminal;
 mod wire;
 
-use backend::{spawn, BackendHandle, UiCommand};
+use backend::{spawn, BackendEvent, BackendHandle, UiCommand};
 use config::HubConfig;
 use state::{apply_event, badge, FollowUp, Screen};
 use std::path::PathBuf;
+use terminal::TerminalPanel;
 
 fn main() -> eframe::Result {
     tracing_subscriber::fmt()
@@ -72,6 +74,11 @@ struct App {
     /// New-workspace form state on the picker.
     new_name: String,
     new_agent: String,
+    /// The live terminal. `Some` only while a `Screen::Session` is open;
+    /// created on `SessionOpened`, fed PTY bytes each frame, rendered by
+    /// the session arm. Lives here (not in `Screen`) so the `state`
+    /// reducer stays pure and unit-testable.
+    terminal: Option<TerminalPanel>,
 }
 
 impl App {
@@ -87,6 +94,7 @@ impl App {
                     backend: Some(backend),
                     new_name: String::new(),
                     new_agent: String::new(),
+                    terminal: None,
                 }
             }
             Err(e) => App {
@@ -96,6 +104,7 @@ impl App {
                 backend: None,
                 new_name: String::new(),
                 new_agent: String::new(),
+                terminal: None,
             },
         }
     }
@@ -108,12 +117,32 @@ impl App {
 
     /// Drain every queued backend event into the screen state, issuing
     /// any follow-up commands the reducer asks for.
+    ///
+    /// `PtyBytes` are intercepted here and fed straight into the live
+    /// `TerminalPanel` (the VTE state machine), bypassing the reducer so
+    /// `state::apply_event` stays pure. The panel is (re)created on
+    /// `SessionOpened` and torn down whenever we leave the session.
     fn drain_events(&mut self) {
         let events: Vec<_> = match &self.backend {
             Some(b) => b.event_rx.try_iter().collect(),
             None => return,
         };
         for ev in events {
+            // PTY bytes drive the terminal directly; don't run them
+            // through the (pure) screen reducer.
+            if let BackendEvent::PtyBytes(bytes) = &ev {
+                if let Some(panel) = &mut self.terminal {
+                    panel.feed(bytes);
+                }
+                continue;
+            }
+
+            // A new session: spin up a fresh terminal panel. 80×24 matches
+            // the hardcoded OpenSession size (Task 5 makes it dynamic).
+            if matches!(ev, BackendEvent::SessionOpened { .. }) {
+                self.terminal = Some(TerminalPanel::new(80, 24));
+            }
+
             let screen = std::mem::replace(
                 &mut self.screen,
                 Screen::Error {
@@ -121,6 +150,10 @@ impl App {
                 },
             );
             let (next, follow_ups) = apply_event(screen, ev);
+            // Dropped out of the session view — release the terminal.
+            if !matches!(next, Screen::Session { .. }) {
+                self.terminal = None;
+            }
             self.screen = next;
             for f in follow_ups {
                 match f {
@@ -235,26 +268,28 @@ impl eframe::App for App {
                     agent,
                     workspace,
                     cwd,
-                    output,
+                    output: _,
                 } => {
-                    // PLACEHOLDER for Task 3's TerminalPanel. Shows the
-                    // session identity + a scrolling lossy-utf8 dump of
-                    // incoming PTY bytes so the skeleton visibly works.
-                    // Task 3 swaps this whole block for a TerminalPanel
-                    // widget that consumes the same PtyBytes events.
-                    ui.heading(format!("session open: {workspace}@{agent}"));
-                    ui.weak(format!("cwd: {cwd}"));
+                    // Live terminal panel (Task 3). The VTE state machine
+                    // is fed PtyBytes in `drain_events`; here we just
+                    // render its current grid.
+                    ui.horizontal(|ui| {
+                        ui.heading(format!("session: {workspace}@{agent}"));
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| ui.weak(format!("cwd: {cwd}")),
+                        );
+                    });
                     ui.separator();
-                    egui::ScrollArea::vertical()
+                    egui::ScrollArea::both()
                         .auto_shrink([false, false])
                         .stick_to_bottom(true)
                         .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(&output).monospace(),
-                                )
-                                .wrap(),
-                            );
+                            if let Some(panel) = &mut self.terminal {
+                                panel.ui(ui);
+                            } else {
+                                ui.weak("(terminal not ready)");
+                            }
                         });
                 }
                 Screen::Error { message } => {
