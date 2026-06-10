@@ -42,6 +42,30 @@ pub struct PtyManager {
     tmux_conf: Option<PathBuf>,
     sessions: Arc<DashMap<Uuid, Arc<PtyHandle>>>,
     write_sessions: crate::fs::WriteSessions,
+    /// Resident localhost MCP endpoint. Shares `Arc` internals with the
+    /// `AppState.mcp` instance, so registering a session route here is
+    /// visible to the HTTP handler that claude POSTs to. Used by
+    /// `open_session` to (re-)register the workspace token + `--mcp-config`.
+    mcp: crate::browser::mcp_endpoint::EndpointState,
+    /// Whether browser MCP injection is enabled (mirror of
+    /// `config.browser.enabled`). P1 gates the whole injection block on this
+    /// agent-local config — there is NO per-client capability flag.
+    browser_enabled: bool,
+    /// Port the resident MCP endpoint listens on (config.browser.mcp_port,
+    /// default 7110). Stored at construction because PtyManager doesn't
+    /// hold the full Config.
+    mcp_port: u16,
+    /// ONE stable browser MCP token per workspace, keyed by
+    /// (account, workspace). Minted on the first browser-enabled open of a
+    /// workspace and REUSED on every subsequent open: the hub mints a fresh
+    /// session_id per OpenSession (reattach included), so the token must
+    /// outlive any hub session — its lifetime is the workspace/tmux
+    /// lifetime. Each open re-registers the same token against the new
+    /// session_id (register overwrites), so both a still-running claude
+    /// (token in memory) and a restarted claude (token re-read from
+    /// `.cloudcode/mcp-browser.json`) route to the live session. Removed +
+    /// unregistered only on workspace delete/reset.
+    workspace_tokens: DashMap<(String, String), String>,
 }
 
 struct PtyHandle {
@@ -70,6 +94,13 @@ impl PtyManager {
         // just figures out whether sandbox is structurally possible
         // (macOS today) and stands the wrapper-path ready.
         _sandbox: SandboxConfig,
+        // Resident MCP endpoint (shared with AppState.mcp), whether browser
+        // injection is enabled (config.browser.enabled), and the port it
+        // listens on, so open_session can register the workspace's stable
+        // token and inject `--mcp-config` for claude.
+        mcp: crate::browser::mcp_endpoint::EndpointState,
+        browser_enabled: bool,
+        mcp_port: u16,
     ) -> Result<Self> {
         // Fail fast if tmux is not installed.
         let tmux_path = which::which(&tmux.executable).with_context(|| {
@@ -173,6 +204,10 @@ impl PtyManager {
             tmux_conf,
             sessions: Arc::new(DashMap::new()),
             write_sessions: crate::fs::new_write_sessions(),
+            mcp,
+            browser_enabled,
+            mcp_port,
+            workspace_tokens: DashMap::new(),
         })
     }
 
@@ -516,7 +551,7 @@ impl PtyManager {
         workspace: String,
         cols: u16,
         rows: u16,
-        claude_args: Vec<String>,
+        mut claude_args: Vec<String>,
         sandbox: bool,
         sandbox_mode: Option<String>,
         tool: Option<String>,
@@ -580,6 +615,80 @@ impl PtyManager {
         // somehow vanished between create_dir_all and now; fall back
         // to the raw path in that pathological case.
         let cwd = std::fs::canonicalize(&cwd_raw).unwrap_or(cwd_raw);
+
+        // Inject the resident browser MCP endpoint config for this session —
+        // but only when browser support is enabled agent-side via
+        // `[browser].enabled` (P1 has NO per-client capability flag; the gate
+        // is pure agent-local config). The token is the workspace's STABLE
+        // token (minted on first browser-enabled open, reused forever after):
+        // the hub mints a fresh session_id on every OpenSession — reattach
+        // included — so we re-register the same token against the new
+        // session_id (register overwrites). A claude still running in tmux
+        // keeps its in-memory token working; a restarted claude re-reads the
+        // (now byte-stable) `--mcp-config` JSON under the workspace's
+        // `.cloudcode/` dir. The `--mcp-config <path>` arg is appended to
+        // claude's per-session args (forwarded to claude's argv via the bash
+        // wrapper alongside the other extra args, on first boot AND on
+        // resume). When browser is disabled, we skip injection entirely so
+        // claude launches with no `cc-browser` MCP server configured.
+        if self.browser_enabled {
+            let token = self
+                .workspace_tokens
+                .entry((account.clone(), workspace.clone()))
+                .or_insert_with(|| {
+                    // Self-heal across agent restarts: prefer the token already
+                    // persisted in this workspace's mcp-browser.json — a claude
+                    // surviving in tmux still holds it in memory. Only adopt a
+                    // token in exactly the format we mint (32 ascii-hex chars,
+                    // Uuid::simple): a tampered/corrupt config must mint fresh
+                    // instead of smuggling an arbitrary (guessable) token into
+                    // the endpoint's auth map.
+                    std::fs::read_to_string(cwd.join(".cloudcode").join("mcp-browser.json"))
+                        .ok()
+                        .and_then(|s| crate::browser::mcp_endpoint::extract_token_from_config(&s))
+                        .filter(|t| crate::browser::mcp_endpoint::is_valid_token(t))
+                        .unwrap_or_else(|| Uuid::new_v4().simple().to_string())
+                })
+                .clone();
+            self.mcp.register(token.clone(), session_id);
+            let mcp_cfg = crate::browser::mcp_endpoint::mcp_config_json(self.mcp_port, &token);
+            let mcp_cfg_path = cwd.join(".cloudcode").join("mcp-browser.json");
+            if let Some(parent) = mcp_cfg_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // The config carries a bearer token: create it 0600 from the
+            // start (no world-readable window between write and chmod).
+            #[cfg(unix)]
+            let write_res = {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&mcp_cfg_path)
+                    .and_then(|mut f| f.write_all(mcp_cfg.as_bytes()))
+            };
+            #[cfg(not(unix))]
+            let write_res = std::fs::write(&mcp_cfg_path, &mcp_cfg);
+            if let Err(e) = write_res {
+                tracing::warn!(error = %e, "failed to write browser mcp config");
+            }
+            // `.mode(0o600)` only applies at create time; a file left over
+            // from an older run keeps its original (possibly 0644) mode
+            // through the truncate, so repair it explicitly.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &mcp_cfg_path,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
+            claude_args.push("--mcp-config".to_string());
+            claude_args.push(mcp_cfg_path.to_string_lossy().to_string());
+        }
 
         // Open the PTY.
         let size = PtySize {
@@ -1229,6 +1338,15 @@ impl PtyManager {
                     let _ = std::process::Command::new(&self.tmux.executable)
                         .args(["-L", &format!("cc-{}-{}", account, name), "kill-server"])
                         .output();
+                    // True workspace death: drop the workspace's stable
+                    // browser token and its endpoint route. A recreated
+                    // workspace with the same name mints a fresh token.
+                    if let Some((_, tok)) = self
+                        .workspace_tokens
+                        .remove(&(account.clone(), name.clone()))
+                    {
+                        self.mcp.unregister(&tok);
+                    }
                     // Wipe claude's per-project conversation history so
                     // a recreated workspace with the same name doesn't
                     // silently `--continue` into the old chat. The
@@ -1281,6 +1399,15 @@ impl PtyManager {
                     let _ = std::process::Command::new(&self.tmux.executable)
                         .args(["-L", &format!("cc-{}-{}", account, name), "kill-server"])
                         .output();
+                    // Reset = the old claude (and anything holding the old
+                    // token) is gone for good; retire the workspace's stable
+                    // browser token so the next open starts from a fresh one.
+                    if let Some((_, tok)) = self
+                        .workspace_tokens
+                        .remove(&(account.clone(), name.clone()))
+                    {
+                        self.mcp.unregister(&tok);
+                    }
                     // Keep ~/.claude/projects/<encoded-cwd>/ intact so
                     // claude's conversation history and project memory
                     // survive the reset. The next --continue will resume
@@ -1456,6 +1583,12 @@ impl PtyManager {
                 let _ = std::process::Command::new(&self.tmux.executable)
                     .args(["-L", &label, "kill-server"])
                     .output();
+                // Deliberately do NOT unregister the workspace's browser token
+                // here: idle-reaping only reclaims RAM, the workspace still
+                // exists and `--continue` resumes it on the next open. The
+                // stable token survives idle (re-pointed at the fresh
+                // session_id on reopen); it's retired only on workspace
+                // delete/reset.
                 tracing::info!(
                     %account, %workspace,
                     "reaped idle workspace (no client >= 30m + claude idle); --continue will resume"

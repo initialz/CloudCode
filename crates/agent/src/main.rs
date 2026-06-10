@@ -218,6 +218,18 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         .unwrap_or_else(name::default_agent_name);
     tracing::info!(agent = %name, "starting cloudcode-agent");
 
+    // Resident browser stack (P1 desktop app). The Chrome manager and the MCP
+    // endpoint state are always constructed (so AppState is uniform and the
+    // session wiring can register sessions unconditionally), but Chrome is
+    // only spawned and the endpoint only served when the operator opts in via
+    // [browser].enabled. The same EndpointState instance is shared with the
+    // PtyManager below (clone shares Arc internals), so `open_session`'s
+    // register/unregister are visible to the HTTP handler claude POSTs to.
+    let agent_state_dir =
+        paths::agent_state_dir().unwrap_or_else(|| PathBuf::from("/tmp/cloudcode/agent"));
+    let chrome = Arc::new(ChromeManager::new(config.browser.clone(), &agent_state_dir));
+    let mcp = EndpointState::new(chrome.clone(), config.browser.clone());
+
     let manager = Arc::new(PtyManager::new(
         config.claude.clone(),
         config.tools.tools.clone(),
@@ -225,6 +237,9 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         config.tmux.clone(),
         config.recording.clone(),
         config.sandbox.clone(),
+        mcp.clone(),
+        config.browser.enabled,
+        config.browser.mcp_port,
     )?);
 
     // Process-level audit pipeline: watches ~/.claude/projects/ and
@@ -241,19 +256,8 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     // `claude --continue` on the next open.
     tokio::spawn(manager.clone().run_idle_reaper());
 
-    // Resident browser stack (P1 desktop app). The Chrome manager and the MCP
-    // endpoint state are always constructed (so AppState is uniform and Task 5
-    // can register sessions unconditionally), but Chrome is only spawned and
-    // the endpoint only served when the operator opts in via [browser].enabled.
+    // Spawn Chrome + serve the MCP endpoint only when the operator opts in.
     // Failures here are non-fatal: the agent still serves PTYs.
-    let agent_state_dir = paths::agent_state_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp/cloudcode/agent"));
-    let chrome = Arc::new(ChromeManager::new(
-        config.browser.clone(),
-        &agent_state_dir,
-    ));
-    let mcp = EndpointState::new(chrome.clone(), config.browser.clone());
-
     if config.browser.enabled {
         match chrome.start().await {
             Ok(()) => tracing::info!("resident Chrome started"),
