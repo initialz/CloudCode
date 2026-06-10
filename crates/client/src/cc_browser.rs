@@ -119,7 +119,11 @@ impl BrowserChannel {
 /// Override entirely via `CC_BROWSER_MCP` (whitespace-separated).
 ///
 /// Default (M2): pinned `@playwright/mcp@0.0.76` via npx, headless, with a
-/// dedicated persistent profile under the client state dir.
+/// dedicated persistent profile AND a predictable output dir (screenshots,
+/// saved files) under the client state dir — without `--output-dir`,
+/// playwright-mcp writes outputs relative to its own cwd, i.e. wherever the
+/// client process happened to be started. playwright creates the directory
+/// itself on first write; we create nothing here.
 ///
 /// The version is pinned to prevent silent npx drift. Note: do NOT use the
 /// unscoped third-party package `playwright-mcp` — that is a different,
@@ -133,10 +137,11 @@ pub fn mcp_command() -> Option<(String, Vec<String>)> {
         return Some((prog, parts.collect()));
     }
     which_node()?; // npx ships with node
-    let profile = dirs::data_local_dir()
+    let base = dirs::data_local_dir()
         .unwrap_or_else(std::env::temp_dir)
-        .join("cloudcode")
-        .join("browser-profile");
+        .join("cloudcode");
+    let profile = base.join("browser-profile");
+    let output_dir = base.join("browser-output");
     Some((
         "npx".to_string(),
         vec![
@@ -145,6 +150,8 @@ pub fn mcp_command() -> Option<(String, Vec<String>)> {
             "--headless".to_string(),              // default is headed; must be explicit
             "--user-data-dir".to_string(),
             profile.to_string_lossy().to_string(),
+            "--output-dir".to_string(),
+            output_dir.to_string_lossy().to_string(),
         ],
     ))
 }

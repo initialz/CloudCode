@@ -124,11 +124,31 @@ impl EndpointState {
 }
 
 /// Timeout for a blocking claude POST awaiting its response from the
-/// client subprocess (via the hub). Factored out so tests can reason
-/// about the timeout branch without blocking for the full duration.
-/// Kept below claude's own 30s MCP connection timeout so our JSON-RPC
-/// error reaches claude instead of racing its client-side timeout.
+/// client subprocess (via the hub). Handshake/metadata answers come
+/// from the client subprocess immediately, so this stays short. Kept
+/// below claude's own 30s MCP connection timeout so our JSON-RPC error
+/// reaches claude instead of racing its client-side timeout.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// Tool calls can legitimately take long: the first one triggers the
+/// browser launch on the client, and the user may be slow to approve
+/// the consent prompt. Keep this generous.
+const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Method-aware timeout selection: `tools/call` gets the generous
+/// CALL_TIMEOUT; everything else (handshake, metadata, garbage) gets
+/// the short REQUEST_TIMEOUT.
+fn timeout_for(body: &str) -> Duration {
+    let is_call = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s == "tools/call"))
+        .unwrap_or(false);
+    if is_call {
+        CALL_TIMEOUT
+    } else {
+        REQUEST_TIMEOUT
+    }
+}
 
 /// Build a JSON-RPC error response body for a given request id (raw id
 /// string as captured by extract_id_key, e.g. "1" or "\"abc\"").
@@ -205,7 +225,11 @@ pub async fn handle_post(token: &str, body: String, state: &EndpointState) -> Po
             ))
         }
         // Request to a known session: forward and block for the response.
+        // tools/call gets a generous timeout (first call triggers the
+        // browser launch + user consent on the client); everything else
+        // keeps the short handshake timeout.
         (Some(id), Some(session_id)) => {
+            let timeout = timeout_for(&body);
             let (tx, rx) = oneshot::channel();
             state.pending.insert((session_id, id.clone()), tx);
             state
@@ -214,19 +238,22 @@ pub async fn handle_post(token: &str, body: String, state: &EndpointState) -> Po
                     payload: body,
                 }))
                 .await;
-            match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+            match tokio::time::timeout(timeout, rx).await {
                 Ok(Ok(resp)) => PostOutcome::Response(resp),
                 _ => {
                     state.pending.remove(&(session_id, id.clone()));
                     tracing::warn!(
                         token = %token_prefix(token),
                         %session_id,
+                        timeout_secs = timeout.as_secs(),
                         "browser MCP request timed out awaiting client response"
                     );
                     PostOutcome::Response(jsonrpc_error(
                         &id,
                         -32000,
-                        "browser MCP request timed out (client subprocess not responding)",
+                        "browser MCP request timed out (the browser may still be \
+                         starting on the first call, or the user has not yet \
+                         answered the consent prompt — retrying usually succeeds)",
                     ))
                 }
             }
@@ -481,6 +508,28 @@ mod tests {
 
         // Session B entry should still be present
         assert!(state.pending.contains_key(&(sid_b, "3".to_string())));
+    }
+
+    #[test]
+    fn timeout_for_is_method_aware() {
+        // tools/call gets the generous browser-launch/consent timeout.
+        assert_eq!(
+            timeout_for(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{}}"#),
+            CALL_TIMEOUT
+        );
+        assert_eq!(CALL_TIMEOUT, Duration::from_secs(120));
+        // Handshake/metadata keep the short timeout.
+        assert_eq!(
+            timeout_for(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#),
+            REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            timeout_for(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#),
+            REQUEST_TIMEOUT
+        );
+        // Garbage / unparseable bodies fall back to the short timeout.
+        assert_eq!(timeout_for("not json"), REQUEST_TIMEOUT);
+        assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(25));
     }
 
     #[test]

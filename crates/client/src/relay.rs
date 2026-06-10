@@ -252,25 +252,44 @@ async fn relay_loop(
                         }
                     }
                     HubToClient::BrowserRpc { payload } => {
-                        // M2 authorization gate: a live grant slides its
-                        // idle window; otherwise block on the inline
-                        // consent pill before touching the subprocess.
-                        // While the prompt awaits, the other select! arms
-                        // are parked — PTY output buffers in its channel
-                        // and flushes once the modal closes.
-                        let now = std::time::Instant::now();
-                        let allowed = match gate.check(now) {
-                            auth_gate::Decision::Allow => {
-                                gate.touch(now);
-                                true
-                            }
-                            auth_gate::Decision::AskUser => {
-                                if prompt_browser_consent(bytes).await {
-                                    gate.grant(std::time::Instant::now());
+                        // M2 authorization gate, method-aware: only ACTION
+                        // frames (tools/call and anything unrecognized) need
+                        // consent. Handshake/metadata (initialize, tools/list,
+                        // ping, notifications, responses) flow freely — so the
+                        // consent pill appears on claude's FIRST TOOL CALL,
+                        // not at its MCP handshake during session boot.
+                        //
+                        // Consequence: the subprocess lazy-spawn below now
+                        // happens on the first PASSIVE frame (initialize) —
+                        // before any consent. That is fine and intended:
+                        // spawning a local subprocess grants the cloud
+                        // nothing; the gate guards ACTIONS. It also warms up
+                        // npx before the first action.
+                        //
+                        // A live grant slides its idle window; otherwise we
+                        // block on the inline consent pill before feeding the
+                        // subprocess. While the prompt awaits, the other
+                        // select! arms are parked — PTY output buffers in its
+                        // channel and flushes once the modal closes.
+                        let allowed = if method_is_passive(&payload) {
+                            // Passive frames neither require nor extend a
+                            // grant: don't touch the gate at all.
+                            true
+                        } else {
+                            let now = std::time::Instant::now();
+                            match gate.check(now) {
+                                auth_gate::Decision::Allow => {
+                                    gate.touch(now);
                                     true
-                                } else {
-                                    gate.deny();
-                                    false
+                                }
+                                auth_gate::Decision::AskUser => {
+                                    if prompt_browser_consent(bytes).await {
+                                        gate.grant(std::time::Instant::now());
+                                        true
+                                    } else {
+                                        gate.deny();
+                                        false
+                                    }
                                 }
                             }
                         };
@@ -348,8 +367,9 @@ async fn relay_loop(
 /// its channel and flushes after the modal closes.
 ///
 /// No local timeout: we wait indefinitely. The agent endpoint times the
-/// in-flight MCP request out at 25s, so claude sees a clean timeout
-/// error while the pill stays up — the next `BrowserRpc` frame lands in
+/// in-flight MCP request out (120s for tools/call — the only method
+/// class that prompts), so claude sees a clean timeout error while the
+/// pill stays up — the next action `BrowserRpc` frame lands in
 /// `AskUser` again and re-arms the same prompt.
 ///
 /// Every keystroke other than y/Y/n/N/Esc is swallowed; nothing typed
@@ -386,6 +406,29 @@ async fn prompt_browser_consent(bytes: &mut ByteRx) -> bool {
     let _ = stdout.write_all(b"\x1b[2;1H\x1b[2K\x1b8\x1b[?25h");
     let _ = stdout.flush();
     approved
+}
+
+/// Methods that flow without consent: protocol handshake and metadata.
+/// Anything else (tools/call and any unknown/future method) is an action
+/// and must pass the consent gate. Default-deny posture: a frame we
+/// cannot parse is treated as an action, never waved through.
+fn method_is_passive(payload: &str) -> bool {
+    // Unparseable payload → NOT passive (default-deny).
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) else {
+        return false;
+    };
+    match v.get("method") {
+        // Valid JSON without a method field is a response — passive:
+        // responses only occur if a request was already allowed through.
+        None => true,
+        Some(m) => match m.as_str() {
+            // Requests/notifications that don't touch the browser.
+            Some("initialize") | Some("tools/list") | Some("ping") => true,
+            Some(m) if m.starts_with("notifications/") => true,
+            // Unknown/future methods, or a non-string `method`: action.
+            _ => false,
+        },
+    }
 }
 
 /// What a stdin chunk means for the consent prompt.
@@ -642,7 +685,54 @@ async fn winch_tick(_: &mut WinchHandle) -> Option<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{scan_consent_chunk, ConsentScan};
+    use super::{method_is_passive, scan_consent_chunk, ConsentScan};
+
+    #[test]
+    fn handshake_and_metadata_methods_are_passive() {
+        assert!(method_is_passive(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#
+        ));
+        assert!(method_is_passive(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#
+        ));
+        assert!(method_is_passive(r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#));
+        assert!(method_is_passive(
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#
+        ));
+    }
+
+    #[test]
+    fn action_methods_require_consent() {
+        assert!(!method_is_passive(
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"browser_navigate"}}"#
+        ));
+        // Unknown/future methods default to action (default-deny posture).
+        assert!(!method_is_passive(
+            r#"{"jsonrpc":"2.0","id":5,"method":"resources/read"}"#
+        ));
+    }
+
+    #[test]
+    fn response_frames_are_passive() {
+        // No method field = a response; only occurs if the request was
+        // already allowed through.
+        assert!(method_is_passive(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"tools":[]}}"#
+        ));
+    }
+
+    #[test]
+    fn malformed_json_is_not_passive() {
+        // Default-deny: an unparseable frame must hit the consent gate.
+        assert!(!method_is_passive("not json at all"));
+        assert!(!method_is_passive(r#"{"method":"initialize""#)); // truncated
+        assert!(!method_is_passive(""));
+    }
+
+    #[test]
+    fn non_string_method_is_not_passive() {
+        assert!(!method_is_passive(r#"{"jsonrpc":"2.0","id":6,"method":42}"#));
+    }
 
     fn scan(chunk: &[u8]) -> ConsentScan {
         let mut in_paste = false;
