@@ -53,30 +53,16 @@ impl EndpointState {
         }
     }
 
-    /// Reserve a session route for a claude token (used at session open, Task 11).
+    /// Map a claude token to a session route (used at session open, Task 11).
+    /// Registering an already-known token OVERWRITES its route — this is how
+    /// a stable per-workspace token gets re-pointed at the fresh session_id
+    /// on every reattach (the hub mints a new session_id per OpenSession).
     pub fn register(&self, token: String, session_id: Uuid) {
         self.routes.insert(token, session_id);
     }
 
-    /// Reserve a session route for a not-yet-connected claude. Generates a
-    /// random token, maps it to `session_id`, and returns the token.
-    pub fn reserve(&self, session_id: Uuid) -> String {
-        let token = Uuid::new_v4().simple().to_string();
-        self.register(token.clone(), session_id);
-        token
-    }
-
     pub fn unregister(&self, token: &str) {
         self.routes.remove(token);
-    }
-
-    /// Point an existing token at a new session_id (busy-reattach: the
-    /// still-running claude keeps its original token while the hub-side
-    /// session identity changes). No-op if the token is unknown.
-    pub fn rebind(&self, token: &str, new_session_id: Uuid) {
-        if let Some(mut entry) = self.routes.get_mut(token) {
-            *entry.value_mut() = new_session_id;
-        }
     }
 
     pub fn session_for(&self, token: &str) -> Option<Uuid> {
@@ -506,32 +492,35 @@ mod tests {
     }
 
     #[test]
-    fn reserve_maps_token_to_session() {
+    fn register_maps_token_to_session() {
         let st = EndpointState::new();
         let sid = uuid::Uuid::new_v4();
-        let tok = st.reserve(sid);
-        assert_eq!(st.session_for(&tok), Some(sid));
+        st.register("tok-a".to_string(), sid);
+        assert_eq!(st.session_for("tok-a"), Some(sid));
     }
 
     #[test]
-    fn rebind_points_token_at_new_session() {
+    fn register_overwrite_repoints_token_at_new_session() {
+        // Reattach path: the same per-workspace token is re-registered
+        // against the fresh session_id the hub minted; the overwrite must
+        // re-point routing (DashMap insert semantics).
         let st = EndpointState::new();
-        let old_sid = Uuid::new_v4();
-        let new_sid = Uuid::new_v4();
-        let tok = st.reserve(old_sid);
-        st.rebind(&tok, new_sid);
-        assert_eq!(st.session_for(&tok), Some(new_sid));
-        st.rebind("unknown-token", new_sid); // no-op, no panic
+        let sid1 = Uuid::new_v4();
+        let sid2 = Uuid::new_v4();
+        let tok = "stable-workspace-token".to_string();
+        st.register(tok.clone(), sid1);
+        st.register(tok.clone(), sid2);
+        assert_eq!(st.session_for(&tok), Some(sid2));
     }
 
     #[test]
     fn unregister_clears_route() {
         let st = EndpointState::new();
         let sid = uuid::Uuid::new_v4();
-        let tok = st.reserve(sid);
-        assert_eq!(st.session_for(&tok), Some(sid));
-        st.unregister(&tok);
-        assert_eq!(st.session_for(&tok), None);
+        st.register("tok-b".to_string(), sid);
+        assert_eq!(st.session_for("tok-b"), Some(sid));
+        st.unregister("tok-b");
+        assert_eq!(st.session_for("tok-b"), None);
     }
 
     #[tokio::test]

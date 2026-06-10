@@ -59,11 +59,17 @@ processes and a real `claude`, using the echo MCP stub on the client side.
   reattach (CLOUDCODE_RESUME_CMD path) the `--mcp-config` is not re-applied, so a resumed
   session won't have cc-browser until a fresh session. (Revisit in M2.)
   **FIXED in M2:** the wrapper actually does pass `--mcp-config` on resume too (`$@` is
-  forwarded to `eval "$RESUME_CMD"`), so idle-reattach works via re-reading the rewritten
-  `mcp-browser.json` (new token). Busy-reattach (claude still running in tmux) is fixed by
-  token REBIND on the open_session swap path: the prior handle's tokens are rebound to the
-  new session_id instead of unregistered, so the live claude keeps working; both tokens are
-  carried on the new handle (`PtyHandle.mcp_tokens`) and all unregistered on true close.
+  forwarded to `eval "$RESUME_CMD"`), and the token is now STABLE PER WORKSPACE
+  (`PtyManager.workspace_tokens`, keyed by `(account, workspace)`): minted on the first
+  browser-capable open, reused on every later open of the same workspace. The hub mints a
+  fresh session_id on every OpenSession (reattach included), so each open simply
+  re-registers the same token against the new session_id (`EndpointState::register`
+  overwrites). That covers both reattach flavors: a claude still running in tmux keeps its
+  in-memory token working, and a restarted claude re-reads the now-byte-stable
+  `mcp-browser.json`. Detach (hub PtyClose / PTY EOF) no longer unregisters anything — the
+  token is unregistered only on workspace reset/delete. Remaining gotcha: an AGENT restart
+  clears the in-memory token map, so a claude surviving in tmux across an agent restart
+  needs a fresh session before cc-browser works again.
 - No auth gate / handoff / real browser yet — those are M2/M3. The client-side MCP
   subprocess is the echo stub (`test-fixtures/echo-mcp.mjs`), not a real browser driver.
 - Streamable-HTTP header nuances (Mcp-Session-Id, Accept negotiation) are not implemented;

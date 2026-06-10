@@ -43,14 +43,25 @@ pub struct PtyManager {
     sessions: Arc<DashMap<Uuid, Arc<PtyHandle>>>,
     write_sessions: crate::fs::WriteSessions,
     /// Resident localhost MCP endpoint. Shares `Arc` internals with the
-    /// `AppState.mcp` instance, so reserving a session route here is
+    /// `AppState.mcp` instance, so registering a session route here is
     /// visible to the HTTP handler that claude POSTs to. Used by
-    /// `open_session` to mint a per-session token + `--mcp-config`.
+    /// `open_session` to (re-)register the workspace token + `--mcp-config`.
     mcp: crate::mcp_endpoint::EndpointState,
     /// Port the resident MCP endpoint listens on (config.mcp_port,
     /// default 7110). Stored at construction because PtyManager doesn't
     /// hold the full Config.
     mcp_port: u16,
+    /// ONE stable browser MCP token per workspace, keyed by
+    /// (account, workspace). Minted on the first browser-capable open of a
+    /// workspace and REUSED on every subsequent open: the hub mints a fresh
+    /// session_id per OpenSession (reattach included), so the token must
+    /// outlive any hub session — its lifetime is the workspace/tmux
+    /// lifetime. Each open re-registers the same token against the new
+    /// session_id (register overwrites), so both a still-running claude
+    /// (token in memory) and a restarted claude (token re-read from
+    /// `.cloudcode/mcp-browser.json`) route to the live session. Removed +
+    /// unregistered only on workspace delete/reset.
+    workspace_tokens: DashMap<(String, String), String>,
 }
 
 struct PtyHandle {
@@ -64,11 +75,6 @@ struct PtyHandle {
     /// Stops the jsonl watcher task on drop. Held only for its
     /// Drop side-effect.
     _jsonl: crate::jsonl::WatcherHandle,
-    /// All browser MCP tokens routing to this session — the freshly minted
-    /// one plus any inherited from a busy-reattach swap (the still-running
-    /// claude keeps its original token, rebound to the new session_id); all
-    /// unregistered from the endpoint route map on close.
-    mcp_tokens: Vec<String>,
 }
 
 impl PtyManager {
@@ -85,8 +91,8 @@ impl PtyManager {
         // (macOS today) and stands the wrapper-path ready.
         _sandbox: SandboxConfig,
         // Resident MCP endpoint (shared with AppState.mcp) and the port
-        // it listens on, so open_session can mint a per-session token and
-        // inject `--mcp-config` for claude.
+        // it listens on, so open_session can register the workspace's
+        // stable token and inject `--mcp-config` for claude.
         mcp: crate::mcp_endpoint::EndpointState,
         mcp_port: u16,
     ) -> Result<Self> {
@@ -194,6 +200,7 @@ impl PtyManager {
             write_sessions: crate::fs::new_write_sessions(),
             mcp,
             mcp_port,
+            workspace_tokens: DashMap::new(),
         })
     }
 
@@ -587,21 +594,10 @@ impl PtyManager {
         // Same session_id arriving again = "swap workspace in place". Drop the
         // old handle silently (the reader thread will see read==0 and exit
         // without emitting PtyClosed because we set a no-emit marker through
-        // the absence of the entry in `sessions`).
-        //
-        // Busy-reattach: a claude may still be running inside tmux holding the
-        // prior handle's token in memory. Do NOT unregister it — that would
-        // kill the live claude's cc-browser MCP mid-flight. Instead REBIND each
-        // prior token to the (new) session_id so the running claude keeps
-        // working, and inherit the tokens into the new handle so close()
-        // cleans them all up.
-        let mut inherited_mcp_tokens: Vec<String> = Vec::new();
-        if let Some((_, h)) = self.sessions.remove(&session_id) {
-            for tok in &h.mcp_tokens {
-                self.mcp.rebind(tok, session_id);
-            }
-            inherited_mcp_tokens.extend(h.mcp_tokens.iter().cloned());
-        }
+        // the absence of the entry in `sessions`). Browser tokens are
+        // workspace-scoped (`workspace_tokens`), not handle-scoped, so the
+        // swap doesn't touch them.
+        self.sessions.remove(&session_id);
         let cwd_raw = self.workspace_root().join(&account).join(&workspace);
         if let Err(e) = std::fs::create_dir_all(&cwd_raw) {
             let _ = tx
@@ -627,16 +623,25 @@ impl PtyManager {
         // Inject the resident browser MCP endpoint config for this session —
         // but only when the bound client announced it can run the browser MCP
         // subprocess (`Hello.browser_capable` -> `PtyOpen.browser_capable`).
-        // Mint a fresh token mapping this session_id in the shared endpoint
-        // state, write the `--mcp-config` JSON under the workspace's
-        // `.cloudcode/` dir, and append `--mcp-config <path>` to claude's
-        // per-session args (forwarded to claude's argv via the bash wrapper
-        // alongside the other extra args). When the client isn't
-        // browser-capable, we skip injection entirely so claude launches with
-        // no `cc-browser` MCP server configured.
-        let mut mcp_tokens: Vec<String> = Vec::new();
+        // The token is the workspace's STABLE token (minted on first
+        // browser-capable open, reused forever after): the hub mints a fresh
+        // session_id on every OpenSession — reattach included — so we
+        // re-register the same token against the new session_id (register
+        // overwrites). A claude still running in tmux keeps its in-memory
+        // token working; a restarted claude re-reads the (now byte-stable)
+        // `--mcp-config` JSON under the workspace's `.cloudcode/` dir. The
+        // `--mcp-config <path>` arg is appended to claude's per-session args
+        // (forwarded to claude's argv via the bash wrapper alongside the
+        // other extra args, on first boot AND on resume). When the client
+        // isn't browser-capable, we skip injection entirely so claude
+        // launches with no `cc-browser` MCP server configured.
         if browser_capable {
-            let token = self.mcp.reserve(session_id);
+            let token = self
+                .workspace_tokens
+                .entry((account.clone(), workspace.clone()))
+                .or_insert_with(|| Uuid::new_v4().simple().to_string())
+                .clone();
+            self.mcp.register(token.clone(), session_id);
             let mcp_cfg = crate::mcp_endpoint::mcp_config_json(self.mcp_port, &token);
             let mcp_cfg_path = cwd.join(".cloudcode").join("mcp-browser.json");
             if let Some(parent) = mcp_cfg_path.parent() {
@@ -645,15 +650,9 @@ impl PtyManager {
             if let Err(e) = std::fs::write(&mcp_cfg_path, &mcp_cfg) {
                 tracing::warn!(error = %e, "failed to write browser mcp config");
             }
-            // Forwarded to claude's argv like the other extra args (the bash
-            // wrapper passes $@ through to the tool on first boot).
             claude_args.push("--mcp-config".to_string());
             claude_args.push(mcp_cfg_path.to_string_lossy().to_string());
-            mcp_tokens.push(token);
         }
-        // Tokens inherited from a busy-reattach swap (already rebound above)
-        // ride along so close() unregisters every token routing here.
-        mcp_tokens.extend(inherited_mcp_tokens);
 
         // Open the PTY.
         let size = PtySize {
@@ -949,7 +948,6 @@ impl PtyManager {
             account: account.clone(),
             workspace: workspace.clone(),
             _jsonl: jsonl,
-            mcp_tokens,
         });
         self.sessions.insert(session_id, handle.clone());
 
@@ -984,24 +982,22 @@ impl PtyManager {
         // already been replaced by a fresh handle).
         let sessions = self.sessions.clone();
         let tx_out = tx.clone();
-        let mcp = self.mcp.clone();
         let _ = std::thread::Builder::new()
             .name(format!("pty-reader-{}", session_id))
             .spawn(move || {
-                pty_reader_loop(
-                    handle, reader, session_id, sessions, tx_out, recorder, child, mcp,
-                )
+                pty_reader_loop(handle, reader, session_id, sessions, tx_out, recorder, child)
             });
     }
 
     async fn close(&self, session_id: Uuid, tx: mpsc::Sender<OutFrame>) {
         // Drop the handle; the reader thread will see read=0 and exit; tmux
-        // session stays alive on the OS.
-        if let Some((_, h)) = self.sessions.remove(&session_id) {
-            for tok in &h.mcp_tokens {
-                self.mcp.unregister(tok);
-            }
-        }
+        // session stays alive on the OS. Browser tokens are deliberately NOT
+        // unregistered here: the hub sends PtyClose on EVERY client detach
+        // (laptop lid close included) while claude keeps running inside tmux —
+        // unregistering would kill the live claude's cc-browser routing. The
+        // workspace-scoped token stays registered until workspace
+        // delete/reset.
+        self.sessions.remove(&session_id);
         let _ = tx
             .send(OutFrame::Text(ClientMsg::PtyClosed {
                 session_id,
@@ -1309,6 +1305,15 @@ impl PtyManager {
                     let _ = std::process::Command::new(&self.tmux.executable)
                         .args(["-L", &format!("cc-{}-{}", account, name), "kill-server"])
                         .output();
+                    // True workspace death: drop the workspace's stable
+                    // browser token and its endpoint route. A recreated
+                    // workspace with the same name mints a fresh token.
+                    if let Some((_, tok)) = self
+                        .workspace_tokens
+                        .remove(&(account.clone(), name.clone()))
+                    {
+                        self.mcp.unregister(&tok);
+                    }
                     // Wipe claude's per-project conversation history so
                     // a recreated workspace with the same name doesn't
                     // silently `--continue` into the old chat. The
@@ -1361,6 +1366,15 @@ impl PtyManager {
                     let _ = std::process::Command::new(&self.tmux.executable)
                         .args(["-L", &format!("cc-{}-{}", account, name), "kill-server"])
                         .output();
+                    // Reset = the old claude (and anything holding the old
+                    // token) is gone for good; retire the workspace's stable
+                    // browser token so the next open starts from a fresh one.
+                    if let Some((_, tok)) = self
+                        .workspace_tokens
+                        .remove(&(account.clone(), name.clone()))
+                    {
+                        self.mcp.unregister(&tok);
+                    }
                     // Keep ~/.claude/projects/<encoded-cwd>/ intact so
                     // claude's conversation history and project memory
                     // survive the reset. The next --continue will resume
@@ -1536,6 +1550,11 @@ impl PtyManager {
                 let _ = std::process::Command::new(&self.tmux.executable)
                     .args(["-L", &label, "kill-server"])
                     .output();
+                // The workspace's browser token deliberately stays in
+                // `workspace_tokens` (and registered on the endpoint): the
+                // workspace still exists — only its idle tmux/claude was
+                // reclaimed — so the next open reuses the same token and the
+                // resumed claude re-reads the unchanged mcp-browser.json.
                 tracing::info!(
                     %account, %workspace,
                     "reaped idle workspace (no client >= 30m + claude idle); --continue will resume"
@@ -1660,7 +1679,6 @@ while :; do
 done
 "#;
 
-#[allow(clippy::too_many_arguments)]
 fn pty_reader_loop(
     handle: Arc<PtyHandle>,
     mut reader: Box<dyn Read + Send>,
@@ -1669,7 +1687,6 @@ fn pty_reader_loop(
     tx_out: mpsc::Sender<OutFrame>,
     mut recorder: Option<Recorder>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    mcp: crate::mcp_endpoint::EndpointState,
 ) {
     let mut buf = [0u8; 4096];
     loop {
@@ -1699,11 +1716,11 @@ fn pty_reader_loop(
         .map(|e| Arc::ptr_eq(e.value(), &handle))
         .unwrap_or(false);
     if still_us {
-        if let Some((_, h)) = sessions.remove(&session_id) {
-            for tok in &h.mcp_tokens {
-                mcp.unregister(tok);
-            }
-        }
+        // Browser tokens stay registered: PTY EOF fires on every client
+        // detach (the tmux CLIENT process exits; the tmux server + claude
+        // keep running), so this is not workspace death. Workspace-scoped
+        // tokens are unregistered only on workspace delete/reset.
+        sessions.remove(&session_id);
         let _ = child.try_wait();
         let _ = tx_out.blocking_send(OutFrame::Text(ClientMsg::PtyClosed {
             session_id,
