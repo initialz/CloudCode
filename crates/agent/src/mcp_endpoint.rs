@@ -115,7 +115,9 @@ impl EndpointState {
 /// Timeout for a blocking claude POST awaiting its response from the
 /// client subprocess (via the hub). Factored out so tests can reason
 /// about the timeout branch without blocking for the full duration.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Kept below claude's own 30s MCP connection timeout so our JSON-RPC
+/// error reaches claude instead of racing its client-side timeout.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Build a JSON-RPC error response body for a given request id (raw id
 /// string as captured by extract_id_key, e.g. "1" or "\"abc\"").
@@ -272,6 +274,7 @@ pub async fn serve(state: EndpointState, port: u16) -> std::io::Result<()> {
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    tracing::info!(port, "browser MCP endpoint listening on 127.0.0.1");
     axum::serve(listener, app)
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
