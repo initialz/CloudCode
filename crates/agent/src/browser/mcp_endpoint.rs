@@ -902,6 +902,145 @@ mod tests {
         assert_eq!(extract_id_key(r#"{"id":null}"#), None);
     }
 
+    /// Full-stack P1 integration: REAL headless Chrome + REAL per-session
+    /// `@playwright/mcp` subprocess, driven end-to-end through the actual axum
+    /// endpoint over HTTP — exactly the path claude takes, minus claude itself.
+    ///
+    /// Run manually (it shells out to npx + launches Chrome, so it's #[ignore]d
+    /// out of the default suite):
+    /// ```text
+    /// cargo test -p cloudcode-agent full_stack_real_chrome -- --ignored --nocapture
+    /// ```
+    /// Prereqs: a real Chrome/Chromium install, `node`/`npx` on PATH, and (for
+    /// the example.com hop) internet. If there's no internet the test falls back
+    /// to a `data:` URL so it still exercises the full Chrome+playwright path.
+    #[tokio::test]
+    #[ignore = "requires real Chrome + npx playwright-mcp (+ internet); run manually"]
+    async fn full_stack_real_chrome_and_playwright() {
+        // --- 1. Real resident Chrome on a random CDP port. ---
+        let cdp_port = free_port();
+        let mcp_port = free_port();
+        let cfg = BrowserConfig {
+            enabled: true,
+            chrome_path: None, // auto-detect a real Chrome/Chromium
+            cdp_port,
+            mcp_port,
+            mcp_command: None, // -> default: npx -y @playwright/mcp@PIN --cdp-endpoint <chrome>
+        };
+        let tmp = tempfile::tempdir().expect("tempdir for Chrome profile");
+        let chrome = Arc::new(ChromeManager::new(cfg.clone(), tmp.path()));
+        chrome
+            .start()
+            .await
+            .expect("real Chrome should start and become ready");
+        assert!(chrome.is_ready(), "Chrome must report ready after start()");
+
+        // --- 2. Endpoint backed by that Chrome + the real playwright-mcp. ---
+        let state = EndpointState::new(Arc::clone(&chrome), cfg);
+        let token = uuid::Uuid::new_v4().simple().to_string();
+        let sid = Uuid::new_v4();
+        state.register(token.clone(), sid);
+
+        let serve_state = state.clone();
+        let serve_task = tokio::spawn(async move {
+            let _ = serve(serve_state, mcp_port).await;
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(150))
+            .build()
+            .expect("reqwest client");
+        let base = format!("http://127.0.0.1:{mcp_port}");
+        assert_eq!(wait_healthz(&client, &base).await, "ok");
+
+        let url = format!("{base}/mcp/{token}");
+        let post = |body: &'static str| {
+            let client = client.clone();
+            let url = url.clone();
+            async move {
+                client
+                    .post(&url)
+                    .body(body)
+                    .send()
+                    .await
+                    .expect("MCP POST")
+            }
+        };
+
+        // --- 3. MCP handshake. ---
+        let init = post(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"cc-fullstack-test","version":"0"}}}"#,
+        )
+        .await;
+        assert_eq!(init.status(), reqwest::StatusCode::OK);
+        let init_body = init.text().await.unwrap();
+        assert!(
+            init_body.contains("\"id\":1") && !init_body.contains("\"error\""),
+            "initialize must succeed (no JSON-RPC error): {init_body}"
+        );
+
+        // notifications/initialized -> 202, no body.
+        let notif = post(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).await;
+        assert_eq!(notif.status(), reqwest::StatusCode::ACCEPTED);
+
+        // --- 4. Navigate. Prefer example.com; fall back to a self-contained
+        //        data: URL if the network is unavailable so the test still
+        //        proves the full Chrome + playwright path. ---
+        let online = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .unwrap()
+            .get("https://example.com")
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+
+        let (nav_body, expect_in_snapshot): (&'static str, &str) = if online {
+            (
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_navigate","arguments":{"url":"https://example.com"}}}"#,
+                "Example",
+            )
+        } else {
+            (
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_navigate","arguments":{"url":"data:text/html,<title>CcFullStackProbe</title><h1>CcFullStackProbe</h1>"}}}"#,
+                "CcFullStackProbe",
+            )
+        };
+
+        let nav = post(nav_body).await;
+        assert_eq!(nav.status(), reqwest::StatusCode::OK);
+        let nav_resp = nav.text().await.unwrap();
+        assert!(
+            !nav_resp.contains("\"error\""),
+            "navigate must not return a JSON-RPC error (online={online}): {nav_resp}"
+        );
+
+        // --- 5. Snapshot must contain the page's identifying text. ---
+        let snap = post(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_snapshot","arguments":{}}}"#,
+        )
+        .await;
+        assert_eq!(snap.status(), reqwest::StatusCode::OK);
+        let snap_resp = snap.text().await.unwrap();
+        assert!(
+            !snap_resp.contains("\"error\""),
+            "snapshot must not return a JSON-RPC error: {snap_resp}"
+        );
+        assert!(
+            snap_resp.contains(expect_in_snapshot),
+            "snapshot should contain {expect_in_snapshot:?} (online={online}): {snap_resp}"
+        );
+
+        // --- 6. Cleanup. Dropping the endpoint state aborts the per-session
+        //        pump -> drops McpProcess -> playwright-mcp + its browser tab go
+        //        away; dropping the ChromeManager kills resident Chrome
+        //        (kill_on_drop). serve_task ends when its state Arc is gone. ---
+        serve_task.abort();
+        drop(state);
+        drop(chrome);
+    }
+
     /// Grab a currently-free localhost TCP port by binding to :0.
     fn free_port() -> u16 {
         let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
