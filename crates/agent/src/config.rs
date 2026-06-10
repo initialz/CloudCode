@@ -147,6 +147,12 @@ pub struct BrowserConfig {
     /// CDP remote-debugging port Chrome listens on. Default 19222.
     #[serde(default = "default_cdp_port")]
     pub cdp_port: u16,
+    /// Localhost port the resident MCP HTTP endpoint binds. This is SEPARATE
+    /// from `cdp_port` (Chrome's debugging port): claude connects here, the
+    /// endpoint drives a per-session playwright-mcp subprocess that in turn
+    /// attaches to Chrome on `cdp_port`. Default 7110.
+    #[serde(default = "default_mcp_port")]
+    pub mcp_port: u16,
     /// Override the playwright-mcp launch command (whitespace-split). Test /
     /// escape hatch; normally left unset so the built-in launcher is used.
     #[serde(default)]
@@ -155,6 +161,10 @@ pub struct BrowserConfig {
 
 fn default_cdp_port() -> u16 {
     19222
+}
+
+fn default_mcp_port() -> u16 {
+    7110
 }
 
 #[derive(Debug, Deserialize, Clone)]

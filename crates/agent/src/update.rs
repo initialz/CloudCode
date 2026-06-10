@@ -16,6 +16,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::paths::state_dir;
+
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -263,16 +265,6 @@ fn update_current_symlink(agent_dir: &Path, new_target: &Path) -> std::io::Resul
     std::os::unix::fs::symlink(new_target, &tmp)?;
     std::fs::rename(&tmp, &current)?;
     Ok(())
-}
-
-fn state_dir() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CLOUDCODE_STATE_DIR") {
-        return Some(PathBuf::from(p));
-    }
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("state")))?;
-    Some(base.join("cloudcode"))
 }
 
 /// Compile-time host triple, emitted by build.rs into `CLOUDCODE_TARGET`.

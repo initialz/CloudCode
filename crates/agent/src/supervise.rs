@@ -16,6 +16,8 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+
+use crate::paths::state_dir;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -311,12 +313,3 @@ fn active_binary_path() -> Option<PathBuf> {
     }
 }
 
-fn state_dir() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("CLOUDCODE_STATE_DIR") {
-        return Some(PathBuf::from(p));
-    }
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".local").join("state")))?;
-    Some(base.join("cloudcode"))
-}

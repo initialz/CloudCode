@@ -27,6 +27,7 @@ gethostname.workspace = true
 whoami.workspace = true
 uuid.workspace = true
 dashmap.workspace = true
+axum.workspace = true
 rustls.workspace = true
 chrono.workspace = true
 reqwest.workspace = true

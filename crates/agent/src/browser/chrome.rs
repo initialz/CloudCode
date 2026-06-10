@@ -298,6 +298,7 @@ mod tests {
             enabled: true,
             chrome_path,
             cdp_port: port,
+            mcp_port: 7110,
             mcp_command: None,
         }
     }

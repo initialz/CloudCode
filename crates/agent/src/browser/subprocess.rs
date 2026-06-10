@@ -16,13 +16,28 @@ pub struct McpProcess {
 impl McpProcess {
     #[allow(dead_code)]
     pub fn spawn(program: &str, args: &[&str]) -> std::io::Result<Self> {
-        let mut child = Command::new(program)
-            .args(args)
+        Self::spawn_with_cwd(program, args, None)
+    }
+
+    /// Spawn like [`McpProcess::spawn`] but optionally set the child's working
+    /// directory. The endpoint (Task 4) uses this to point playwright-mcp's
+    /// `.playwright-mcp/` scratch output at a dedicated dir instead of cwd.
+    #[allow(dead_code)]
+    pub fn spawn_with_cwd(
+        program: &str,
+        args: &[&str],
+        cwd: Option<&std::path::Path>,
+    ) -> std::io::Result<Self> {
+        let mut cmd = Command::new(program);
+        cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let lines = BufReader::new(stdout).lines();

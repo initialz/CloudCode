@@ -4,6 +4,7 @@ mod config;
 mod fs;
 mod jsonl;
 mod name;
+mod paths;
 mod pty;
 mod sandbox;
 mod supervise;
@@ -17,6 +18,8 @@ use std::ffi::CString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::browser::chrome::ChromeManager;
+use crate::browser::mcp_endpoint::EndpointState;
 use crate::config::Config;
 use crate::pty::PtyManager;
 
@@ -28,6 +31,13 @@ pub struct AppState {
     /// agent-level audit task (spawned once at startup) can ship
     /// `UserInteraction` frames to the hub.
     pub audit_slot: audit::SenderSlot,
+    /// Resident headless Chrome supervisor. Always present; only `start`ed when
+    /// `config.browser.enabled`. PtyManager (Task 5) reads `cdp_http_url()`.
+    pub chrome: Arc<ChromeManager>,
+    /// Resident MCP HTTP endpoint state. claude connects to it; it drives a
+    /// per-session playwright-mcp subprocess. Consumed by the session wiring in
+    /// Task 5 (register/reserve a token→session at session open).
+    pub mcp: EndpointState,
 }
 
 #[derive(Parser)]
@@ -231,11 +241,43 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     // `claude --continue` on the next open.
     tokio::spawn(manager.clone().run_idle_reaper());
 
+    // Resident browser stack (P1 desktop app). The Chrome manager and the MCP
+    // endpoint state are always constructed (so AppState is uniform and Task 5
+    // can register sessions unconditionally), but Chrome is only spawned and
+    // the endpoint only served when the operator opts in via [browser].enabled.
+    // Failures here are non-fatal: the agent still serves PTYs.
+    let agent_state_dir = paths::agent_state_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp/cloudcode/agent"));
+    let chrome = Arc::new(ChromeManager::new(
+        config.browser.clone(),
+        &agent_state_dir,
+    ));
+    let mcp = EndpointState::new(chrome.clone(), config.browser.clone());
+
+    if config.browser.enabled {
+        match chrome.start().await {
+            Ok(()) => tracing::info!("resident Chrome started"),
+            Err(e) => tracing::warn!(error = %e, "Chrome failed to start; browser tools unavailable"),
+        }
+        let mcp_port = config.browser.mcp_port;
+        let serve_state = mcp.clone();
+        tokio::spawn(async move {
+            if let Err(e) = browser::mcp_endpoint::serve(serve_state, mcp_port).await {
+                tracing::warn!(error = %e, port = mcp_port, "browser MCP endpoint failed to bind");
+            }
+        });
+        tracing::info!(port = config.browser.mcp_port, "browser MCP endpoint enabled");
+    } else {
+        tracing::debug!("browser disabled; Chrome + MCP endpoint not started");
+    }
+
     let state = Arc::new(AppState {
         name,
         config,
         manager,
         audit_slot,
+        chrome,
+        mcp,
     });
 
     ws::run(state).await
