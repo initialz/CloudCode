@@ -1,3 +1,4 @@
+mod auth_gate;
 mod cc_browser;
 mod input;
 mod menu;
