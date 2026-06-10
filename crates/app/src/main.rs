@@ -18,6 +18,7 @@ use config::HubConfig;
 use state::{apply_event, badge, FollowUp, Screen};
 use std::path::PathBuf;
 use terminal::{install_cjk_font, TerminalPanel};
+// `terminal::UiOutput` is referenced fully-qualified in the session arm.
 
 fn main() -> eframe::Result {
     tracing_subscriber::fmt()
@@ -285,21 +286,26 @@ impl eframe::App for App {
                         );
                     });
                     ui.separator();
-                    let input = egui::ScrollArea::both()
-                        .auto_shrink([false, false])
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            if let Some(panel) = &mut self.terminal {
-                                panel.ui(ui)
-                            } else {
-                                ui.weak("(terminal not ready)");
-                                Vec::new()
-                            }
-                        })
-                        .inner;
-                    // Keyboard/IME bytes from the terminal panel -> hub PTY.
-                    if !input.is_empty() {
-                        self.send(UiCommand::SendInput(input));
+                    // The terminal owns its own scrollback (alacritty grid +
+                    // wheel scroll), so no egui ScrollArea — the panel sizes
+                    // itself to the remaining region (pixels → cols/rows).
+                    let avail = ui.available_size();
+                    let output = if let Some(panel) = &mut self.terminal {
+                        panel.ui(ui, avail, std::time::Instant::now())
+                    } else {
+                        ui.weak("(terminal not ready)");
+                        terminal::UiOutput::default()
+                    };
+                    // Keyboard/IME/paste bytes from the panel -> hub PTY.
+                    if !output.input.is_empty() {
+                        self.send(UiCommand::SendInput(output.input));
+                    }
+                    // Debounced pixel→grid resize -> hub PTY resize.
+                    if let Some(r) = output.resize {
+                        self.send(UiCommand::Resize {
+                            cols: r.cols,
+                            rows: r.rows,
+                        });
                     }
                 }
                 Screen::Error { message } => {
