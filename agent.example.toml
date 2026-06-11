@@ -53,3 +53,14 @@ registration_token = "ag_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 # [recording]
 # dir       = "~/.local/state/cloudcode/agent/recordings"
 # keep_days = 0     # 0 = 永久保留（MVP 暂不做自动 GC）
+
+# [browser] 开启 agent 侧浏览器通道：claude 会获得 `cc-browser` MCP 工具
+# （Playwright 驱动一个常驻 headless Chrome），桌面 app / webterm 的 /viewer
+# 可经 CDP 实时镜像它打开的页面。默认关闭。需要本机装 Google Chrome（或
+# Chromium）+ Node.js。设 enabled = true 打开。
+[browser]
+enabled = false
+# chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"  # 不填则自动探测
+# cdp_port = 19222    # 常驻 Chrome 的 --remote-debugging-port（仅 localhost）
+# mcp_port = 7110     # claude 连接的 localhost MCP 端点端口
+# mcp_command = ""    # 整条覆盖 playwright-mcp 启动命令（高级/测试用）

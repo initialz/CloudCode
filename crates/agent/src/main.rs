@@ -367,6 +367,18 @@ extra_args     = []
 # only so older agent.toml files keep parsing.
 # [sandbox]
 # enabled = false
+
+# [browser] enables the agent-side browser channel: claude gets a
+# `cc-browser` MCP tool (Playwright over a resident headless Chrome) and
+# the desktop app / webterm /viewer can mirror its pages via CDP.
+# Disabled by default. Requires Google Chrome (or Chromium) + Node.js on
+# this host. Turn it on by setting enabled = true.
+[browser]
+enabled = false
+# chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"  # auto-detected if unset
+# cdp_port = 19222    # resident Chrome's --remote-debugging-port (localhost only)
+# mcp_port = 7110     # the localhost MCP endpoint claude connects to
+# mcp_command = ""    # override the whole playwright-mcp launch command (advanced/testing)
 "#
     );
 
