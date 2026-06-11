@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use toml_edit::{DocumentMut, Item, Table};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -263,5 +264,248 @@ impl Config {
             // "claude" via default_tool, so nothing to do here.
         }
         Ok(cfg)
+    }
+}
+
+/// One entry in the backfill registry: a documented optional section we know
+/// how to materialise with sensible defaults + explanatory comments.
+struct BackfillSection {
+    /// Top-level table key, e.g. `"browser"`.
+    key: &'static str,
+    /// Builds the default `toml_edit::Item` (a decorated `[key]` table) to
+    /// append when the section is absent.
+    build: fn() -> Item,
+}
+
+/// Registry of documented optional sections to backfill on startup.
+///
+/// Intentionally minimal — V1 only seeds `[browser]`. The other optional
+/// sections are deliberately NOT here:
+///   - `[tmux]` / `[recording]` are auto/host-derived and fine when absent.
+///   - `[sandbox]` is deprecated (toggle moved to the hub).
+///   - `[claude]` / `[tools]` / `[agent]` already parse fine from serde
+///     defaults and carry user-specific wiring we don't want to inject.
+/// Adding a future section is a one-line addition here plus its `build_*` fn.
+fn backfill_registry() -> &'static [BackfillSection] {
+    &[BackfillSection {
+        key: "browser",
+        build: build_browser_section,
+    }]
+}
+
+/// Default `[browser]` table: the real key (`enabled = false`) plus the same
+/// explanatory comment block init_config writes, attached as the table's decor
+/// prefix. The optional fields (chrome_path/cdp_port/mcp_port/mcp_command) are
+/// shown as commented hint lines INSIDE that prefix, not as live keys.
+fn build_browser_section() -> Item {
+    let mut table = Table::new();
+    table.insert("enabled", toml_edit::value(false));
+    // Leading blank line separates the appended block from prior content.
+    table.decor_mut().set_prefix(
+        "\n# [browser] enables the agent-side browser channel: claude gets a\n\
+         # `cc-browser` MCP tool (Playwright over a resident headless Chrome) and\n\
+         # the desktop app / webterm /viewer can mirror its pages via CDP.\n\
+         # Disabled by default. Requires Google Chrome (or Chromium) + Node.js on\n\
+         # this host. Turn it on by setting enabled = true.\n",
+    );
+    // The commented optional-field hints trail the `enabled` key. We attach
+    // them as the suffix decor of the `enabled` value so they sit directly
+    // under it, matching init_config's layout.
+    if let Some(enabled) = table.get_mut("enabled") {
+        if let Item::Value(v) = enabled {
+            v.decor_mut().set_suffix(
+                "\n# chrome_path = \"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome\"  # auto-detected if unset\n\
+                 # cdp_port = 19222    # resident Chrome's --remote-debugging-port (localhost only)\n\
+                 # mcp_port = 7110     # the localhost MCP endpoint claude connects to\n\
+                 # mcp_command = \"\"    # override the whole playwright-mcp launch command (advanced/testing)",
+            );
+        }
+    }
+    Item::Table(table)
+}
+
+/// On startup, append any DOCUMENTED optional config section that's missing
+/// from `path` (with its default value + explanatory comments), preserving all
+/// existing content / comments / formatting. Idempotent: an already-present
+/// section is never touched, and if nothing is added the file is left
+/// byte-for-byte unchanged (no mtime churn).
+///
+/// Returns the list of section keys that were actually appended. Writes are
+/// atomic (temp file + rename) and preserve the original file's permissions.
+pub fn backfill_defaults(path: &Path) -> anyhow::Result<Vec<&'static str>> {
+    let original = std::fs::read_to_string(path)?;
+    // Parse first; on a malformed file we bail without writing anything.
+    let mut doc: DocumentMut = original
+        .parse()
+        .map_err(|e| anyhow::anyhow!("parsing {} for backfill: {}", path.display(), e))?;
+
+    let mut added: Vec<&'static str> = Vec::new();
+    for section in backfill_registry() {
+        if doc.get(section.key).is_none() {
+            doc.insert(section.key, (section.build)());
+            added.push(section.key);
+        }
+    }
+
+    if added.is_empty() {
+        // Nothing to do — don't rewrite the file (idempotent, no mtime churn).
+        return Ok(added);
+    }
+
+    let new_contents = doc.to_string();
+
+    // Atomic write: serialise to a temp file in the SAME dir (so the rename is
+    // a same-filesystem move), then rename over the original. A crash
+    // mid-write leaves the temp file, never a half-written config.
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let tmp_path = match dir {
+        Some(d) => d.join(format!(
+            ".{}.backfill.{}.tmp",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("config"),
+            std::process::id()
+        )),
+        None => PathBuf::from(format!(".config.backfill.{}.tmp", std::process::id())),
+    };
+
+    // Write + flush the temp file, then ensure it's gone on any later failure.
+    let write_result = (|| -> std::io::Result<()> {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp_path)?;
+        f.write_all(new_contents.as_bytes())?;
+        f.flush()?;
+        // Preserve the original file's permissions so we don't loosen the mode
+        // on a file that holds the plaintext registration token.
+        if let Ok(meta) = std::fs::metadata(path) {
+            std::fs::set_permissions(&tmp_path, meta.permissions())?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(anyhow::anyhow!(
+            "writing backfill temp for {}: {}",
+            path.display(),
+            e
+        ));
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(anyhow::anyhow!(
+            "renaming backfilled config into {}: {}",
+            path.display(),
+            e
+        ));
+    }
+
+    Ok(added)
+}
+
+#[cfg(test)]
+mod backfill_tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// Minimal valid agent.toml with only the required sections.
+    const MINIMAL: &str = "[hub]\nurl = \"wss://hub.example.com/v1/agent/ws\"\n\n[auth]\nregistration_token = \"ag_TEST\"\n";
+
+    fn write_tmp(name: &str, contents: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "cc-backfill-test-{}-{}",
+            std::process::id(),
+            name
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("agent.toml");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        path
+    }
+
+    #[test]
+    fn backfill_adds_browser_when_absent() {
+        let path = write_tmp("adds-browser", MINIMAL);
+        let added = backfill_defaults(&path).unwrap();
+        assert_eq!(added, vec!["browser"]);
+
+        let out = std::fs::read_to_string(&path).unwrap();
+        eprintln!("--- backfilled file ---\n{out}\n--- end ---");
+        // New section present with real key + comment text.
+        assert!(out.contains("[browser]"));
+        assert!(out.contains("enabled = false"));
+        assert!(out.contains("enables the agent-side browser channel"));
+        assert!(out.contains("Turn it on by setting enabled = true"));
+        assert!(out.contains("# cdp_port = 19222"));
+        // Required sections preserved verbatim.
+        assert!(out.contains("url = \"wss://hub.example.com/v1/agent/ws\""));
+        assert!(out.contains("registration_token = \"ag_TEST\""));
+    }
+
+    #[test]
+    fn backfill_is_idempotent() {
+        let path = write_tmp("idempotent", MINIMAL);
+        let first = backfill_defaults(&path).unwrap();
+        assert_eq!(first, vec!["browser"]);
+        let after_first = std::fs::read_to_string(&path).unwrap();
+
+        let second = backfill_defaults(&path).unwrap();
+        assert!(second.is_empty(), "second run should add nothing");
+        let after_second = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after_first, after_second, "file must be byte-identical");
+    }
+
+    #[test]
+    fn backfill_preserves_user_browser() {
+        let contents = format!("{MINIMAL}\n[browser]\nenabled = true\n");
+        let path = write_tmp("preserve-browser", &contents);
+        let added = backfill_defaults(&path).unwrap();
+        assert!(added.is_empty());
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(out, contents, "user [browser] must be untouched");
+        assert!(out.contains("enabled = true"));
+        assert!(!out.contains("enabled = false"));
+    }
+
+    #[test]
+    fn backfill_preserves_comments_and_other_sections() {
+        let contents = format!(
+            "# my hand-written note\n{MINIMAL}\n[tmux]\nexecutable = \"/usr/local/bin/tmux\"\n"
+        );
+        let path = write_tmp("preserve-comments", &contents);
+        let added = backfill_defaults(&path).unwrap();
+        assert_eq!(added, vec!["browser"]);
+        let out = std::fs::read_to_string(&path).unwrap();
+        assert!(out.contains("# my hand-written note"));
+        assert!(out.contains("[tmux]"));
+        assert!(out.contains("executable = \"/usr/local/bin/tmux\""));
+        assert!(out.contains("[browser]"));
+        // Comment + tmux survive ahead of the appended block.
+        let note_idx = out.find("# my hand-written note").unwrap();
+        let tmux_idx = out.find("[tmux]").unwrap();
+        let browser_idx = out.find("[browser]").unwrap();
+        assert!(note_idx < browser_idx);
+        assert!(tmux_idx < browser_idx);
+    }
+
+    #[test]
+    fn backfilled_file_parses_as_config() {
+        let path = write_tmp("parses", MINIMAL);
+        backfill_defaults(&path).unwrap();
+        let cfg = Config::load(&path).expect("backfilled file must load");
+        assert!(!cfg.browser.enabled);
+    }
+
+    #[test]
+    fn backfill_leaves_no_temp_files() {
+        let path = write_tmp("no-temp", MINIMAL);
+        backfill_defaults(&path).unwrap();
+        let dir = path.parent().unwrap();
+        let strays: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "stray temp files left: {strays:?}");
     }
 }

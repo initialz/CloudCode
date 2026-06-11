@@ -208,6 +208,34 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         ));
     }
 
+    // Backfill any documented optional section missing from the file (e.g.
+    // [browser]) before loading, so the user's on-disk agent.toml gains the
+    // new block with explanatory comments. A backfill failure must NOT block
+    // startup — log and fall through to load (serde defaults still apply).
+    match config::backfill_defaults(&config_path) {
+        Ok(added) => {
+            for section in added {
+                tracing::info!(
+                    "added default [{}] section to {}",
+                    section,
+                    config_path.display()
+                );
+                println!(
+                    "added default [{}] section to {}",
+                    section,
+                    config_path.display()
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "config backfill for {} failed (continuing): {}",
+                config_path.display(),
+                e
+            );
+        }
+    }
+
     let config =
         Config::load(&config_path).with_context(|| format!("loading {}", config_path.display()))?;
 
