@@ -125,6 +125,10 @@ struct App {
     /// user action (toggle the browser panel away and back, which clears this).
     /// Cleared when the browser panel is hidden or a new session opens.
     viewer_retry_blocked: bool,
+    /// The terminal bell rang this frame (attention freshly set in
+    /// `drain_events`): `update()` nudges the OS (dock bounce / taskbar
+    /// flash) if the window is unfocused. One-shot, best-effort.
+    attention_nudge: bool,
 }
 
 impl App {
@@ -171,6 +175,7 @@ impl App {
             browser: None,
             viewer: None,
             viewer_retry_blocked: false,
+            attention_nudge: false,
         }
     }
 
@@ -293,7 +298,13 @@ impl App {
             // through the (pure) reducer.
             if let BackendEvent::PtyBytes(bytes) = &ev {
                 if let Some(panel) = &mut self.terminal {
+                    let had_attention = panel.attention();
                     panel.feed(bytes);
+                    // A FRESH bell (off → on) also nudges the OS window
+                    // if we're unfocused — handled in `update()`.
+                    if !had_attention && panel.attention() {
+                        self.attention_nudge = true;
+                    }
                 }
                 continue;
             }
@@ -424,6 +435,10 @@ impl App {
             .active
             .as_ref()
             .map(|a| (a.agent.clone(), a.workspace.clone()));
+        // Bell-driven attention on the live terminal — `row_badge` gates
+        // it onto the ACTIVE row only (V1: the bell is only detectable in
+        // the attached session's PTY stream).
+        let attention = self.terminal.as_ref().is_some_and(|t| t.attention());
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -438,7 +453,7 @@ impl App {
                     let is_active = active_key
                         .as_ref()
                         .is_some_and(|(a, n)| *a == w.agent && *n == w.name);
-                    match workspace_row(ui, w, is_active) {
+                    match workspace_row(ui, w, is_active, attention) {
                         RowAction::None => {}
                         RowAction::Clicked => {
                             self.click_workspace(w.agent.clone(), w.name.clone())
@@ -644,11 +659,8 @@ impl App {
                 self.render_session(ui);
             });
             if reconnecting {
-                ui.painter().rect_filled(
-                    content_rect,
-                    0.0,
-                    egui::Color32::from_black_alpha(110),
-                );
+                ui.painter()
+                    .rect_filled(content_rect, 0.0, theme::DIM_OVERLAY);
             }
         } else {
             ui.centered_and_justified(|ui| {
@@ -746,9 +758,26 @@ impl App {
 
     /// Draw the terminal panel and forward its captured input/resize to the
     /// PTY ws. Focus is the panel's own (click-to-focus, gated internally).
+    ///
+    /// When the panel's bell-driven attention flag is set, a 2px ACCENT
+    /// halo is stroked around the panel's rect. Painted here inside the
+    /// session content (BEFORE `render_content`'s reconnect dim overlay)
+    /// so a reconnect dims the halo along with everything else.
     fn render_terminal(&mut self, ui: &mut egui::Ui, avail: egui::Vec2) {
+        let panel_rect =
+            egui::Rect::from_min_size(ui.available_rect_before_wrap().min, avail);
         let output = if let Some(panel) = &mut self.terminal {
-            panel.ui(ui, avail, std::time::Instant::now())
+            let out = panel.ui(ui, avail, std::time::Instant::now());
+            if panel.attention() {
+                // Inset by 1px so the 2px stroke isn't clipped at the
+                // panel's edges.
+                ui.painter().rect_stroke(
+                    panel_rect.shrink(1.0),
+                    theme::RADIUS,
+                    egui::Stroke::new(2.0, theme::ACCENT),
+                );
+            }
+            out
         } else {
             ui.colored_label(theme::TEXT_FAINT, "(terminal not ready)");
             terminal::UiOutput::default()
@@ -797,12 +826,17 @@ enum RowAction {
 }
 
 /// Paint one sidebar workspace row: status dot, name, `@agent`, the
-/// "attached elsewhere" hint, active-row highlight (BG2 + accent left
-/// bar) and hover-revealed delete/reset icons. Pure-ish (egui only) —
-/// the badge derivation it leans on (`state::row_badge`) is the
-/// table-tested part.
-fn workspace_row(ui: &mut egui::Ui, w: &cloudcode_proto::WorkspaceInfo, is_active: bool) -> RowAction {
-    let badge = row_badge(w, is_active);
+/// "attached elsewhere" hint, the bell-driven attention dot, active-row
+/// highlight (BG2 + accent left bar) and hover-revealed delete/reset
+/// icons. Pure-ish (egui only) — the badge derivation it leans on
+/// (`state::row_badge`) is the table-tested part.
+fn workspace_row(
+    ui: &mut egui::Ui,
+    w: &cloudcode_proto::WorkspaceInfo,
+    is_active: bool,
+    attention: bool,
+) -> RowAction {
+    let badge = row_badge(w, is_active, attention);
     let row_h = 40.0;
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), row_h),
@@ -832,6 +866,14 @@ fn workspace_row(ui: &mut egui::Ui, w: &cloudcode_proto::WorkspaceInfo, is_activ
     };
     let dot_center = egui::pos2(rect.min.x + 14.0, rect.center().y);
     painter.circle_filled(dot_center, 4.0, dot_color);
+
+    // Attention dot (bell rang, user hasn't typed back): ACCENT, at the
+    // row's right edge. Hidden while hovered — the delete/reset icons
+    // occupy that corner, and a hovering user is about to act anyway.
+    if badge.attention && !hovered {
+        let attn_center = egui::pos2(rect.max.x - 14.0, rect.center().y);
+        painter.circle_filled(attn_center, 4.0, theme::ACCENT);
+    }
 
     // Name + @agent, dimmed when the agent is offline.
     let name_color = if badge.dot == Dot::Offline {
@@ -903,6 +945,16 @@ fn workspace_row(ui: &mut egui::Ui, w: &cloudcode_proto::WorkspaceInfo, is_activ
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+
+        // A fresh bell while the OS window is unfocused → best-effort
+        // attention request (dock bounce on macOS, taskbar flash
+        // elsewhere). One-shot per bell; focused windows skip it (the
+        // in-app halo is enough).
+        if std::mem::take(&mut self.attention_nudge) && !ctx.input(|i| i.focused) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Informational,
+            ));
+        }
 
         // Cmd/Ctrl+B cycles the session view (Terminal → Split → Browser).
         // Only meaningful with an open session; harmless elsewhere. Consume

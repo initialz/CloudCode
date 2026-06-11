@@ -317,14 +317,24 @@ impl BrowserPanel {
             image_rect,
             // Full texture (uv 0,0 .. 1,1).
             egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            // Identity tint (not a chrome color — the frame's own pixels).
             egui::Color32::WHITE,
         );
 
         // `LIVE · w×h` badge (bottom-right): the honest "this is a mirror"
         // marker, shown only while frames are actually flowing. A stalled
         // stream (>2s without a frame) just hides it (V1 keeps it binary).
-        if frame_is_live(self.last_frame, Instant::now()) {
+        let now = Instant::now();
+        if frame_is_live(self.last_frame, now) {
             draw_live_badge(&painter, image_rect, fw, fh);
+            // When the stream stops, no event arrives to wake the UI, so
+            // the badge would linger until the next repaint. Schedule one
+            // for just past the freshness deadline so it expires promptly.
+            if let Some(last) = self.last_frame {
+                let remaining = LIVE_FRESH.saturating_sub(now.duration_since(last));
+                ui.ctx()
+                    .request_repaint_after(remaining + Duration::from_millis(50));
+            }
         }
 
         // Grab focus on press so keyboard/IME route here.
@@ -382,16 +392,24 @@ impl BrowserPanel {
             .inner_margin(egui::Margin::symmetric(crate::theme::SP_1, crate::theme::SP_1))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = crate::theme::SP_1;
-                    for t in &self.targets {
-                        let active = self.current.as_deref() == Some(t.id.as_str());
-                        let label = tab_label(&t.title, &t.url, TAB_LABEL_MAX);
-                        if tab_button(ui, &label, active) && !active {
-                            clicked = Some(t.id.clone());
-                        }
-                    }
-                });
+                // Horizontal scroll (id-salted: the split layout can host
+                // other scroll areas) so many tabs scroll instead of
+                // clipping off the strip's right edge.
+                egui::ScrollArea::horizontal()
+                    .id_source("viewer_tab_strip")
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = crate::theme::SP_1;
+                            for t in &self.targets {
+                                let active =
+                                    self.current.as_deref() == Some(t.id.as_str());
+                                let label = tab_label(&t.title, &t.url, TAB_LABEL_MAX);
+                                if tab_button(ui, &label, active) && !active {
+                                    clicked = Some(t.id.clone());
+                                }
+                            }
+                        });
+                    });
             });
         if let Some(id) = &clicked {
             // Optimistic: the agent confirms by switching the stream (and a

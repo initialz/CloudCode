@@ -243,7 +243,8 @@ pub enum Dot {
 }
 
 /// Everything the sidebar needs to paint one row, derived purely from
-/// the `WorkspaceInfo` + whether the row is the active session.
+/// the `WorkspaceInfo` + whether the row is the active session (+ the
+/// active terminal's bell-driven attention flag).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowBadge {
     pub dot: Dot,
@@ -254,9 +255,15 @@ pub struct RowBadge {
     /// Clicking the row can open/switch (the agent is online and it's
     /// not already the active session).
     pub clickable: bool,
+    /// The terminal bell rang and the user hasn't typed since — show
+    /// the accent attention dot. Only the ACTIVE row can carry it in
+    /// V1: the bell is detected in the attached session's PTY stream,
+    /// so unattached workspaces have no signal source (documented;
+    /// cross-session notification is P7+).
+    pub attention: bool,
 }
 
-pub fn row_badge(w: &WorkspaceInfo, is_active: bool) -> RowBadge {
+pub fn row_badge(w: &WorkspaceInfo, is_active: bool, attention: bool) -> RowBadge {
     let dot = if !w.agent_online {
         Dot::Offline
     } else if w.tmux_alive {
@@ -268,6 +275,7 @@ pub fn row_badge(w: &WorkspaceInfo, is_active: bool) -> RowBadge {
         dot,
         attached_elsewhere: w.agent_online && w.has_client && !is_active,
         clickable: w.agent_online && !is_active,
+        attention: is_active && attention,
     }
 }
 
@@ -631,31 +639,37 @@ mod tests {
 
     #[test]
     fn row_badge_table() {
-        // (online, tmux, has_client, is_active) → expected badge
+        // (online, tmux, has_client, is_active, attention) → expected badge
         let cases = [
             // running: agent online + tmux alive
-            (true, true, false, false, Dot::Running, false, true),
+            (true, true, false, false, false, Dot::Running, false, true, false),
             // saved: online, no tmux
-            (true, false, false, false, Dot::Saved, false, true),
+            (true, false, false, false, false, Dot::Saved, false, true, false),
             // offline agent: dark dot, not clickable
-            (false, true, false, false, Dot::Offline, false, false),
+            (false, true, false, false, false, Dot::Offline, false, false, false),
             // attached elsewhere: hint shown on a non-active row
-            (true, true, true, false, Dot::Running, true, true),
+            (true, true, true, false, false, Dot::Running, true, true, false),
             // the ACTIVE row: attached client is us — no hint, no click
-            (true, true, true, true, Dot::Running, false, false),
+            (true, true, true, true, false, Dot::Running, false, false, false),
             // offline + has_client: stale flag, agent gone → no hint
-            (false, false, true, false, Dot::Offline, false, false),
+            (false, false, true, false, false, Dot::Offline, false, false, false),
+            // bell on the ACTIVE row → attention dot
+            (true, true, false, true, true, Dot::Running, false, false, true),
+            // bell flag with a NON-active row → suppressed (V1: only the
+            // attached session's PTY stream carries the bell signal)
+            (true, true, false, false, true, Dot::Running, false, true, false),
         ];
-        for (online, tmux, client, active, dot, hint, click) in cases {
-            let b = row_badge(&ws("w", online, tmux, client), active);
+        for (online, tmux, client, active, attn, dot, hint, click, want_attn) in cases {
+            let b = row_badge(&ws("w", online, tmux, client), active, attn);
             assert_eq!(
                 b,
                 RowBadge {
                     dot,
                     attached_elsewhere: hint,
-                    clickable: click
+                    clickable: click,
+                    attention: want_attn,
                 },
-                "case online={online} tmux={tmux} client={client} active={active}"
+                "case online={online} tmux={tmux} client={client} active={active} attn={attn}"
             );
         }
     }

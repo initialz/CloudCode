@@ -28,6 +28,9 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{CursorShape, Processor};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use geom::{
     grid_dims, pixel_to_grid, wheel_to_scroll_lines, wrap_paste, ResizeThrottle,
 };
@@ -52,14 +55,35 @@ pub struct ResizeRequest {
     pub rows: u16,
 }
 
-/// No-op `EventListener`: the `Term` emits events (bell, title change,
-/// clipboard, PTY writes) that a standalone renderer doesn't need to act
-/// on. We discard them.
-#[derive(Clone, Copy)]
-struct NoopListener;
+/// `EventListener` for the `Term`: captures `Event::Bell` (claude rings
+/// BEL / `\x07` when it wants the user) into a shared flag the panel
+/// folds into its attention state on the next [`TerminalPanel::feed`].
+/// Every other event (title change, clipboard, PTY writes, wakeups) is
+/// still discarded — a standalone renderer doesn't act on them.
+#[derive(Clone)]
+struct PanelListener {
+    bell: Arc<AtomicBool>,
+}
 
-impl EventListener for NoopListener {
-    fn send_event(&self, _event: Event) {}
+impl EventListener for PanelListener {
+    fn send_event(&self, event: Event) {
+        if matches!(event, Event::Bell) {
+            self.bell.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The attention-halo decision: any user input clears the flag (they're
+/// at the terminal — even if a bell rang the same frame), otherwise a
+/// bell sets it and it latches until cleared.
+///
+/// PURE (table-tested).
+fn update_attention(prev: bool, bell: bool, user_input: bool) -> bool {
+    if user_input {
+        false
+    } else {
+        prev || bell
+    }
 }
 
 /// Terminal grid size. Implements alacritty's `Dimensions` so it can be
@@ -85,10 +109,18 @@ impl Dimensions for TermSize {
 
 /// The terminal panel: owns the VTE state machine + parser and renders it.
 pub struct TerminalPanel {
-    term: Term<NoopListener>,
+    term: Term<PanelListener>,
     processor: Processor,
     cols: usize,
     rows: usize,
+    /// Bell flag shared with the `Term`'s [`PanelListener`]; swapped
+    /// false and folded into `attention` on every `feed`.
+    bell: Arc<AtomicBool>,
+    /// Attention halo state: set when the terminal rings the bell,
+    /// cleared by ANY user input to the terminal (key/IME/paste — see
+    /// `ui()`); clicks elsewhere (viewer tabs, sidebar) don't go through
+    /// the terminal input path, so they leave it set.
+    attention: bool,
     /// IME composition state. While `ime.is_composing()`, keyboard/text
     /// byte emission is suppressed — the IME owns the keystrokes — and the
     /// preedit string is rendered inline (grey + underline) at the cursor.
@@ -122,12 +154,15 @@ impl TerminalPanel {
             scrolling_history: SCROLLBACK_LINES,
             ..Config::default()
         };
-        let term = Term::new(config, &size, NoopListener);
+        let bell = Arc::new(AtomicBool::new(false));
+        let term = Term::new(config, &size, PanelListener { bell: bell.clone() });
         TerminalPanel {
             term,
             processor: Processor::new(),
             cols,
             rows,
+            bell,
+            attention: false,
             ime: ImeState::default(),
             focus_id: None,
             resize_throttle: ResizeThrottle::new(),
@@ -182,8 +217,18 @@ impl TerminalPanel {
     }
 
     /// Feed raw PTY bytes into the VTE state machine, advancing the grid.
+    /// A BEL (`\x07`) in the stream reaches the [`PanelListener`] as
+    /// `Event::Bell` and sets the attention flag here.
     pub fn feed(&mut self, bytes: &[u8]) {
         self.processor.advance(&mut self.term, bytes);
+        let bell = self.bell.swap(false, Ordering::Relaxed);
+        self.attention = update_attention(self.attention, bell, false);
+    }
+
+    /// Whether the bell-driven attention halo should show (set by a BEL
+    /// in the PTY stream, cleared by any user input to the terminal).
+    pub fn attention(&self) -> bool {
+        self.attention
     }
 
     /// Resize the terminal grid to `cols`×`rows`. Called from `ui()` when
@@ -590,6 +635,11 @@ impl TerminalPanel {
 
             output.input.extend(self.handle_egui_input(&events));
         }
+
+        // ANY terminal input this frame (key/IME/paste — every channel
+        // funnels into `output.input`) clears the attention halo: the
+        // user has answered the bell.
+        self.attention = update_attention(self.attention, false, !output.input.is_empty());
         output
     }
 }
@@ -809,6 +859,52 @@ mod tests {
         assert!(panel.bracketed_paste(), "enabled after DECSET 2004");
         panel.feed(b"\x1b[?2004l");
         assert!(!panel.bracketed_paste(), "disabled after DECRST 2004");
+    }
+
+    // ---- attention (bell-driven halo) -------------------------------
+
+    #[test]
+    fn panel_listener_sets_flag_on_bell_only() {
+        let bell = Arc::new(AtomicBool::new(false));
+        let listener = PanelListener { bell: bell.clone() };
+        // Non-bell events are ignored.
+        listener.send_event(Event::Wakeup);
+        listener.send_event(Event::Title("t".into()));
+        assert!(!bell.load(Ordering::Relaxed));
+        // Bell sets the flag.
+        listener.send_event(Event::Bell);
+        assert!(bell.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn update_attention_table() {
+        // (prev, bell, user_input) → expected
+        let cases = [
+            (false, false, false, false, "idle stays idle"),
+            (false, true, false, true, "bell sets"),
+            (true, false, false, true, "latches until input"),
+            (true, false, true, false, "input clears"),
+            (false, false, true, false, "input on idle is a no-op"),
+            (true, true, true, false, "input wins over a same-frame bell"),
+        ];
+        for (prev, bell, input, want, why) in cases {
+            assert_eq!(update_attention(prev, bell, input), want, "{why}");
+        }
+    }
+
+    #[test]
+    fn feed_bel_byte_sets_attention_via_vte() {
+        // The integration-ish path: a real BEL byte through the actual
+        // alacritty VTE → Event::Bell → PanelListener → attention.
+        let mut panel = TerminalPanel::new(80, 24);
+        assert!(!panel.attention(), "starts clear");
+        panel.feed(b"claude needs you\x07");
+        assert!(panel.attention(), "BEL through the VTE sets attention");
+        // The grid still advanced normally around the BEL.
+        assert_eq!(cell_at(&panel, 0, 0).c, 'c');
+        // Further bell-less output leaves it latched.
+        panel.feed(b" more output");
+        assert!(panel.attention(), "latches across later output");
     }
 
     #[test]

@@ -17,8 +17,15 @@ pub const BG0: Color32 = Color32::from_rgb(0x11, 0x11, 0x1b);
 pub const BG1: Color32 = Color32::from_rgb(0x18, 0x18, 0x25);
 /// Panels / cards / raised surfaces.
 pub const BG2: Color32 = Color32::from_rgb(0x1e, 0x1e, 0x2e);
+/// Widget hover state: one step above BG2.
+pub const BG_HOVER: Color32 = Color32::from_rgb(0x2a, 0x2b, 0x3c);
+/// Widget pressed/active state: one step above BG_HOVER.
+pub const BG_ACTIVE: Color32 = Color32::from_rgb(0x32, 0x33, 0x47);
 /// Hairlines, separators, widget outlines.
 pub const BORDER: Color32 = Color32::from_rgb(0x31, 0x32, 0x44);
+/// Translucent black wash over the session content while the wire heals
+/// (the reconnect dim — panels stay up, visibly inert).
+pub const DIM_OVERLAY: Color32 = Color32::from_black_alpha(110);
 
 // --- Text ---
 pub const TEXT: Color32 = Color32::from_rgb(0xcd, 0xd6, 0xf4);
@@ -93,14 +100,14 @@ pub fn apply(ctx: &egui::Context) {
     w.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT);
     w.inactive.rounding = rounding;
 
-    w.hovered.bg_fill = Color32::from_rgb(0x2a, 0x2b, 0x3c); // BG2 + a step
-    w.hovered.weak_bg_fill = Color32::from_rgb(0x2a, 0x2b, 0x3c);
+    w.hovered.bg_fill = BG_HOVER;
+    w.hovered.weak_bg_fill = BG_HOVER;
     w.hovered.bg_stroke = egui::Stroke::new(1.0, TEXT_FAINT);
     w.hovered.fg_stroke = egui::Stroke::new(1.5, TEXT);
     w.hovered.rounding = rounding;
 
-    w.active.bg_fill = Color32::from_rgb(0x32, 0x33, 0x47);
-    w.active.weak_bg_fill = Color32::from_rgb(0x32, 0x33, 0x47);
+    w.active.bg_fill = BG_ACTIVE;
+    w.active.weak_bg_fill = BG_ACTIVE;
     w.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
     w.active.fg_stroke = egui::Stroke::new(1.5, TEXT);
     w.active.rounding = rounding;
