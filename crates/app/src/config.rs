@@ -43,6 +43,27 @@ pub fn load_config(override_path: Option<&Path>) -> Result<HubConfig> {
     parse_config(&s).with_context(|| format!("parsing {}", path.display()))
 }
 
+/// Resolve the effective config: CLI flags override file values, and when
+/// BOTH `--hub-url` and `--token` are given the config file is not needed
+/// at all (mirrors the CLI client's `resolve_config` precedence).
+pub fn resolve_config(
+    cli_hub_url: Option<String>,
+    cli_token: Option<String>,
+    override_path: Option<&Path>,
+) -> Result<HubConfig> {
+    if let (Some(hub_url), Some(token)) = (cli_hub_url.clone(), cli_token.clone()) {
+        return Ok(HubConfig { hub_url, token });
+    }
+    let mut cfg = load_config(override_path)?;
+    if let Some(u) = cli_hub_url {
+        cfg.hub_url = u;
+    }
+    if let Some(t) = cli_token {
+        cfg.token = t;
+    }
+    Ok(cfg)
+}
+
 /// Split out so the TOML parsing is unit-testable without touching the
 /// filesystem.
 fn parse_config(s: &str) -> Result<HubConfig> {

@@ -44,7 +44,7 @@ fn main() -> eframe::Result {
 
     // Load config up front so a misconfigured client shows the fatal
     // screen rather than spinning forever on Connecting.
-    let cfg_result = config::load_config(args.config.as_deref());
+    let cfg_result = config::resolve_config(args.hub_url, args.token, args.config.as_deref());
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 680.0]),
@@ -58,25 +58,43 @@ fn main() -> eframe::Result {
     )
 }
 
-/// Minimal CLI: only `--config <path>` (no clap — the desktop app has
-/// one knob and pulling clap in for it isn't worth it).
+/// Minimal CLI (no clap — three knobs aren't worth the dependency):
+/// `--config <path>`, `--hub-url <url>`, `--token <tok>`.
+/// Flags override config-file values; with BOTH --hub-url and --token the
+/// config file isn't read at all (mirrors the CLI client's precedence).
 struct Args {
     config: Option<PathBuf>,
+    hub_url: Option<String>,
+    token: Option<String>,
 }
 
 impl Args {
     fn parse(mut argv: impl Iterator<Item = String>) -> Args {
         let mut config = None;
+        let mut hub_url = None;
+        let mut token = None;
         while let Some(a) = argv.next() {
             match a.as_str() {
                 "--config" => config = argv.next().map(PathBuf::from),
+                "--hub-url" => hub_url = argv.next(),
+                "--token" => token = argv.next(),
                 other if other.starts_with("--config=") => {
                     config = Some(PathBuf::from(&other["--config=".len()..]));
+                }
+                other if other.starts_with("--hub-url=") => {
+                    hub_url = Some(other["--hub-url=".len()..].to_string());
+                }
+                other if other.starts_with("--token=") => {
+                    token = Some(other["--token=".len()..].to_string());
                 }
                 _ => {}
             }
         }
-        Args { config }
+        Args {
+            config,
+            hub_url,
+            token,
+        }
     }
 }
 
@@ -1078,5 +1096,26 @@ mod tests {
     fn no_config_flag_is_none() {
         let args = Args::parse(["--other"].into_iter().map(String::from));
         assert!(args.config.is_none());
+        assert!(args.hub_url.is_none());
+        assert!(args.token.is_none());
+    }
+
+    #[test]
+    fn parses_hub_url_and_token_both_forms() {
+        let args = Args::parse(
+            ["--hub-url", "http://h:7100", "--token=cc_t"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(args.hub_url.as_deref(), Some("http://h:7100"));
+        assert_eq!(args.token.as_deref(), Some("cc_t"));
+
+        let args = Args::parse(
+            ["--hub-url=http://h2:7100", "--token", "cc_t2"]
+                .into_iter()
+                .map(String::from),
+        );
+        assert_eq!(args.hub_url.as_deref(), Some("http://h2:7100"));
+        assert_eq!(args.token.as_deref(), Some("cc_t2"));
     }
 }
