@@ -123,3 +123,17 @@ targets 条目: { id, title, url, kind:"page", attached:bool }
 - 切 workspace 的"关旧开新"要查 backend 现有命令语义(Close 是整连接关闭!可能需要新的 CloseSession-only 语义或直接 OpenSession 顶替——hub 的 takeover 机制本来就支持同账户重开,验证后取最简)。实现者必须先读 hub pty_session 的 OpenSession/teardown 语义再动。
 - 多 viewer 共享 TargetWatcher 的并发:V1 取简,逐 viewer 一个 watcher 也可接受(连接数=viewer 数,个位数)。
 - cmux 的教训贯穿:主题唯一来源、稳定优先(dirty repaint 别引入忙刷)、claude 原生 PTY 不动。
+
+---
+
+## 实现备注（T1–T4 对设计的实际偏差，诚实记录）
+
+1. **切换走"switch via reconnect"而非独立 CloseSession**：Self-Review 备忘预判了这一疑问。实测发现 hub 拒绝同连接上的第二个 `OpenSession`（"session already open"），而 `Close` 会关闭整条连接。最终取最简路径：`UiCommand::SwitchWorkspace` → backend 发送 `Close` 并按"线路丢失"处理（NOT 用户主动退出）→ 正常退避重连 → re-Welcome → reducer 的 `last_active` 触发 `FollowUp::OpenSession` 自动 reopen 目标 workspace。这意味着切换时会出现短暂的橙色重连横幅（几百毫秒），是 cosmetic 副作用而非 bug，已在冒烟文档和已知限制中如实说明。
+
+2. **`Page.bringToFront` 副作用**：`ScreencastSession::start_on_target` 在连接到新 target 前会发送 `Page.bringToFront`，因为 CDP screencast 对后台 tab 不产生帧。这意味着 tab 条点击切换 = 把 agent Chrome 对应的 tab 推到前台。设计文档说"只投可见 tab"，这个副作用是该设计的必然结论，但实现中体现为 agent Chrome 的前台 tab 被 app 的 tab 点击所驱动——用户可以看到 agent Chrome 里的 tab 随 app tab 条的点击切换。已在冒烟文档"双面板生命周期说明"和步骤 3 中明确标注。
+
+3. **cold relaunch 不自动 attach（设计范围收窄）**：设计文档第 2 步提到"quit → relaunch → auto-reattaches the last workspace"。实现中 `last_active` 仅保存在进程内存（`AppModel` 字段），不写入 eframe 持久化存储，因此冷启动后不自动 reopen。这不影响核心叙事（tmux 仍在运行，侧边栏点击即可零损失 reattach），但与原设计描述有偏差。已在冒烟文档步骤 2 中如实记录为"冷启动 relaunch 不自动 attach"限制。
+
+4. **初始连接时无侧边栏（phase 精化）**：设计图示中侧边栏"永在"。实现区分了两种 Connecting 相态：`reconnecting: false`（初始连接）→ 全屏 spinner，无侧边栏（因为列表还未到，展示空壳无意义）；`reconnecting: true`（断线重连）→ 保留完整布局 + 橙色横幅。两种相态下的 UX 行为不同，但均有充分理由，冒烟文档步骤 1 已体现。
+
+5. **TargetWatcher 每 viewer 独立（不共享）**：Self-Review 备忘提到可共享或独立。V1 实现为每个 viewer session 持有独立的 TargetWatcher（per-viewer 一条 browser 级 CDP ws），连接数等于活跃 viewer 数（通常为 1），没有复杂的多订阅共享机制。代码注释中有说明（"V1: per-viewer watcher"）。
