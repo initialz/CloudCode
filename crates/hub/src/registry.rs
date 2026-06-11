@@ -27,6 +27,22 @@ pub enum PtyEventOut {
     Output(Bytes),
 }
 
+/// What flows down a viewer's channel to its ws relay loop
+/// (`viewer_session::relay_loop`). Pre-P6 this was bare `Bytes` (JPEG frames
+/// only) and `ViewerClosed` was signalled by dropping the channel; the
+/// multi-target viewer also needs deliverable Text payloads (the targets
+/// list), so the channel now carries an explicit enum.
+#[derive(Debug)]
+pub enum ViewerOut {
+    /// A JPEG screencast frame → forwarded as a Binary ws message.
+    Frame(Bytes),
+    /// Pre-serialized targets JSON (`{"kind":"targets","targets":[…]}`) →
+    /// forwarded as a Text ws message.
+    Targets(String),
+    /// The agent's screencast for this viewer ended → the relay loop breaks.
+    Closed(Option<String>),
+}
+
 pub struct AgentRegistry {
     agents: DashMap<String, Arc<AgentConn>>,
 }
@@ -139,9 +155,10 @@ pub struct AgentConn {
     /// Active PTY sessions hosted by this agent, keyed by session_id.
     sessions: DashMap<Uuid, mpsc::Sender<PtyEventOut>>,
     /// Active browser screencast viewers, keyed by viewer_session_id. Each
-    /// `TAG_SCREENCAST_FRAME` binary frame (a raw JPEG) is forwarded to the
-    /// matching sender; the viewer ws relay loop holds the receiver.
-    viewer_sessions: DashMap<Uuid, mpsc::Sender<bytes::Bytes>>,
+    /// `TAG_SCREENCAST_FRAME` binary frame (a raw JPEG), `ViewerTargets`
+    /// list, and `ViewerClosed` signal is forwarded to the matching sender
+    /// as a [`ViewerOut`]; the viewer ws relay loop holds the receiver.
+    viewer_sessions: DashMap<Uuid, mpsc::Sender<ViewerOut>>,
     /// One-shot reply slots for workspace_list / create / delete / update by request_id.
     workspace_requests: DashMap<Uuid, oneshot::Sender<ClientMsg>>,
     /// Streaming reply slots for `FsRead`: many `FsReadChunk` frames per
@@ -186,10 +203,10 @@ impl AgentConn {
         self.sessions.remove(&session_id);
     }
 
-    /// Register a screencast frame sink for `viewer_session_id`. The viewer
-    /// ws relay loop (P2 Task 3) holds the receiver and forwards each JPEG
-    /// out to the browser.
-    pub fn register_viewer(&self, viewer_session_id: Uuid, tx: mpsc::Sender<bytes::Bytes>) {
+    /// Register a viewer sink for `viewer_session_id`. The viewer ws relay
+    /// loop (P2 Task 3) holds the receiver and forwards each [`ViewerOut`]
+    /// out to the browser/app (Binary for frames, Text for targets).
+    pub fn register_viewer(&self, viewer_session_id: Uuid, tx: mpsc::Sender<ViewerOut>) {
         self.viewer_sessions.insert(viewer_session_id, tx);
     }
 
@@ -268,17 +285,35 @@ impl AgentConn {
                     }
                 }
             }
-            Routing::Viewer(vid) => {
-                // The agent's screencast ended. Drop the viewer's frame
-                // channel so its ws relay loop observes a closed channel and
-                // ends — same close-by-drop signal as the agent-disconnect
-                // path in `unregister`. (`reason` is logged for diagnostics
-                // but not forwarded; the viewer just sees the stream stop.)
-                if let ClientMsg::ViewerClosed { reason, .. } = &frame {
+            Routing::Viewer(vid) => match frame {
+                // The agent's screencast ended: DELIVER the close (so the
+                // relay loop breaks promptly) and drop the route. The
+                // agent-disconnect path in `unregister` still uses bare
+                // channel-drop as its close signal.
+                ClientMsg::ViewerClosed { reason, .. } => {
                     tracing::debug!(viewer = %vid, reason = ?reason, "viewer screencast closed by agent");
+                    if let Some((_, tx)) = self.viewer_sessions.remove(&vid) {
+                        let _ = tx.try_send(ViewerOut::Closed(reason));
+                    }
                 }
-                self.viewer_sessions.remove(&vid);
-            }
+                // Targets list: a deliverable update, NOT a close signal —
+                // the route stays registered. Serialized here once so the
+                // relay loop just ships a ready Text frame.
+                ClientMsg::ViewerTargets { targets, .. } => {
+                    let tx = self.viewer_sessions.get(&vid).map(|e| e.value().clone());
+                    if let Some(tx) = tx {
+                        let json = crate::viewer_session::targets_wire_json(&targets);
+                        if let Err(mpsc::error::TrySendError::Full(_)) =
+                            tx.try_send(ViewerOut::Targets(json))
+                        {
+                            tracing::warn!(viewer = %vid, "viewer channel full; dropping targets update");
+                        }
+                    } else {
+                        tracing::debug!(viewer = %vid, "targets update for unknown viewer");
+                    }
+                }
+                _ => unreachable!("classify() routes only viewer frames here"),
+            },
             Routing::Discard => {}
         }
     }
@@ -316,7 +351,9 @@ impl AgentConn {
                 let tx = self.viewer_sessions.get(&sid).map(|e| e.value().clone());
                 if let Some(tx) = tx {
                     let bytes = Bytes::copy_from_slice(payload);
-                    if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(bytes) {
+                    if let Err(mpsc::error::TrySendError::Full(_)) =
+                        tx.try_send(ViewerOut::Frame(bytes))
+                    {
                         tracing::warn!(viewer = %sid, "viewer frame channel full; dropping frame");
                     }
                 } else {
@@ -336,8 +373,9 @@ enum Routing {
     /// `FsReadChunk` stream: many frames per request_id, routed via the
     /// mpsc-backed `fs_read_streams` map (oneshot can't carry a stream).
     FsStream(Uuid),
-    /// `ViewerClosed`: the agent's screencast for this viewer_session_id
-    /// ended; close the viewer's frame channel so its ws relay loop exits.
+    /// Viewer-keyed frames (`ViewerClosed` / `ViewerTargets`): forwarded to
+    /// the viewer's [`ViewerOut`] channel. `ViewerClosed` also drops the
+    /// route so the relay loop exits; `ViewerTargets` is a plain delivery.
     Viewer(Uuid),
     Discard,
 }
@@ -359,6 +397,9 @@ fn classify(frame: &ClientMsg) -> Routing {
         | ClientMsg::FsDeleteResult { request_id, .. } => Routing::Workspace(*request_id),
         ClientMsg::FsReadChunk { request_id, .. } => Routing::FsStream(*request_id),
         ClientMsg::ViewerClosed {
+            viewer_session_id, ..
+        }
+        | ClientMsg::ViewerTargets {
             viewer_session_id, ..
         } => Routing::Viewer(*viewer_session_id),
         ClientMsg::Hello { .. }
@@ -455,7 +496,7 @@ mod tests {
     async fn screencast_frame_routes_to_viewer() {
         let conn = mk_conn();
         let vid = Uuid::new_v4();
-        let (tx, mut rx) = mpsc::channel::<Bytes>(8);
+        let (tx, mut rx) = mpsc::channel::<ViewerOut>(8);
         conn.register_viewer(vid, tx);
 
         // A TAG_SCREENCAST_FRAME keyed by viewer_session_id → viewer channel.
@@ -463,8 +504,10 @@ mod tests {
         let frame = pack_pty_frame(TAG_SCREENCAST_FRAME, vid, &jpeg);
         conn.handle_binary_frame(&frame);
 
-        let got = rx.recv().await.expect("viewer frame");
-        assert_eq!(&got[..], &jpeg[..]);
+        match rx.recv().await.expect("viewer frame") {
+            ViewerOut::Frame(got) => assert_eq!(&got[..], &jpeg[..]),
+            other => panic!("expected ViewerOut::Frame, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -497,10 +540,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn viewer_closed_removes_viewer_route() {
+    async fn viewer_closed_delivers_close_and_removes_viewer_route() {
         let conn = mk_conn();
         let vid = Uuid::new_v4();
-        let (tx, _rx) = mpsc::channel::<Bytes>(8);
+        let (tx, mut rx) = mpsc::channel::<ViewerOut>(8);
         conn.register_viewer(vid, tx);
         assert!(conn.viewer_sessions.contains_key(&vid));
 
@@ -508,6 +551,44 @@ mod tests {
             viewer_session_id: vid,
             reason: Some("page closed".into()),
         });
+        // The close is DELIVERED (so the relay breaks promptly with the
+        // reason in hand), and the route is gone.
+        match rx.recv().await.expect("close delivered") {
+            ViewerOut::Closed(reason) => assert_eq!(reason.as_deref(), Some("page closed")),
+            other => panic!("expected ViewerOut::Closed, got {other:?}"),
+        }
         assert!(!conn.viewer_sessions.contains_key(&vid));
+    }
+
+    #[tokio::test]
+    async fn viewer_targets_delivered_and_route_kept() {
+        use crate::tunnel::TargetInfo;
+
+        let conn = mk_conn();
+        let vid = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel::<ViewerOut>(8);
+        conn.register_viewer(vid, tx);
+
+        conn.handle_text_frame(ClientMsg::ViewerTargets {
+            viewer_session_id: vid,
+            targets: vec![TargetInfo {
+                id: "T1".into(),
+                title: "Example".into(),
+                url: "https://example.com/".into(),
+                kind: "page".into(),
+            }],
+        });
+
+        // Delivered as a pre-serialized Text payload…
+        match rx.recv().await.expect("targets delivered") {
+            ViewerOut::Targets(json) => {
+                let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+                assert_eq!(v["kind"], "targets");
+                assert_eq!(v["targets"][0]["id"], "T1");
+            }
+            other => panic!("expected ViewerOut::Targets, got {other:?}"),
+        }
+        // …and crucially NOT treated as a close signal: the route survives.
+        assert!(conn.viewer_sessions.contains_key(&vid));
     }
 }

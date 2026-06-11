@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "13";
+pub const PROTOCOL_VERSION: &str = "14";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
@@ -75,6 +75,16 @@ pub enum ViewerInputEvent {
     },
     /// Commit a whole string (IME composition end / paste).
     InsertText { text: String },
+}
+
+/// One mirrorable CDP target (a browser page today; other CDP endpoints later).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TargetInfo {
+    pub id: String,
+    pub title: String,
+    pub url: String,
+    /// "page" for now; reserved for future kinds (e.g. electron windows).
+    pub kind: String,
 }
 
 /// Frames sent from the agent to the hub (text JSON).
@@ -264,6 +274,15 @@ pub enum ClientMsg {
         viewer_session_id: Uuid,
         #[serde(default)]
         reason: Option<String>,
+    },
+
+    /// Full list of this viewer's mirrorable CDP targets, re-sent in its
+    /// entirety on every change (target created / navigated / destroyed).
+    /// The hub relays it to the viewer ws as a Text frame so the app can
+    /// render the tab bar. New in protocol v14.
+    ViewerTargets {
+        viewer_session_id: Uuid,
+        targets: Vec<TargetInfo>,
     },
 }
 
@@ -519,6 +538,13 @@ pub enum ServerMsg {
     ViewerInput {
         viewer_session_id: Uuid,
         event: ViewerInputEvent,
+    },
+    /// Switch this viewer's screencast to another CDP target (a tab click
+    /// in the app). The agent stops the current screencast and starts one
+    /// on the named target. New in protocol v14.
+    ViewerSelectTarget {
+        viewer_session_id: Uuid,
+        target_id: String,
     },
 }
 

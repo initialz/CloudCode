@@ -10,20 +10,25 @@
 //! Wire shapes:
 //!   - **down (agent → viewer)**: binary `Message::Binary(jpeg)` — one JPEG
 //!     per screencast frame, forwarded verbatim from the agent's
-//!     `TAG_SCREENCAST_FRAME` channel.
-//!   - **up (viewer → agent)**: text `Message::Text(json)` — each frame is a
-//!     `ViewerInputEvent` in its `{"kind":...}` serde form (see `parse_viewer_input`),
-//!     relayed to the agent as `ServerMsg::ViewerInput`.
+//!     `TAG_SCREENCAST_FRAME` channel — plus text `Message::Text(json)` of
+//!     the shape `{"kind":"targets","targets":[…]}` whenever the agent's
+//!     target list changes (see [`targets_wire_json`]; P6 multi-target).
+//!   - **up (viewer → agent)**: text `Message::Text(json)` — each frame is
+//!     either a `ViewerInputEvent` in its `{"kind":...}` serde form, relayed
+//!     as `ServerMsg::ViewerInput`, or `{"kind":"select_target",
+//!     "target_id":…}`, relayed as `ServerMsg::ViewerSelectTarget` (see
+//!     [`parse_viewer_uplink`]).
 //!
-//! Lifecycle: on connect we mint a `viewer_session_id`, register a frame
-//! channel on the owning `AgentConn`, and send `ServerMsg::ViewerAttach`. On
-//! disconnect (ws close, agent frame channel closed, or agent gone) we
-//! unregister and send `ServerMsg::ViewerDetach`.
+//! Lifecycle: on connect we mint a `viewer_session_id`, register a
+//! [`ViewerOut`] channel on the owning `AgentConn`, and send
+//! `ServerMsg::ViewerAttach`. On disconnect (ws close, agent channel closed,
+//! `ViewerOut::Closed`, or agent gone) we unregister and send
+//! `ServerMsg::ViewerDetach`.
 
 use crate::app::{self, USER_SESSION_COOKIE};
 use crate::auth;
-use crate::registry::AgentConn;
-use crate::tunnel::{ServerMsg, ViewerInputEvent};
+use crate::registry::{AgentConn, ViewerOut};
+use crate::tunnel::{ServerMsg, TargetInfo, ViewerInputEvent};
 use crate::AppState;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -105,6 +110,51 @@ async fn resolve_viewer_account(
 /// live socket.
 pub fn parse_viewer_input(text: &str) -> Option<ViewerInputEvent> {
     serde_json::from_str::<ViewerInputEvent>(text).ok()
+}
+
+/// One parsed uplink (viewer → hub) text frame.
+///
+/// The uplink shares one `{"kind":…}` tag space: every `ViewerInputEvent`
+/// kind passes through untouched as [`ViewerUplink::Input`], and the P6
+/// multi-target addition `{"kind":"select_target","target_id":"…"}` becomes
+/// [`ViewerUplink::SelectTarget`] (relayed as `ServerMsg::ViewerSelectTarget`).
+#[derive(Debug, PartialEq)]
+pub enum ViewerUplink {
+    Input(ViewerInputEvent),
+    SelectTarget { target_id: String },
+}
+
+/// The non-input uplink kinds, parsed with the same serde conventions as
+/// `ViewerInputEvent` (flat `kind` tag, snake_case).
+#[derive(Debug, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ControlUplink {
+    SelectTarget { target_id: String },
+}
+
+/// Parse any uplink text frame. Input kinds keep their exact pre-P6
+/// semantics (`parse_viewer_input` passthrough); unknown/malformed frames
+/// yield `None` and are skipped by the relay loop.
+pub fn parse_viewer_uplink(text: &str) -> Option<ViewerUplink> {
+    if let Some(ev) = parse_viewer_input(text) {
+        return Some(ViewerUplink::Input(ev));
+    }
+    match serde_json::from_str::<ControlUplink>(text).ok()? {
+        ControlUplink::SelectTarget { target_id } => Some(ViewerUplink::SelectTarget { target_id }),
+    }
+}
+
+/// Serialize a targets list into the downlink Text-frame shape the viewer
+/// app consumes: `{"kind":"targets","targets":[…]}`. Wrapped in a `kind`
+/// envelope so future downlink text messages can multiplex on the same
+/// socket. This is THE wire contract for the app's tab bar (the app mirrors
+/// `TargetInfo` from this JSON, same pattern as `ViewerInputEvent`).
+pub fn targets_wire_json(targets: &[TargetInfo]) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "kind": "targets",
+        "targets": targets,
+    }))
+    .unwrap_or_else(|_| r#"{"kind":"targets","targets":[]}"#.to_string())
 }
 
 /// Find the agent that currently owns `session_id`, and the account that
@@ -192,7 +242,7 @@ async fn handle_socket(
     };
 
     let viewer_session_id = Uuid::new_v4();
-    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(VIEWER_FRAME_QUEUE);
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<ViewerOut>(VIEWER_FRAME_QUEUE);
     agent_conn.register_viewer(viewer_session_id, frame_tx);
 
     // Tell the agent to start screencasting this session's browser to us.
@@ -234,14 +284,15 @@ async fn handle_socket(
     let _ = sink.close().await;
 }
 
-/// The core bridge: agent frames → browser binary, browser text → agent input.
-/// Returns when either side closes. Generic over the sink/stream halves so the
-/// pure routing shape stays obvious (and so a future test could drive it with
+/// The core bridge: agent [`ViewerOut`]s → browser ws (Binary frames / Text
+/// targets), browser text → agent input or target selection. Returns when
+/// either side closes. Generic over the sink/stream halves so the pure
+/// routing shape stays obvious (and so a future test could drive it with
 /// in-memory channels — the live ws path is P4/P5 manual smoke).
 async fn relay_loop<Si, St>(
     sink: &mut Si,
     stream: &mut St,
-    frame_rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    frame_rx: &mut tokio::sync::mpsc::Receiver<ViewerOut>,
     agent_conn: &Arc<AgentConn>,
     viewer_session_id: Uuid,
 ) where
@@ -253,13 +304,23 @@ async fn relay_loop<Si, St>(
             frame = frame_rx.recv() => {
                 match frame {
                     // A JPEG from the agent → straight down to the browser.
-                    Some(jpeg) => {
+                    Some(ViewerOut::Frame(jpeg)) => {
                         if sink.send(Message::Binary(jpeg.to_vec())).await.is_err() {
                             break;
                         }
                     }
-                    // Channel closed: agent dropped the screencast (page
-                    // closed / agent disconnected). End the relay.
+                    // Targets list (pre-serialized JSON) → Text frame.
+                    Some(ViewerOut::Targets(json)) => {
+                        if sink.send(Message::Text(json)).await.is_err() {
+                            break;
+                        }
+                    }
+                    // Agent ended this viewer's screencast. End the relay.
+                    Some(ViewerOut::Closed(reason)) => {
+                        tracing::debug!(viewer = %viewer_session_id, reason = ?reason, "agent closed viewer");
+                        break;
+                    }
+                    // Channel closed (agent disconnected). End the relay.
                     None => break,
                 }
             }
@@ -270,21 +331,26 @@ async fn relay_loop<Si, St>(
                 };
                 match msg {
                     Message::Text(text) => {
-                        if let Some(event) = parse_viewer_input(&text) {
-                            // Fire-and-forget; a dead agent ends the loop on
-                            // the next frame poll anyway.
-                            if agent_conn
-                                .send(ServerMsg::ViewerInput {
+                        let out = match parse_viewer_uplink(&text) {
+                            Some(ViewerUplink::Input(event)) => ServerMsg::ViewerInput {
+                                viewer_session_id,
+                                event,
+                            },
+                            Some(ViewerUplink::SelectTarget { target_id }) => {
+                                ServerMsg::ViewerSelectTarget {
                                     viewer_session_id,
-                                    event,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                break;
+                                    target_id,
+                                }
                             }
-                        } else {
-                            tracing::debug!(viewer = %viewer_session_id, "unparseable viewer input frame; ignoring");
+                            None => {
+                                tracing::debug!(viewer = %viewer_session_id, "unparseable viewer uplink frame; ignoring");
+                                continue;
+                            }
+                        };
+                        // Fire-and-forget; a dead agent ends the loop on
+                        // the next frame poll anyway.
+                        if agent_conn.send(out).await.is_err() {
+                            break;
                         }
                     }
                     Message::Close(_) => break,
@@ -372,6 +438,78 @@ mod tests {
         assert!(parse_viewer_input(r#"{"kind":"mouse_move","x":1.0}"#).is_none());
         // Empty.
         assert!(parse_viewer_input("").is_none());
+    }
+
+    // --- parse_viewer_uplink (P6 multi-target) -----------------------------
+
+    #[test]
+    fn uplink_passes_input_kinds_through() {
+        let got = parse_viewer_uplink(r#"{"kind":"mouse_move","x":10.5,"y":20.0}"#).unwrap();
+        assert_eq!(
+            got,
+            ViewerUplink::Input(ViewerInputEvent::MouseMove { x: 10.5, y: 20.0 })
+        );
+        let got = parse_viewer_uplink(r#"{"kind":"insert_text","text":"你好"}"#).unwrap();
+        assert_eq!(
+            got,
+            ViewerUplink::Input(ViewerInputEvent::InsertText { text: "你好".into() })
+        );
+    }
+
+    #[test]
+    fn uplink_parses_select_target() {
+        let got = parse_viewer_uplink(r#"{"kind":"select_target","target_id":"ABC123"}"#).unwrap();
+        assert_eq!(
+            got,
+            ViewerUplink::SelectTarget {
+                target_id: "ABC123".into()
+            }
+        );
+    }
+
+    #[test]
+    fn uplink_garbage_is_none() {
+        assert!(parse_viewer_uplink("not json").is_none());
+        assert!(parse_viewer_uplink("{}").is_none());
+        assert!(parse_viewer_uplink(r#"{"kind":"nope"}"#).is_none());
+        // select_target missing its required field.
+        assert!(parse_viewer_uplink(r#"{"kind":"select_target"}"#).is_none());
+        assert!(parse_viewer_uplink("").is_none());
+    }
+
+    // --- targets_wire_json: the app-facing downlink Text shape -------------
+
+    #[test]
+    fn targets_wire_shape_is_pinned() {
+        let targets = vec![
+            TargetInfo {
+                id: "T_A".into(),
+                title: "百度一下".into(),
+                url: "https://www.baidu.com/".into(),
+                kind: "page".into(),
+            },
+            TargetInfo {
+                id: "T_B".into(),
+                title: "".into(),
+                url: "about:blank".into(),
+                kind: "page".into(),
+            },
+        ];
+        let json = targets_wire_json(&targets);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["kind"], "targets");
+        let arr = v["targets"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["id"], "T_A");
+        assert_eq!(arr[0]["title"], "百度一下");
+        assert_eq!(arr[0]["url"], "https://www.baidu.com/");
+        assert_eq!(arr[0]["kind"], "page");
+        assert_eq!(arr[1]["id"], "T_B");
+
+        // Empty list (browser idle) keeps the envelope.
+        let v: serde_json::Value = serde_json::from_str(&targets_wire_json(&[])).unwrap();
+        assert_eq!(v["kind"], "targets");
+        assert_eq!(v["targets"].as_array().unwrap().len(), 0);
     }
 
     /// The token branch of `resolve_viewer_account` is a thin wrapper over

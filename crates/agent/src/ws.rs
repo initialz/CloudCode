@@ -265,6 +265,17 @@ where
                 }) => {
                     viewers.input(viewer_session_id, &event);
                 }
+                Ok(ServerMsg::ViewerSelectTarget {
+                    viewer_session_id,
+                    target_id,
+                }) => {
+                    // Awaits CDP (page ws lookup + connect): spawn like
+                    // Attach/Detach so the read loop never blocks on Chrome.
+                    let viewers = viewers.clone();
+                    tokio::spawn(async move {
+                        viewers.select_target(viewer_session_id, target_id).await;
+                    });
+                }
                 // Stateful, ordered frames (the FsWriteInit → FsWriteChunk…
                 // → eof upload sequence) MUST run in arrival order. Spawning
                 // a task per frame (below) races them: a chunk handled before

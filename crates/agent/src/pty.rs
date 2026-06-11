@@ -516,7 +516,8 @@ impl PtyManager {
             // by the per-connection ViewerManager and never reach here.
             ServerMsg::ViewerAttach { .. }
             | ServerMsg::ViewerDetach { .. }
-            | ServerMsg::ViewerInput { .. } => {}
+            | ServerMsg::ViewerInput { .. }
+            | ServerMsg::ViewerSelectTarget { .. } => {}
         }
     }
 

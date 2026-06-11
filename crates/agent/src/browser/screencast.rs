@@ -23,7 +23,7 @@
 // zero-warning bar isn't tripped before the consumers land.
 #![allow(dead_code)]
 
-use crate::tunnel::ViewerInputEvent;
+use crate::tunnel::{TargetInfo, ViewerInputEvent};
 use anyhow::{anyhow, Result};
 use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
@@ -73,14 +73,25 @@ use tokio_tungstenite::tungstenite::Message;
 /// gets a distinct context/target (which is what actually closes the P2
 /// cross-page leak). See `docs/superpowers/plans/2026-06-10-p4-page-mapping-notes.md`.
 pub fn pick_page_for_session(targets_json: &str, target_hint: Option<&str>) -> Option<String> {
+    pick_page_entry_for_session(targets_json, target_hint).map(|(_, ws)| ws)
+}
+
+/// Like [`pick_page_for_session`], but also returns the chosen page's CDP
+/// **target id** alongside its ws url, as `(target_id, ws_url)`. The viewer
+/// manager (P6) needs the id to track which tab the screencast is on so the
+/// tab bar can highlight it and `targetDestroyed` can be matched against it.
+pub fn pick_page_entry_for_session(
+    targets_json: &str,
+    target_hint: Option<&str>,
+) -> Option<(String, String)> {
     let arr = serde_json::from_str::<Value>(targets_json).ok()?;
     let arr = arr.as_array()?;
 
     let is_page = |t: &Value| t.get("type").and_then(Value::as_str) == Some("page");
-    let ws_of = |t: &Value| {
-        t.get("webSocketDebuggerUrl")
-            .and_then(Value::as_str)
-            .map(str::to_string)
+    let entry_of = |t: &Value| -> Option<(String, String)> {
+        let id = t.get("id").and_then(Value::as_str)?.to_string();
+        let ws = t.get("webSocketDebuggerUrl").and_then(Value::as_str)?;
+        Some((id, ws.to_string()))
     };
 
     // Hinted: only the page whose target id matches. Fail closed if absent — do
@@ -92,7 +103,7 @@ pub fn pick_page_for_session(targets_json: &str, target_hint: Option<&str>) -> O
                 continue;
             }
             if t.get("id").and_then(Value::as_str) == Some(hint) {
-                return ws_of(t);
+                return entry_of(t);
             }
         }
         return None;
@@ -107,16 +118,16 @@ pub fn pick_page_for_session(targets_json: &str, target_hint: Option<&str>) -> O
         if url.starts_with("about:blank") || url.starts_with("chrome://") {
             continue;
         }
-        if let Some(ws) = ws_of(t) {
-            return Some(ws);
+        if let Some(e) = entry_of(t) {
+            return Some(e);
         }
     }
 
     // Unhinted fallback — Pass 2: the first page of any kind that has a ws url.
     for t in arr {
         if is_page(t) {
-            if let Some(ws) = ws_of(t) {
-                return Some(ws);
+            if let Some(e) = entry_of(t) {
+                return Some(e);
             }
         }
     }
@@ -136,6 +147,16 @@ fn compact(v: Value) -> String {
 
 fn cmd_page_enable(id: i64) -> String {
     compact(json!({ "id": id, "method": "Page.enable" }))
+}
+
+/// Chrome only emits screencast frames for the FOREGROUND tab — verified
+/// against real Chrome in `multi_target_watcher_and_switch`: starting a
+/// screencast on a background tab yields zero frames. So every
+/// `start_on_target` brings its page to front first. (Tab switching = the
+/// agent-side browser switches tabs too, which matches the P6 "mirror the
+/// visible tab" design.)
+fn cmd_bring_to_front(id: i64) -> String {
+    compact(json!({ "id": id, "method": "Page.bringToFront" }))
 }
 
 fn cmd_start_screencast(id: i64) -> String {
@@ -274,17 +295,11 @@ impl ScreencastSession {
     /// Connect to the page target behind `cdp_http_url`, start a JPEG
     /// screencast, and stream decoded frames to `frame_tx`.
     ///
-    /// `target_hint` is the per-session page target id (when known); see
-    /// [`pick_page_for_session`]. `None` falls back to the active page.
-    ///
-    /// Steps:
-    ///   1. `GET <cdp_http_url>/json` → [`pick_page_for_session`] → ws url (bail
-    ///      if none);
-    ///   2. `connect_async` the page debugger ws;
-    ///   3. send `Page.enable` + `Page.startScreencast`;
-    ///   4. spawn a task that selects between the ws read stream (decode frames
-    ///      → `frame_tx`, ack each) and a command receiver (forward queued
-    ///      outgoing commands to the ws).
+    /// Thin wrapper over [`Self::start_on_target`]: resolves the page ws url
+    /// via `GET /json` + [`pick_page_for_session`] first. `target_hint` is the
+    /// per-session page target id (when known); `None` falls back to the
+    /// active page. The P6 multi-target viewer mostly bypasses this and calls
+    /// `start_on_target` with a ws url it picked from the target list itself.
     pub async fn start(
         cdp_http_url: &str,
         target_hint: Option<&str>,
@@ -301,7 +316,22 @@ impl ScreencastSession {
         let ws_url = pick_page_for_session(&body, target_hint)
             .ok_or_else(|| anyhow!("no suitable page target found at {list_url}"))?;
 
-        let (ws, _) = tokio_tungstenite::connect_async(&ws_url)
+        Self::start_on_target(&ws_url, frame_tx).await
+    }
+
+    /// Connect directly to a page target's debugger websocket, start a JPEG
+    /// screencast, and stream decoded frames to `frame_tx`. No page picking —
+    /// the caller already knows the exact target (P6 tab switching).
+    ///
+    /// Steps:
+    ///   1. `connect_async` the page debugger ws;
+    ///   2. send `Page.enable` + `Page.bringToFront` + `Page.startScreencast`
+    ///      (background tabs emit NO frames — see [`cmd_bring_to_front`]);
+    ///   3. spawn a task that selects between the ws read stream (decode frames
+    ///      → `frame_tx`, ack each) and a command receiver (forward queued
+    ///      outgoing commands to the ws).
+    pub async fn start_on_target(ws_url: &str, frame_tx: mpsc::Sender<Vec<u8>>) -> Result<Self> {
+        let (ws, _) = tokio_tungstenite::connect_async(ws_url)
             .await
             .map_err(|e| anyhow!("connecting CDP ws {ws_url}: {e}"))?;
         let (mut sink, mut stream) = ws.split();
@@ -309,10 +339,14 @@ impl ScreencastSession {
         let next_id = Arc::new(AtomicI64::new(1));
         let mint = |id: &AtomicI64| id.fetch_add(1, Ordering::Relaxed);
 
-        // Bring the page up and start the screencast.
+        // Bring the page up (and to the FRONT — background tabs emit no
+        // frames) and start the screencast.
         sink.send(Message::Text(cmd_page_enable(mint(&next_id))))
             .await
             .map_err(|e| anyhow!("sending Page.enable: {e}"))?;
+        sink.send(Message::Text(cmd_bring_to_front(mint(&next_id))))
+            .await
+            .map_err(|e| anyhow!("sending Page.bringToFront: {e}"))?;
         sink.send(Message::Text(cmd_start_screencast(mint(&next_id))))
             .await
             .map_err(|e| anyhow!("sending Page.startScreencast: {e}"))?;
@@ -412,6 +446,290 @@ impl ScreencastSession {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Target watching (P6 multi-target viewer).
+// ---------------------------------------------------------------------------
+
+/// Should this CDP target appear in the viewer's tab list?
+///
+/// All `type == "page"` targets count — INCLUDING `about:blank` (a fresh blank
+/// tab claude just opened is a real tab the user should see) — EXCEPT browser
+/// chrome: `chrome://…` internals and `devtools://…` panels.
+fn is_listable_page(kind: &str, url: &str) -> bool {
+    kind == "page" && !url.starts_with("chrome://") && !url.starts_with("devtools://")
+}
+
+/// Parse a CDP `targetInfo` object (`params.targetInfo` of the
+/// `Target.targetCreated` / `Target.targetInfoChanged` events) into a
+/// [`TargetInfo`], regardless of whether it's a listable page. `None` if the
+/// required fields are missing.
+fn parse_cdp_target_info(info: &Value) -> Option<TargetInfo> {
+    Some(TargetInfo {
+        id: info.get("targetId").and_then(Value::as_str)?.to_string(),
+        title: info
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        url: info
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        kind: info.get("type").and_then(Value::as_str)?.to_string(),
+    })
+}
+
+/// Apply one browser-level CDP `Target.*` event to the viewer's target list.
+/// Pure — the [`TargetWatcher`] read loop folds incoming events through this.
+///
+/// Returns the updated list and whether it actually changed:
+///   * `Target.targetCreated`     — push if it's a listable page not already
+///     present (Chrome replays `targetCreated` for every existing target right
+///     after `Target.setDiscoverTargets`, hence the dedup).
+///   * `Target.targetInfoChanged` — update title/url in place. Also handles
+///     listability flips: a tracked page navigating to `chrome://…` is
+///     removed; an untracked page navigating from `chrome://…` to a real url
+///     is added.
+///   * `Target.targetDestroyed`   — remove by `params.targetId`.
+///
+/// Anything else (other methods, non-page targets, malformed params) leaves
+/// the list untouched with `changed = false`.
+pub fn apply_target_event(
+    mut list: Vec<TargetInfo>,
+    event: &Value,
+) -> (Vec<TargetInfo>, bool /* changed */) {
+    let method = event.get("method").and_then(Value::as_str).unwrap_or("");
+    match method {
+        "Target.targetCreated" | "Target.targetInfoChanged" => {
+            let Some(info) = event
+                .get("params")
+                .and_then(|p| p.get("targetInfo"))
+                .and_then(parse_cdp_target_info)
+            else {
+                return (list, false);
+            };
+            let pos = list.iter().position(|t| t.id == info.id);
+            if !is_listable_page(&info.kind, &info.url) {
+                // Not listable (non-page, chrome://, devtools://). If we were
+                // tracking it (page navigated INTO chrome://), drop it.
+                return match pos {
+                    Some(i) => {
+                        list.remove(i);
+                        (list, true)
+                    }
+                    None => (list, false),
+                };
+            }
+            match pos {
+                Some(i) => {
+                    if list[i] == info {
+                        (list, false) // No-op change (same title/url).
+                    } else {
+                        list[i] = info;
+                        (list, true)
+                    }
+                }
+                None => {
+                    list.push(info);
+                    (list, true)
+                }
+            }
+        }
+        "Target.targetDestroyed" => {
+            let Some(id) = event
+                .get("params")
+                .and_then(|p| p.get("targetId"))
+                .and_then(Value::as_str)
+            else {
+                return (list, false);
+            };
+            match list.iter().position(|t| t.id == id) {
+                Some(i) => {
+                    list.remove(i);
+                    (list, true)
+                }
+                None => (list, false),
+            }
+        }
+        _ => (list, false),
+    }
+}
+
+/// Resolve the **browser-level** debugger ws url from `GET /json/version`
+/// (`webSocketDebuggerUrl`). This is the endpoint that accepts
+/// `Target.setDiscoverTargets`; page-level sockets don't see other targets.
+async fn browser_ws_url(cdp_http_url: &str) -> Result<String> {
+    let url = format!("{cdp_http_url}/json/version");
+    let body = reqwest::get(&url)
+        .await
+        .map_err(|e| anyhow!("GET {url}: {e}"))?
+        .text()
+        .await
+        .map_err(|e| anyhow!("reading {url} body: {e}"))?;
+    let v: Value = serde_json::from_str(&body).map_err(|e| anyhow!("parsing {url}: {e}"))?;
+    v.get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("no webSocketDebuggerUrl in {url}"))
+}
+
+/// Resolve the page debugger ws url for `target_id` via `GET /json`.
+///
+/// CDP's `Target.targetCreated` event does NOT carry the ws url, so when the
+/// viewer selects a tab we re-fetch `/json` (cheap, and selection is rare)
+/// and join on the `id` field. `None` when the target is gone (stale tab
+/// click) or isn't a page.
+pub async fn page_ws_url(cdp_http_url: &str, target_id: &str) -> Option<String> {
+    let list_url = format!("{cdp_http_url}/json");
+    let body = reqwest::get(&list_url).await.ok()?.text().await.ok()?;
+    let arr = serde_json::from_str::<Value>(&body).ok()?;
+    arr.as_array()?.iter().find_map(|t| {
+        if t.get("type").and_then(Value::as_str) == Some("page")
+            && t.get("id").and_then(Value::as_str) == Some(target_id)
+        {
+            t.get("webSocketDebuggerUrl")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        }
+    })
+}
+
+/// Build the initial target list from a `GET /json` body — same listability
+/// rules as [`apply_target_event`]. Pure for testability.
+pub fn initial_targets_from_json(targets_json: &str) -> Vec<TargetInfo> {
+    let Ok(v) = serde_json::from_str::<Value>(targets_json) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|t| {
+            let info = TargetInfo {
+                id: t.get("id").and_then(Value::as_str)?.to_string(),
+                title: t
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                url: t.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
+                kind: t.get("type").and_then(Value::as_str)?.to_string(),
+            };
+            is_listable_page(&info.kind, &info.url).then_some(info)
+        })
+        .collect()
+}
+
+/// Watches the resident Chrome's target list over the **browser-level** CDP
+/// websocket (`Target.setDiscoverTargets {discover:true}`) and pushes the full
+/// page-target list to `on_change` on every change — plus once up front with
+/// the initial list (built from `GET /json`, so the consumer always gets a
+/// deterministic first snapshot even when the browser is idle/empty).
+///
+/// [`Self::snapshot`] exposes the current list for pull-style reads (e.g.
+/// re-sending the list after a stale tab selection).
+pub struct TargetWatcher {
+    /// The spawned ws read task. Aborted on drop — same lesson as
+    /// [`ScreencastSession`]: dropping a `JoinHandle` only DETACHES the task,
+    /// which would leak a browser-level CDP connection per detached viewer.
+    task: JoinHandle<()>,
+    /// Shared snapshot of the current list, updated by the read task.
+    targets: Arc<std::sync::Mutex<Vec<TargetInfo>>>,
+}
+
+impl Drop for TargetWatcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl TargetWatcher {
+    /// Connect to the browser-level ws behind `cdp_http_url`, enable target
+    /// discovery, and start watching. Sends the initial list (possibly empty)
+    /// to `on_change` before any event-driven update.
+    pub async fn start(
+        cdp_http_url: &str,
+        on_change: mpsc::Sender<Vec<TargetInfo>>,
+    ) -> Result<Self> {
+        let ws_url = browser_ws_url(cdp_http_url).await?;
+        let (ws, _) = tokio_tungstenite::connect_async(&ws_url)
+            .await
+            .map_err(|e| anyhow!("connecting browser CDP ws {ws_url}: {e}"))?;
+        let (mut sink, mut stream) = ws.split();
+
+        sink.send(Message::Text(compact(json!({
+            "id": 1,
+            "method": "Target.setDiscoverTargets",
+            "params": { "discover": true }
+        }))))
+        .await
+        .map_err(|e| anyhow!("sending Target.setDiscoverTargets: {e}"))?;
+
+        // Deterministic initial snapshot from /json. The replayed
+        // `targetCreated` events Chrome sends right after setDiscoverTargets
+        // then dedup against this list in `apply_target_event` (no-op pushes
+        // → changed=false → no duplicate notification).
+        let list_url = format!("{cdp_http_url}/json");
+        let body = reqwest::get(&list_url)
+            .await
+            .map_err(|e| anyhow!("GET {list_url}: {e}"))?
+            .text()
+            .await
+            .map_err(|e| anyhow!("reading {list_url} body: {e}"))?;
+        let initial = initial_targets_from_json(&body);
+
+        let targets = Arc::new(std::sync::Mutex::new(initial.clone()));
+        let shared = Arc::clone(&targets);
+
+        let task = tokio::spawn(async move {
+            // Always announce the initial list, even when empty — the viewer
+            // side uses it to render "browser idle" instead of hanging.
+            if on_change.send(initial).await.is_err() {
+                return;
+            }
+            while let Some(msg) = stream.next().await {
+                match msg {
+                    Ok(Message::Text(text)) => {
+                        let Ok(val) = serde_json::from_str::<Value>(&text) else {
+                            continue;
+                        };
+                        let current = shared.lock().expect("targets lock").clone();
+                        let (next, changed) = apply_target_event(current, &val);
+                        if changed {
+                            *shared.lock().expect("targets lock") = next.clone();
+                            if on_change.send(next).await.is_err() {
+                                // Consumer gone (viewer detached): stop watching.
+                                return;
+                            }
+                        }
+                    }
+                    Ok(Message::Close(_)) | Err(_) => {
+                        tracing::debug!("target watcher ws closed");
+                        return;
+                    }
+                    Ok(_) => {} // ping/pong/binary: ignore.
+                }
+            }
+        });
+
+        Ok(Self { task, targets })
+    }
+
+    /// The current target list (clone of the watcher's shared state).
+    pub fn snapshot(&self) -> Vec<TargetInfo> {
+        self.targets.lock().expect("targets lock").clone()
+    }
+
+    /// Stop watching: abort the ws read task (Drop does the same; this is the
+    /// explicit form for symmetry with `ScreencastSession::stop`).
+    pub fn stop(self) {
+        self.task.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,25 +737,32 @@ mod tests {
     // --- pick_page_for_session: unhinted fallback (active page) -----------
     // These lock the legacy `pick_page_target` behaviour, now reached with
     // `target_hint = None` (the agent's current default-config path).
+    // Fixtures carry `id` because picking now also resolves the target id
+    // (real Chrome /json always includes it).
 
     #[test]
     fn pick_prefers_real_page_over_blank() {
         let json = r#"[
-            {"type":"background_page","url":"chrome-extension://x","webSocketDebuggerUrl":"ws://bg"},
-            {"type":"page","url":"about:blank","webSocketDebuggerUrl":"ws://blank"},
-            {"type":"page","url":"https://example.com/","webSocketDebuggerUrl":"ws://real"}
+            {"type":"background_page","id":"T0","url":"chrome-extension://x","webSocketDebuggerUrl":"ws://bg"},
+            {"type":"page","id":"T1","url":"about:blank","webSocketDebuggerUrl":"ws://blank"},
+            {"type":"page","id":"T2","url":"https://example.com/","webSocketDebuggerUrl":"ws://real"}
         ]"#;
         assert_eq!(
             pick_page_for_session(json, None),
             Some("ws://real".to_string())
+        );
+        // The entry variant also reports WHICH target was picked.
+        assert_eq!(
+            pick_page_entry_for_session(json, None),
+            Some(("T2".to_string(), "ws://real".to_string()))
         );
     }
 
     #[test]
     fn pick_skips_chrome_scheme_pages() {
         let json = r#"[
-            {"type":"page","url":"chrome://newtab/","webSocketDebuggerUrl":"ws://newtab"},
-            {"type":"page","url":"data:text/html,<h1>hi</h1>","webSocketDebuggerUrl":"ws://data"}
+            {"type":"page","id":"T1","url":"chrome://newtab/","webSocketDebuggerUrl":"ws://newtab"},
+            {"type":"page","id":"T2","url":"data:text/html,<h1>hi</h1>","webSocketDebuggerUrl":"ws://data"}
         ]"#;
         assert_eq!(
             pick_page_for_session(json, None),
@@ -448,13 +773,17 @@ mod tests {
     #[test]
     fn pick_falls_back_to_first_page_when_all_blank() {
         let json = r#"[
-            {"type":"webview","url":"x","webSocketDebuggerUrl":"ws://wv"},
-            {"type":"page","url":"about:blank","webSocketDebuggerUrl":"ws://first"},
-            {"type":"page","url":"chrome://gpu","webSocketDebuggerUrl":"ws://second"}
+            {"type":"webview","id":"T0","url":"x","webSocketDebuggerUrl":"ws://wv"},
+            {"type":"page","id":"T1","url":"about:blank","webSocketDebuggerUrl":"ws://first"},
+            {"type":"page","id":"T2","url":"chrome://gpu","webSocketDebuggerUrl":"ws://second"}
         ]"#;
         assert_eq!(
             pick_page_for_session(json, None),
             Some("ws://first".to_string())
+        );
+        assert_eq!(
+            pick_page_entry_for_session(json, None),
+            Some(("T1".to_string(), "ws://first".to_string()))
         );
     }
 
@@ -480,8 +809,8 @@ mod tests {
     #[test]
     fn pick_skips_page_without_ws_url() {
         let json = r#"[
-            {"type":"page","url":"https://a.com/"},
-            {"type":"page","url":"https://b.com/","webSocketDebuggerUrl":"ws://b"}
+            {"type":"page","id":"T_A","url":"https://a.com/"},
+            {"type":"page","id":"T_B","url":"https://b.com/","webSocketDebuggerUrl":"ws://b"}
         ]"#;
         assert_eq!(pick_page_for_session(json, None), Some("ws://b".to_string()));
     }
@@ -548,6 +877,13 @@ mod tests {
         let v = parse(&cmd_page_enable(7));
         assert_eq!(v["id"], 7);
         assert_eq!(v["method"], "Page.enable");
+    }
+
+    #[test]
+    fn bring_to_front_shape() {
+        let v = parse(&cmd_bring_to_front(5));
+        assert_eq!(v["id"], 5);
+        assert_eq!(v["method"], "Page.bringToFront");
     }
 
     #[test]
@@ -719,6 +1055,181 @@ mod tests {
         assert_eq!(extract_screencast_frame(&msg), None);
         let msg2 = json!({ "method": "Page.screencastFrame" });
         assert_eq!(extract_screencast_frame(&msg2), None);
+    }
+
+    // --- apply_target_event (P6 target watching) ---------------------------
+
+    fn ti(id: &str, title: &str, url: &str) -> TargetInfo {
+        TargetInfo {
+            id: id.into(),
+            title: title.into(),
+            url: url.into(),
+            kind: "page".into(),
+        }
+    }
+
+    fn ev_created(id: &str, kind: &str, title: &str, url: &str) -> Value {
+        json!({
+            "method": "Target.targetCreated",
+            "params": { "targetInfo": {
+                "targetId": id, "type": kind, "title": title, "url": url, "attached": false
+            }}
+        })
+    }
+
+    fn ev_changed(id: &str, kind: &str, title: &str, url: &str) -> Value {
+        json!({
+            "method": "Target.targetInfoChanged",
+            "params": { "targetInfo": {
+                "targetId": id, "type": kind, "title": title, "url": url, "attached": true
+            }}
+        })
+    }
+
+    fn ev_destroyed(id: &str) -> Value {
+        json!({ "method": "Target.targetDestroyed", "params": { "targetId": id } })
+    }
+
+    #[test]
+    fn target_events_table() {
+        // (name, starting list, event, expected list, expected changed)
+        let cases: Vec<(&str, Vec<TargetInfo>, Value, Vec<TargetInfo>, bool)> = vec![
+            (
+                "created page is added",
+                vec![],
+                ev_created("T1", "page", "Example", "https://example.com/"),
+                vec![ti("T1", "Example", "https://example.com/")],
+                true,
+            ),
+            (
+                "created about:blank page IS added (fresh tab is real)",
+                vec![ti("T1", "A", "https://a/")],
+                ev_created("T2", "page", "", "about:blank"),
+                vec![ti("T1", "A", "https://a/"), ti("T2", "", "about:blank")],
+                true,
+            ),
+            (
+                "created duplicate (setDiscoverTargets replay) is a no-op",
+                vec![ti("T1", "A", "https://a/")],
+                ev_created("T1", "page", "A", "https://a/"),
+                vec![ti("T1", "A", "https://a/")],
+                false,
+            ),
+            (
+                "created non-page is ignored",
+                vec![],
+                ev_created("SW1", "service_worker", "", "https://a/sw.js"),
+                vec![],
+                false,
+            ),
+            (
+                "created chrome:// page is ignored",
+                vec![],
+                ev_created("T9", "page", "New Tab", "chrome://newtab/"),
+                vec![],
+                false,
+            ),
+            (
+                "created devtools:// page is ignored",
+                vec![],
+                ev_created("T9", "page", "DevTools", "devtools://devtools/bundled/x.html"),
+                vec![],
+                false,
+            ),
+            (
+                "infoChanged updates title+url in place",
+                vec![ti("T1", "", "about:blank"), ti("T2", "B", "https://b/")],
+                ev_changed("T1", "page", "百度一下", "https://www.baidu.com/"),
+                vec![
+                    ti("T1", "百度一下", "https://www.baidu.com/"),
+                    ti("T2", "B", "https://b/"),
+                ],
+                true,
+            ),
+            (
+                "infoChanged with identical info is a no-op",
+                vec![ti("T1", "A", "https://a/")],
+                ev_changed("T1", "page", "A", "https://a/"),
+                vec![ti("T1", "A", "https://a/")],
+                false,
+            ),
+            (
+                "infoChanged for an untracked real page adds it",
+                vec![],
+                ev_changed("T3", "page", "C", "https://c/"),
+                vec![ti("T3", "C", "https://c/")],
+                true,
+            ),
+            (
+                "infoChanged navigating a tracked page into chrome:// removes it",
+                vec![ti("T1", "A", "https://a/")],
+                ev_changed("T1", "page", "Settings", "chrome://settings/"),
+                vec![],
+                true,
+            ),
+            (
+                "destroyed removes the target",
+                vec![ti("T1", "A", "https://a/"), ti("T2", "B", "https://b/")],
+                ev_destroyed("T1"),
+                vec![ti("T2", "B", "https://b/")],
+                true,
+            ),
+            (
+                "destroyed unknown id is a no-op",
+                vec![ti("T1", "A", "https://a/")],
+                ev_destroyed("T_GONE"),
+                vec![ti("T1", "A", "https://a/")],
+                false,
+            ),
+            (
+                "unrelated method leaves list unchanged",
+                vec![ti("T1", "A", "https://a/")],
+                json!({ "method": "Page.loadEventFired", "params": {} }),
+                vec![ti("T1", "A", "https://a/")],
+                false,
+            ),
+            (
+                "command reply (no method) leaves list unchanged",
+                vec![ti("T1", "A", "https://a/")],
+                json!({ "id": 1, "result": {} }),
+                vec![ti("T1", "A", "https://a/")],
+                false,
+            ),
+            (
+                "malformed params leave list unchanged",
+                vec![ti("T1", "A", "https://a/")],
+                json!({ "method": "Target.targetCreated", "params": {} }),
+                vec![ti("T1", "A", "https://a/")],
+                false,
+            ),
+        ];
+
+        for (name, start, event, want_list, want_changed) in cases {
+            let (got, changed) = apply_target_event(start, &event);
+            assert_eq!(got, want_list, "case: {name}");
+            assert_eq!(changed, want_changed, "case: {name} (changed flag)");
+        }
+    }
+
+    #[test]
+    fn initial_targets_filter_matches_event_rules() {
+        let json = r#"[
+            {"type":"page","id":"T1","title":"Blank","url":"about:blank","webSocketDebuggerUrl":"ws://1"},
+            {"type":"page","id":"T2","title":"New Tab","url":"chrome://newtab/","webSocketDebuggerUrl":"ws://2"},
+            {"type":"page","id":"T3","title":"Real","url":"https://example.com/","webSocketDebuggerUrl":"ws://3"},
+            {"type":"service_worker","id":"SW","title":"","url":"https://example.com/sw.js"}
+        ]"#;
+        let list = initial_targets_from_json(json);
+        assert_eq!(
+            list,
+            vec![
+                ti("T1", "Blank", "about:blank"),
+                ti("T3", "Real", "https://example.com/"),
+            ]
+        );
+        // Garbage → empty, not panic.
+        assert!(initial_targets_from_json("not json").is_empty());
+        assert!(initial_targets_from_json("{}").is_empty());
     }
 
     // --- integration: real Chrome ----------------------------------------
@@ -966,5 +1477,150 @@ mod tests {
         state.end_session(sid_b);
         drop(state);
         drop(chrome);
+    }
+
+    /// P6 Task 1 multi-target integration — real Chrome, two pages:
+    /// the TargetWatcher sees both pages, `start_on_target` streams a JPEG
+    /// from page A, switching to page B (stop A → `page_ws_url(B)` →
+    /// `start_on_target`) streams a JPEG from B, and destroying B shrinks the
+    /// watcher's list back to one.
+    ///
+    /// Run manually:
+    /// `cargo test -p cloudcode-agent multi_target_watcher_and_switch -- --ignored --nocapture`
+    /// Prereqs: a real Chrome/Chromium install (no internet; data: URLs).
+    #[tokio::test]
+    #[ignore = "requires a real Chrome install; run manually"]
+    async fn multi_target_watcher_and_switch() {
+        use crate::browser::chrome::ChromeManager;
+        use crate::config::BrowserConfig;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let cdp_port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let cfg = BrowserConfig {
+            enabled: true,
+            chrome_path: None,
+            cdp_port,
+            mcp_port: 0,
+            mcp_command: None,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(ChromeManager::new(cfg, tmp.path()));
+        mgr.start().await.expect("Chrome should start and become ready");
+        let cdp = mgr.cdp_http_url();
+
+        // Open TWO distinct data: pages via /json/new (PUT first, GET fallback
+        // for older Chrome).
+        let client = reqwest::Client::new();
+        let open = |client: reqwest::Client, cdp: String, data_url: &'static str| async move {
+            let new_url = format!("{cdp}/json/new?{data_url}");
+            match client.put(&new_url).send().await {
+                Ok(r) if r.status().is_success() => true,
+                _ => matches!(client.get(&new_url).send().await, Ok(r) if r.status().is_success()),
+            }
+        };
+        let url_a = "data:text/html,<title>P6A</title><h1 style=font-size:80px>P6-A</h1>";
+        let url_b = "data:text/html,<title>P6B</title><h1 style=font-size:80px>P6-B</h1>";
+        assert!(open(client.clone(), cdp.clone(), url_a).await, "open page A");
+        assert!(open(client.clone(), cdp.clone(), url_b).await, "open page B");
+
+        // Watch targets: wait on the change channel until both pages appear.
+        let (chg_tx, mut chg_rx) = mpsc::channel::<Vec<TargetInfo>>(16);
+        let watcher = TargetWatcher::start(&cdp, chg_tx)
+            .await
+            .expect("watcher should start");
+        let both = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let list = chg_rx.recv().await.expect("change channel open");
+                eprintln!(
+                    "targets update: {:?}",
+                    list.iter().map(|t| (&t.id, &t.url)).collect::<Vec<_>>()
+                );
+                let has = |m: &str| list.iter().any(|t| t.url.contains(m));
+                if has("P6-A") && has("P6-B") {
+                    break list;
+                }
+            }
+        })
+        .await
+        .expect("watcher should report both pages within 5s");
+        assert!(both.iter().all(|t| t.kind == "page"));
+        let id_of = |m: &str| {
+            both.iter()
+                .find(|t| t.url.contains(m))
+                .map(|t| t.id.clone())
+                .unwrap()
+        };
+        let (target_a, target_b) = (id_of("P6-A"), id_of("P6-B"));
+        assert_ne!(target_a, target_b);
+
+        // Stream page A directly via start_on_target.
+        let ws_a = page_ws_url(&cdp, &target_a)
+            .await
+            .expect("page A ws url resolves");
+        let (ftx_a, mut frx_a) = mpsc::channel::<Vec<u8>>(8);
+        let sess_a = ScreencastSession::start_on_target(&ws_a, ftx_a)
+            .await
+            .expect("screencast A starts");
+        let frame = tokio::time::timeout(Duration::from_secs(5), frx_a.recv())
+            .await
+            .expect("frame from A within 5s")
+            .expect("frame channel A");
+        assert_eq!(&frame[0..2], &[0xFF, 0xD8], "A frame must be JPEG");
+        eprintln!("page A JPEG: {} bytes", frame.len());
+
+        // Switch: stop A, start B (the exact select_target flow).
+        sess_a.stop().await;
+        let ws_b = page_ws_url(&cdp, &target_b)
+            .await
+            .expect("page B ws url resolves");
+        let (ftx_b, mut frx_b) = mpsc::channel::<Vec<u8>>(8);
+        let sess_b = ScreencastSession::start_on_target(&ws_b, ftx_b)
+            .await
+            .expect("screencast B starts");
+        let frame = tokio::time::timeout(Duration::from_secs(5), frx_b.recv())
+            .await
+            .expect("frame from B within 5s")
+            .expect("frame channel B");
+        assert_eq!(&frame[0..2], &[0xFF, 0xD8], "B frame must be JPEG");
+        eprintln!("page B JPEG: {} bytes", frame.len());
+        sess_b.stop().await;
+
+        // A stale id resolves to None (page_ws_url contract for stale tabs).
+        assert_eq!(page_ws_url(&cdp, "NOT_A_REAL_TARGET").await, None);
+
+        // Destroy page B via /json/close and watch the list shrink.
+        let close = client
+            .get(format!("{cdp}/json/close/{target_b}"))
+            .send()
+            .await
+            .expect("close request");
+        assert!(close.status().is_success(), "close B: {}", close.status());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let list = chg_rx.recv().await.expect("change channel open");
+                eprintln!(
+                    "targets update after close: {:?}",
+                    list.iter().map(|t| (&t.id, &t.url)).collect::<Vec<_>>()
+                );
+                if !list.iter().any(|t| t.id == target_b) {
+                    assert!(
+                        list.iter().any(|t| t.id == target_a),
+                        "A must survive B's destruction"
+                    );
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("watcher should drop B within 5s of close");
+        // Snapshot agrees with the last pushed list.
+        assert!(watcher.snapshot().iter().all(|t| t.id != target_b));
+
+        watcher.stop();
+        drop(mgr);
     }
 }
