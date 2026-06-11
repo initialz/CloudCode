@@ -550,6 +550,11 @@ impl ScreencastSession {
     pub fn input(&self, ev: &ViewerInputEvent) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let cmd = input_to_cdp(id, ev);
+        // Diagnostic: shows exactly what gets injected into the page. Enable
+        // with `RUST_LOG=cloudcode_agent::browser::screencast=debug`. For a
+        // slider drag you should see mousePressed(buttons=1) → a stream of
+        // mouseMoved(buttons=1, changing x/y) → mouseReleased.
+        tracing::debug!(%cmd, "inject CDP input");
         if self.cmd_tx.try_send(cmd).is_err() {
             tracing::warn!("screencast cmd channel full; dropping input event");
         }
