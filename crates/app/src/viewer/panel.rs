@@ -225,8 +225,8 @@ impl BrowserPanel {
         self.focus_id = Some(response.id);
 
         // Backdrop: a dark fill so the letterbox bars read as "outside the
-        // page" rather than transparent gaps.
-        painter.rect_filled(panel_rect, 0.0, egui::Color32::from_gray(20));
+        // page" rather than transparent gaps. Theme token, not a one-off.
+        painter.rect_filled(panel_rect, 0.0, crate::theme::BG0);
 
         let frame = self.texture.as_ref().zip(self.frame_dims);
         let Some((texture, (fw, fh))) = frame else {
@@ -243,7 +243,7 @@ impl BrowserPanel {
                 egui::Align2::CENTER_CENTER,
                 msg,
                 egui::FontId::proportional(16.0),
-                egui::Color32::from_gray(140),
+                crate::theme::TEXT_MUTED,
             );
             return events;
         };

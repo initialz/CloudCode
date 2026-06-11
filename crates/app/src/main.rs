@@ -1,17 +1,23 @@
-//! cloudcode-app — native egui desktop client (P3).
+//! cloudcode-app — native egui desktop client.
 //!
 //! Architecture (see `backend.rs`): eframe owns the winit main thread;
 //! all hub I/O runs on a tokio runtime in a separate std::thread. The
 //! two halves talk over `UiCommand` / `BackendEvent` channels, and the
 //! backend wakes the UI with `egui::Context::request_repaint()` on every
-//! event. The view is a `Screen` state machine folded by the pure
-//! `state::apply_event` reducer (unit-tested in `state.rs`).
+//! event.
+//!
+//! P6 layout (cmux-style): a persistent left sidebar (workspace list,
+//! new/delete/reset, hub status) + a content area (the active session's
+//! terminal/browser split, or a placeholder). The view state is the
+//! [`state::AppModel`] folded by the pure `state::apply_event` reducer
+//! (unit-tested in `state.rs`); all chrome colors come from `theme.rs`.
 
 mod backend;
 mod config;
 mod session_view;
 mod state;
 mod terminal;
+mod theme;
 mod viewer;
 mod wire;
 
@@ -20,7 +26,7 @@ use config::HubConfig;
 use session_view::{
     reconcile_viewer_action, should_connect_viewer, split_width_range, SessionView, ViewerAction,
 };
-use state::{apply_event, badge, FollowUp, Screen};
+use state::{apply_event, row_badge, switch_decision, AppModel, Dot, FollowUp, Phase, SwitchDecision};
 use std::path::PathBuf;
 use terminal::{install_cjk_font, TerminalPanel};
 use viewer::{BrowserPanel, ViewerCommand, ViewerEvent, ViewerHandle};
@@ -36,12 +42,12 @@ fn main() -> eframe::Result {
 
     let args = Args::parse(std::env::args().skip(1));
 
-    // Load config up front so a misconfigured client shows the Error
+    // Load config up front so a misconfigured client shows the fatal
     // screen rather than spinning forever on Connecting.
     let cfg_result = config::load_config(args.config.as_deref());
 
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([900.0, 640.0]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([1100.0, 680.0]),
         ..Default::default()
     };
 
@@ -74,29 +80,38 @@ impl Args {
     }
 }
 
+/// A destructive sidebar action awaiting the user's confirmation popup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Confirm {
+    Delete { name: String, agent: String },
+    Reset { name: String, agent: String },
+}
+
 struct App {
-    screen: Screen,
+    /// The reducer-owned view model (sidebar list, phase, active session).
+    model: AppModel,
     /// `None` until config loads cleanly and the backend spawns.
     backend: Option<BackendHandle>,
     /// Hub base URL + account token from config — threaded into the App so
-    /// the Session screen can open the *second* (viewer) ws lazily. The
+    /// the session content can open the *second* (viewer) ws lazily. The
     /// backend already has its own copy for the PTY ws.
     hub_url: String,
     token: String,
-    /// New-workspace form state on the picker.
+    /// "+ new workspace" inline form state (sidebar).
+    new_open: bool,
     new_name: String,
     new_agent: String,
-    /// The live terminal. `Some` only while a `Screen::Session` is open;
-    /// created on `SessionOpened`, fed PTY bytes each frame, rendered by
-    /// the session arm. Lives here (not in `Screen`) so the `state`
-    /// reducer stays pure and unit-testable.
+    /// Pending destructive action (delete/reset) awaiting confirmation.
+    confirm: Option<Confirm>,
+    /// The live terminal. `Some` only while a session is open; created on
+    /// `SessionOpened`, fed PTY bytes each frame. Lives here (not in the
+    /// model) so the `state` reducer stays pure and unit-testable. NOT
+    /// dropped on a disconnect — the grid stays up (dimmed) through the
+    /// reconnect so the blip doesn't blank the screen.
     terminal: Option<TerminalPanel>,
-    /// Which panel(s) the Session screen shows (terminal / split / browser).
-    /// Persisted across frames; reset to the default on each new session.
+    /// Which panel(s) the session content shows (terminal / split / browser).
     session_view: SessionView,
-    /// The browser (screencast) panel — decodes JPEG frames to a texture and
-    /// captures mouse/key/IME. Created on `SessionOpened`, torn down when we
-    /// leave the session (alongside `terminal`).
+    /// The browser (screencast) panel — same lifetime as `terminal`.
     browser: Option<BrowserPanel>,
     /// The *second* ws to the hub (the viewer/screencast). Opened LAZILY:
     /// `None` until the browser panel is first shown, dropped (→ hub
@@ -114,46 +129,48 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>, cfg: anyhow::Result<HubConfig>) -> App {
+        // The ONE place the theme is installed — every panel and popup
+        // rendered afterwards inherits it (cmux lesson: no split themes).
+        theme::apply(&cc.egui_ctx);
         // Register a system CJK font as a fallback so Chinese renders
         // instead of tofu. Runtime-loaded (not embedded) — see fonts.rs.
         install_cjk_font(&cc.egui_ctx);
 
-        match cfg {
+        let (model, backend, hub_url, token) = match cfg {
             Ok(cfg) => {
                 let hub_url = cfg.hub_url.clone();
                 let token = cfg.token.clone();
                 // Hand the egui context to the backend so it can wake us
                 // on incoming events from its own thread.
                 let backend = spawn(cfg, cc.egui_ctx.clone());
-                App {
-                    screen: Screen::connecting(hub_url.clone()),
-                    backend: Some(backend),
+                (
+                    AppModel::new(hub_url.clone()),
+                    Some(backend),
                     hub_url,
                     token,
-                    new_name: String::new(),
-                    new_agent: String::new(),
-                    terminal: None,
-                    session_view: SessionView::default(),
-                    browser: None,
-                    viewer: None,
-                    viewer_retry_blocked: false,
-                }
+                )
             }
-            Err(e) => App {
-                screen: Screen::Error {
-                    message: format!("config error: {e:#}"),
-                },
-                backend: None,
-                hub_url: String::new(),
-                token: String::new(),
-                new_name: String::new(),
-                new_agent: String::new(),
-                terminal: None,
-                session_view: SessionView::default(),
-                browser: None,
-                viewer: None,
-                viewer_retry_blocked: false,
-            },
+            Err(e) => (
+                AppModel::fatal(format!("config error: {e:#}")),
+                None,
+                String::new(),
+                String::new(),
+            ),
+        };
+        App {
+            model,
+            backend,
+            hub_url,
+            token,
+            new_open: false,
+            new_name: String::new(),
+            new_agent: String::new(),
+            confirm: None,
+            terminal: None,
+            session_view: SessionView::default(),
+            browser: None,
+            viewer: None,
+            viewer_retry_blocked: false,
         }
     }
 
@@ -179,10 +196,10 @@ impl App {
         if self.viewer.is_some() {
             return; // already connected
         }
-        let Screen::Session { session_id, .. } = &self.screen else {
+        let Some(active) = &self.model.active else {
             return; // not in a session — nothing to watch
         };
-        if session_id.is_empty() {
+        if active.session_id.is_empty() {
             // No session id (older hub that didn't send one) — can't open the
             // viewer ws. Leave the panel on its placeholder.
             tracing::warn!("viewer: no session_id; browser panel unavailable");
@@ -191,23 +208,19 @@ impl App {
         self.viewer = Some(ViewerHandle::connect(
             self.hub_url.clone(),
             self.token.clone(),
-            session_id.clone(),
+            active.session_id.clone(),
             ctx.clone(),
         ));
     }
 
     /// Reconcile the viewer ws with the current view: connect when the
-    /// browser panel is visible, disconnect when it's hidden. Idempotent —
-    /// called every frame; only acts on a change.
-    ///
-    /// After a drop we set `viewer_retry_blocked` so we don't reconnect on the
-    /// very next frame (the panel is still visible). The block is cleared the
-    /// moment the panel is hidden, so toggling the browser away and back is the
-    /// deliberate "reconnect" gesture (matching the client's no-auto-reconnect
-    /// contract; otherwise a `browser.enabled=false` agent would busy-loop the
-    /// viewer ws every frame).
+    /// browser panel is visible (and the wire is up), disconnect when it's
+    /// hidden or we're mid-reconnect. Idempotent — called every frame; only
+    /// acts on a change. See `session_view::reconcile_viewer_action` for the
+    /// retry-latch contract.
     fn reconcile_viewer(&mut self, ctx: &egui::Context) {
-        let want = matches!(self.screen, Screen::Session { .. })
+        let want = self.model.phase == Phase::Ready
+            && self.model.active.is_some()
             && should_connect_viewer(self.session_view);
         let (action, clear_block) =
             reconcile_viewer_action(want, self.viewer.is_some(), self.viewer_retry_blocked);
@@ -256,13 +269,16 @@ impl App {
         }
     }
 
-    /// Drain every queued backend event into the screen state, issuing
-    /// any follow-up commands the reducer asks for.
+    /// Drain every queued backend event into the model, issuing any
+    /// follow-up commands the reducer asks for.
     ///
     /// `PtyBytes` are intercepted here and fed straight into the live
     /// `TerminalPanel` (the VTE state machine), bypassing the reducer so
-    /// `state::apply_event` stays pure. The panel is (re)created on
-    /// `SessionOpened` and torn down whenever we leave the session.
+    /// `state::apply_event` stays pure. Panel lifecycle: (re)created on
+    /// `SessionOpened`, torn down when the model has no active session
+    /// while the wire is up. A `Disconnected` deliberately KEEPS the
+    /// panels (the reducer retains `model.active`) so the terminal grid
+    /// stays on screen, dimmed, through the reconnect.
     fn drain_events(&mut self) {
         let events: Vec<_> = match &self.backend {
             Some(b) => b.event_rx.try_iter().collect(),
@@ -270,7 +286,7 @@ impl App {
         };
         for ev in events {
             // PTY bytes drive the terminal directly; don't run them
-            // through the (pure) screen reducer.
+            // through the (pure) reducer.
             if let BackendEvent::PtyBytes(bytes) = &ev {
                 if let Some(panel) = &mut self.terminal {
                     panel.feed(bytes);
@@ -280,9 +296,9 @@ impl App {
 
             // A new session: spin up a fresh terminal + browser panel and
             // reset the view to the default split. 80×24 matches the
-            // hardcoded OpenSession size (Task 5 makes it dynamic). The
-            // viewer ws stays closed until the browser panel is first shown
-            // (lazy connect — see `reconcile_viewer`).
+            // hardcoded OpenSession size. The viewer ws stays closed until
+            // the browser panel is first shown (lazy connect — see
+            // `reconcile_viewer`).
             if matches!(ev, BackendEvent::SessionOpened { .. }) {
                 self.terminal = Some(TerminalPanel::new(80, 24));
                 self.browser = Some(BrowserPanel::new());
@@ -293,74 +309,404 @@ impl App {
                 self.viewer_retry_blocked = false;
             }
 
-            let screen = std::mem::replace(
-                &mut self.screen,
-                Screen::Error {
-                    message: String::new(),
-                },
-            );
-            let (next, follow_ups) = apply_event(screen, ev);
-            // Dropped out of the session view — release the terminal, the
-            // browser panel, and the viewer ws (→ agent stops screencast).
-            if !matches!(next, Screen::Session { .. }) {
+            let follow_ups = apply_event(&mut self.model, ev);
+
+            // No active session in the model AND the wire is up → the
+            // session genuinely ended (closed / switch / failed reopen):
+            // release the terminal, the browser panel, and the viewer ws
+            // (→ agent stops screencast). While RECONNECTING the model
+            // keeps `active`, so the panels survive the blip dimmed.
+            if self.model.active.is_none() && self.terminal.is_some() {
                 self.terminal = None;
                 self.browser = None;
                 self.disconnect_viewer();
             }
-            self.screen = next;
+
             for f in follow_ups {
                 match f {
                     FollowUp::ListWorkspaces => self.send(UiCommand::ListWorkspaces),
+                    FollowUp::ListAgents => self.send(UiCommand::ListAgents),
+                    // The auto-reattach hero flow / switch landing: reopen
+                    // the remembered workspace on the fresh connection.
+                    FollowUp::OpenSession { agent, workspace } => {
+                        self.send(UiCommand::OpenSession { agent, workspace })
+                    }
                 }
             }
         }
     }
 
-    /// Render the Session screen: a header + view toolbar, then the split
-    /// (terminal | browser) layout, single-panel when collapsed. Terminal
-    /// input/resize go to the PTY ws; browser input goes to the viewer ws.
+    /// Sidebar row click → the pure switch decision → commands. Open when
+    /// idle; cycle the connection when a session is live (see
+    /// `state::SwitchDecision::SwitchViaReconnect` for why).
+    fn click_workspace(&mut self, agent: String, workspace: String) {
+        match switch_decision(&self.model, &agent, &workspace) {
+            SwitchDecision::Ignore => {}
+            SwitchDecision::Open => {
+                self.send(UiCommand::OpenSession { agent, workspace });
+            }
+            SwitchDecision::SwitchViaReconnect => {
+                self.model.begin_switch(agent, workspace);
+                self.send(UiCommand::SwitchWorkspace);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Sidebar
+    // -----------------------------------------------------------------
+
+    fn render_sidebar(&mut self, ui: &mut egui::Ui) {
+        let reconnecting = matches!(self.model.phase, Phase::Connecting { reconnecting: true });
+
+        // --- Bottom status cell first (bottom-up), so the scroll list can
+        // take the remaining height. ---
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            ui.add_space(theme::SP_2);
+            ui.horizontal(|ui| {
+                if reconnecting {
+                    ui.colored_label(theme::WARN, "●");
+                    ui.colored_label(theme::WARN, "reconnecting…");
+                } else {
+                    ui.colored_label(theme::OK, "●");
+                    ui.label(
+                        egui::RichText::new(if self.model.account.is_empty() {
+                            "connected".to_string()
+                        } else {
+                            self.model.account.clone()
+                        })
+                        .color(theme::TEXT_MUTED),
+                    );
+                }
+            });
+            ui.separator();
+
+            // Everything above the status cell, top-down again.
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                self.render_sidebar_main(ui);
+            });
+        });
+    }
+
+    fn render_sidebar_main(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(theme::SP_2);
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("CloudCode")
+                    .strong()
+                    .size(16.0)
+                    .color(theme::TEXT),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .small_button("⟳")
+                    .on_hover_text("refresh workspaces")
+                    .clicked()
+                {
+                    self.send(UiCommand::ListWorkspaces);
+                    self.send(UiCommand::ListAgents);
+                }
+            });
+        });
+        ui.add_space(theme::SP_1);
+        ui.separator();
+        ui.add_space(theme::SP_1);
+
+        // Workspace rows. Clone the list so the loop can mutate `self`
+        // (send commands) without borrow conflicts.
+        let workspaces = self.model.workspaces.clone();
+        let active_key = self
+            .model
+            .active
+            .as_ref()
+            .map(|a| (a.agent.clone(), a.workspace.clone()));
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if workspaces.is_empty() {
+                    ui.label(
+                        egui::RichText::new("(no workspaces yet)")
+                            .color(theme::TEXT_FAINT)
+                            .small(),
+                    );
+                }
+                for w in &workspaces {
+                    let is_active = active_key
+                        .as_ref()
+                        .is_some_and(|(a, n)| *a == w.agent && *n == w.name);
+                    match workspace_row(ui, w, is_active) {
+                        RowAction::None => {}
+                        RowAction::Clicked => {
+                            self.click_workspace(w.agent.clone(), w.name.clone())
+                        }
+                        RowAction::Delete => {
+                            self.confirm = Some(Confirm::Delete {
+                                name: w.name.clone(),
+                                agent: w.agent.clone(),
+                            })
+                        }
+                        RowAction::Reset => {
+                            self.confirm = Some(Confirm::Reset {
+                                name: w.name.clone(),
+                                agent: w.agent.clone(),
+                            })
+                        }
+                    }
+                }
+
+                ui.add_space(theme::SP_2);
+                self.render_new_workspace(ui);
+            });
+    }
+
+    /// The "+ new workspace" row: a button that expands inline into a
+    /// name input + agent dropdown (agents from ListAgents).
+    fn render_new_workspace(&mut self, ui: &mut egui::Ui) {
+        if !self.new_open {
+            if ui
+                .add(
+                    egui::Button::new(
+                        egui::RichText::new("+ new workspace").color(theme::TEXT_MUTED),
+                    )
+                    .frame(false),
+                )
+                .clicked()
+            {
+                self.new_open = true;
+                // Refresh the dropdown's source when the form opens.
+                self.send(UiCommand::ListAgents);
+            }
+            return;
+        }
+
+        egui::Frame::none()
+            .fill(theme::BG2)
+            .rounding(theme::RADIUS)
+            .inner_margin(theme::SP_2)
+            .show(ui, |ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.new_name)
+                        .hint_text("workspace name")
+                        .desired_width(f32::INFINITY),
+                );
+                // Default the dropdown to the first known agent.
+                if self.new_agent.is_empty() {
+                    if let Some(a) = self.model.agents.first() {
+                        self.new_agent = a.name.clone();
+                    }
+                }
+                egui::ComboBox::from_id_source("new_ws_agent")
+                    .width(ui.available_width())
+                    .selected_text(if self.new_agent.is_empty() {
+                        "(no agents online)".to_string()
+                    } else {
+                        self.new_agent.clone()
+                    })
+                    .show_ui(ui, |ui| {
+                        for a in &self.model.agents {
+                            ui.selectable_value(&mut self.new_agent, a.name.clone(), &a.name);
+                        }
+                    });
+                ui.add_space(theme::SP_1);
+                ui.horizontal(|ui| {
+                    let ready = !self.new_name.trim().is_empty()
+                        && !self.new_agent.trim().is_empty();
+                    if ui.add_enabled(ready, egui::Button::new("Create")).clicked() {
+                        self.send(UiCommand::CreateWorkspace {
+                            name: self.new_name.trim().to_string(),
+                            agent: self.new_agent.trim().to_string(),
+                        });
+                        self.new_name.clear();
+                        self.new_open = false;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.new_open = false;
+                        self.new_name.clear();
+                    }
+                });
+            });
+    }
+
+    /// The delete/reset confirmation popup (simple centered window).
+    fn render_confirm(&mut self, ctx: &egui::Context) {
+        let Some(confirm) = self.confirm.clone() else {
+            return;
+        };
+        let (title, body) = match &confirm {
+            Confirm::Delete { name, agent } => (
+                "Delete workspace?",
+                format!("Delete '{name}' on agent '{agent}'?\nThis removes its directory on the agent."),
+            ),
+            Confirm::Reset { name, agent } => (
+                "Reset workspace?",
+                format!("Reset '{name}' on agent '{agent}'?\nThis kills its tmux session and wipes claude history."),
+            ),
+        };
+        let mut open = true;
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(body);
+                ui.add_space(theme::SP_2);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(egui::RichText::new("Confirm").color(theme::ERR))
+                        .clicked()
+                    {
+                        match confirm.clone() {
+                            Confirm::Delete { name, agent } => {
+                                self.send(UiCommand::DeleteWorkspace { name, agent })
+                            }
+                            Confirm::Reset { name, agent } => {
+                                self.send(UiCommand::ResetWorkspace { name, agent })
+                            }
+                        }
+                        self.confirm = None;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.confirm = None;
+                    }
+                });
+            });
+        if !open {
+            self.confirm = None;
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Content area
+    // -----------------------------------------------------------------
+
+    fn render_content(&mut self, ui: &mut egui::Ui) {
+        let reconnecting = matches!(self.model.phase, Phase::Connecting { reconnecting: true });
+
+        // Reconnect banner: an orange strip across the top of the content
+        // area (replaces P3's full-screen reconnecting page — the model,
+        // sidebar and panels all stay up).
+        if reconnecting {
+            egui::Frame::none()
+                .fill(theme::WARN.linear_multiply(0.22))
+                .inner_margin(egui::Margin::symmetric(theme::SP_3, theme::SP_1 + 2.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().size(12.0).color(theme::WARN));
+                        let host = if self.model.hub_url.is_empty() {
+                            "reconnecting…".to_string()
+                        } else {
+                            format!("reconnecting to {}…", self.model.hub_url)
+                        };
+                        ui.colored_label(theme::WARN, host);
+                        ui.label(
+                            egui::RichText::new("· your session keeps running on the agent")
+                                .color(theme::TEXT_MUTED)
+                                .small(),
+                        );
+                    });
+                });
+        }
+
+        // Transient error toast (failed open/create/reopen).
+        if let Some(err) = self.model.error.clone() {
+            egui::Frame::none()
+                .fill(theme::ERR.linear_multiply(0.18))
+                .inner_margin(egui::Margin::symmetric(theme::SP_3, theme::SP_1 + 2.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.colored_label(theme::ERR, err);
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.small_button("✕").clicked() {
+                                    self.model.error = None;
+                                }
+                            },
+                        );
+                    });
+                });
+        }
+
+        if self.model.active.is_some() {
+            // Remember the rect so the reconnect dim-overlay can cover
+            // exactly the session content.
+            let content_rect = ui.available_rect_before_wrap();
+            // While reconnecting: panels stay visible but input is dead
+            // (disabled UI → no focus → terminal/browser capture nothing).
+            ui.add_enabled_ui(!reconnecting, |ui| {
+                self.render_session(ui);
+            });
+            if reconnecting {
+                ui.painter().rect_filled(
+                    content_rect,
+                    0.0,
+                    egui::Color32::from_black_alpha(110),
+                );
+            }
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new("select a workspace to attach")
+                        .color(theme::TEXT_FAINT)
+                        .size(15.0),
+                );
+            });
+        }
+    }
+
+    /// Render the active session: a top bar (ws@agent · cwd · view toggle),
+    /// then the split (terminal | browser) layout, single-panel when
+    /// collapsed. Terminal input/resize go to the PTY ws; browser input goes
+    /// to the viewer ws.
     ///
     /// Focus routing is egui's native single-focus: each panel calls
     /// `request_focus()` on click on its own `allocate_painter` response
     /// (distinct ids — the terminal's and the browser's regions never share
     /// one), and both gate keyboard/IME capture on `has_focus()`, so typing
     /// only ever reaches the clicked panel.
-    fn render_session(
-        &mut self,
-        ui: &mut egui::Ui,
-        agent: &str,
-        workspace: &str,
-        cwd: &str,
-    ) {
-        // --- Header + view toolbar ---
+    fn render_session(&mut self, ui: &mut egui::Ui) {
+        let Some(active) = self.model.active.clone() else {
+            return;
+        };
+        // --- Top bar ---
         // A live-screencast dot: lit only when the browser is shown AND a
         // frame has actually arrived (lazy-connect is up and streaming).
         let browser_live = self.session_view.shows_browser()
             && self.browser.as_ref().is_some_and(|p| p.has_frame());
+        ui.add_space(theme::SP_1);
         ui.horizontal(|ui| {
-            ui.heading(format!("session: {workspace}@{agent}"));
+            ui.add_space(theme::SP_2);
+            ui.label(
+                egui::RichText::new(format!("{}@{}", active.workspace, active.agent))
+                    .strong()
+                    .color(theme::TEXT),
+            );
+            ui.label(
+                egui::RichText::new(active.cwd.as_str())
+                    .color(theme::TEXT_MUTED)
+                    .small(),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.weak(format!("cwd: {cwd}"));
-                ui.add_space(12.0);
-                if browser_live {
-                    ui.colored_label(egui::Color32::from_rgb(80, 200, 120), "● live");
-                    ui.add_space(8.0);
-                }
+                ui.add_space(theme::SP_2);
                 // Three-state toggle. `selectable_value` shows the current
                 // mode pressed. (Cmd/Ctrl+B cycles the same states.)
-                ui.selectable_value(
-                    &mut self.session_view,
-                    SessionView::BrowserOnly,
-                    "Browser",
-                );
+                ui.selectable_value(&mut self.session_view, SessionView::BrowserOnly, "Browser");
                 ui.selectable_value(&mut self.session_view, SessionView::Split, "Split");
                 ui.selectable_value(
                     &mut self.session_view,
                     SessionView::TerminalOnly,
                     "Terminal",
                 );
+                if browser_live {
+                    ui.add_space(theme::SP_2);
+                    ui.colored_label(theme::OK, "● live");
+                }
             });
         });
+        ui.add_space(theme::SP_1);
         ui.separator();
 
         let view = self.session_view;
@@ -400,7 +746,7 @@ impl App {
         let output = if let Some(panel) = &mut self.terminal {
             panel.ui(ui, avail, std::time::Instant::now())
         } else {
-            ui.weak("(terminal not ready)");
+            ui.colored_label(theme::TEXT_FAINT, "(terminal not ready)");
             terminal::UiOutput::default()
         };
         if !output.input.is_empty() {
@@ -421,7 +767,7 @@ impl App {
         let events = match &mut self.browser {
             Some(panel) => panel.ui(ui),
             None => {
-                ui.weak("(browser not ready)");
+                ui.colored_label(theme::TEXT_FAINT, "(browser not ready)");
                 return;
             }
         };
@@ -433,14 +779,126 @@ impl App {
     }
 }
 
+/// What the user did to a sidebar workspace row this frame.
+enum RowAction {
+    None,
+    Clicked,
+    Delete,
+    Reset,
+}
+
+/// Paint one sidebar workspace row: status dot, name, `@agent`, the
+/// "attached elsewhere" hint, active-row highlight (BG2 + accent left
+/// bar) and hover-revealed delete/reset icons. Pure-ish (egui only) —
+/// the badge derivation it leans on (`state::row_badge`) is the
+/// table-tested part.
+fn workspace_row(ui: &mut egui::Ui, w: &cloudcode_proto::WorkspaceInfo, is_active: bool) -> RowAction {
+    let badge = row_badge(w, is_active);
+    let row_h = 40.0;
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), row_h),
+        if badge.clickable {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    let hovered = response.hovered();
+    let painter = ui.painter();
+
+    // Background: active row = raised card + accent bar; hover = subtle.
+    if is_active {
+        painter.rect_filled(rect, theme::RADIUS, theme::BG2);
+        let bar = egui::Rect::from_min_size(rect.min, egui::vec2(3.0, rect.height()));
+        painter.rect_filled(bar, 1.5, theme::ACCENT);
+    } else if hovered {
+        painter.rect_filled(rect, theme::RADIUS, theme::BG2.linear_multiply(0.6));
+    }
+
+    // Status dot.
+    let dot_color = match badge.dot {
+        Dot::Running => theme::OK,
+        Dot::Saved => theme::TEXT_FAINT,
+        Dot::Offline => theme::BORDER,
+    };
+    let dot_center = egui::pos2(rect.min.x + 14.0, rect.center().y);
+    painter.circle_filled(dot_center, 4.0, dot_color);
+
+    // Name + @agent, dimmed when the agent is offline.
+    let name_color = if badge.dot == Dot::Offline {
+        theme::TEXT_FAINT
+    } else {
+        theme::TEXT
+    };
+    let text_x = rect.min.x + 26.0;
+    painter.text(
+        egui::pos2(text_x, rect.center().y - 9.0),
+        egui::Align2::LEFT_CENTER,
+        &w.name,
+        egui::FontId::proportional(13.0),
+        name_color,
+    );
+    let sub = if badge.attached_elsewhere {
+        format!("@{} · attached elsewhere", w.agent)
+    } else {
+        format!("@{}", w.agent)
+    };
+    painter.text(
+        egui::pos2(text_x, rect.center().y + 9.0),
+        egui::Align2::LEFT_CENTER,
+        sub,
+        egui::FontId::proportional(11.0),
+        if badge.attached_elsewhere {
+            theme::WARN
+        } else {
+            theme::TEXT_MUTED
+        },
+    );
+
+    // Hover actions: small delete/reset icon buttons on the right. Placed
+    // after (on top of) the row's click region, so egui routes their
+    // clicks to the buttons, not the row.
+    let mut action = RowAction::None;
+    if hovered {
+        let icons_rect = egui::Rect::from_min_max(
+            egui::pos2(rect.max.x - 52.0, rect.min.y),
+            rect.max,
+        );
+        let mut icons_ui = ui.child_ui(
+            icons_rect,
+            egui::Layout::right_to_left(egui::Align::Center),
+            None,
+        );
+        if icons_ui
+            .small_button("🗑")
+            .on_hover_text("delete workspace")
+            .clicked()
+        {
+            action = RowAction::Delete;
+        }
+        if icons_ui
+            .small_button("↺")
+            .on_hover_text("reset workspace (kill tmux + history)")
+            .clicked()
+        {
+            action = RowAction::Reset;
+        }
+    }
+    if matches!(action, RowAction::None) && response.clicked() {
+        action = RowAction::Clicked;
+    }
+    ui.add_space(2.0);
+    action
+}
+
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
 
-        // Cmd/Ctrl+B cycles the Session view (Terminal → Split → Browser).
-        // Only meaningful in a session; harmless elsewhere. Consume the
-        // shortcut so it doesn't also reach the terminal as a Ctrl-B byte.
-        if matches!(self.screen, Screen::Session { .. })
+        // Cmd/Ctrl+B cycles the session view (Terminal → Split → Browser).
+        // Only meaningful with an open session; harmless elsewhere. Consume
+        // the shortcut so it doesn't also reach the terminal as a Ctrl-B byte.
+        if self.model.active.is_some()
             && ctx.input_mut(|i| {
                 i.consume_shortcut(&egui::KeyboardShortcut::new(
                     egui::Modifiers::COMMAND,
@@ -457,143 +915,65 @@ impl eframe::App for App {
         self.reconcile_viewer(ctx);
         self.drain_viewer_events(ctx);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            // Clone the screen out for rendering so we don't hold a
-            // borrow of `self` while mutating it (sending commands).
-            let screen = self.screen.clone();
-            match screen {
-                Screen::Connecting {
-                    hub_url,
-                    reconnecting,
-                } => {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(ui.available_height() * 0.4);
-                        ui.add(egui::Spinner::new().size(32.0));
-                        ui.add_space(12.0);
-                        // A mid-session drop reads as "reconnecting…"
-                        // (the backend is in its backoff loop); a fresh
-                        // launch reads as "connecting to <host>".
-                        if reconnecting {
-                            let host = if hub_url.is_empty() {
-                                "reconnecting…".to_string()
-                            } else {
-                                format!("reconnecting to {hub_url}…")
-                            };
-                            ui.colored_label(egui::Color32::from_rgb(220, 170, 60), host);
-                            ui.add_space(4.0);
-                            ui.weak("the session will return to the workspace picker");
-                        } else {
-                            ui.label(format!("connecting to {hub_url}"));
-                        }
-                    });
-                }
-                Screen::Picker {
-                    account,
-                    workspaces,
-                    error,
-                } => {
-                    ui.horizontal(|ui| {
-                        ui.heading("Workspaces");
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                ui.weak(format!("account: {account}"));
-                            },
-                        );
-                    });
-                    if let Some(err) = &error {
-                        ui.colored_label(egui::Color32::from_rgb(220, 80, 80), err);
+        // --- Fatal: full-window error, nothing else to show. ---
+        if let Some(message) = self.model.fatal.clone() {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() * 0.4);
+                    ui.colored_label(theme::ERR, "Error");
+                    ui.label(message);
+                    ui.add_space(theme::SP_3);
+                    if ui.button("Quit").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
-                    ui.separator();
+                });
+            });
+            return;
+        }
 
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .max_height(ui.available_height() - 90.0)
-                        .show(ui, |ui| {
-                            if workspaces.is_empty() {
-                                ui.weak("(no workspaces — create one below)");
-                            }
-                            for w in &workspaces {
-                                ui.horizontal(|ui| {
-                                    let label = format!("{}@{}", w.name, w.agent);
-                                    ui.label(label);
-                                    ui.label(
-                                        egui::RichText::new(format!("[{}]", badge(w)))
-                                            .weak()
-                                            .small(),
-                                    );
-                                    let openable = w.agent_online;
-                                    if ui
-                                        .add_enabled(openable, egui::Button::new("Open"))
-                                        .clicked()
-                                    {
-                                        self.send(UiCommand::OpenSession {
-                                            agent: w.agent.clone(),
-                                            workspace: w.name.clone(),
-                                        });
-                                    }
-                                    if ui.button("Delete").clicked() {
-                                        self.send(UiCommand::DeleteWorkspace {
-                                            name: w.name.clone(),
-                                            agent: w.agent.clone(),
-                                        });
-                                    }
-                                });
-                            }
-                        });
+        // --- Initial connect: centered spinner (no sidebar yet — there's
+        // nothing to list before the first Welcome). A RECONNECT renders
+        // the normal layout instead: sidebar + banner + dimmed panels. ---
+        if self.model.phase
+            == (Phase::Connecting {
+                reconnecting: false,
+            })
+        {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(ui.available_height() * 0.4);
+                    ui.add(egui::Spinner::new().size(32.0));
+                    ui.add_space(theme::SP_3);
+                    ui.colored_label(
+                        theme::TEXT_MUTED,
+                        format!("connecting to {}", self.model.hub_url),
+                    );
+                });
+            });
+            return;
+        }
 
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("New:");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.new_name)
-                                .hint_text("name")
-                                .desired_width(140.0),
-                        );
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.new_agent)
-                                .hint_text("agent")
-                                .desired_width(140.0),
-                        );
-                        let ready = !self.new_name.trim().is_empty()
-                            && !self.new_agent.trim().is_empty();
-                        if ui.add_enabled(ready, egui::Button::new("Create")).clicked() {
-                            self.send(UiCommand::CreateWorkspace {
-                                name: self.new_name.trim().to_string(),
-                                agent: self.new_agent.trim().to_string(),
-                            });
-                            self.new_name.clear();
-                            self.new_agent.clear();
-                        }
-                        if ui.button("Refresh").clicked() {
-                            self.send(UiCommand::ListWorkspaces);
-                        }
-                    });
-                }
-                Screen::Session {
-                    agent,
-                    workspace,
-                    cwd,
-                    ..
-                } => {
-                    self.render_session(ui, &agent, &workspace, &cwd);
-                }
-                Screen::Error { message } => {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(ui.available_height() * 0.4);
-                        ui.colored_label(
-                            egui::Color32::from_rgb(220, 80, 80),
-                            "Error",
-                        );
-                        ui.label(message);
-                        ui.add_space(12.0);
-                        if ui.button("Quit").clicked() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    });
-                }
-            }
-        });
+        // --- Persistent layout: sidebar + content. ---
+        egui::SidePanel::left("sidebar")
+            .resizable(true)
+            .default_width(theme::SIDEBAR_W)
+            .min_width(160.0)
+            .frame(
+                egui::Frame::none()
+                    .fill(theme::BG1)
+                    .inner_margin(egui::Margin::symmetric(theme::SP_2, theme::SP_1)),
+            )
+            .show(ctx, |ui| {
+                self.render_sidebar(ui);
+            });
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none().fill(theme::BG0))
+            .show(ctx, |ui| {
+                self.render_content(ui);
+            });
+
+        self.render_confirm(ctx);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

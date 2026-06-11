@@ -37,9 +37,24 @@ fn bump(d: Duration) -> Duration {
 #[derive(Debug, Clone)]
 pub enum UiCommand {
     ListWorkspaces,
+    /// List online agents (the sidebar's new-workspace agent dropdown).
+    ListAgents,
     OpenSession { agent: String, workspace: String },
     CreateWorkspace { name: String, agent: String },
     DeleteWorkspace { name: String, agent: String },
+    /// Clear a workspace's saved session (kill tmux, wipe history)
+    /// without deleting the directory.
+    ResetWorkspace { name: String, agent: String },
+    /// Deliberately cycle the connection to switch workspaces. The hub
+    /// REJECTS a second OpenSession while a session is active on the
+    /// connection ("session already open"), and the only client-side way
+    /// to end just the session is to end the connection (`Close` → hub
+    /// `teardown_active` → agent PtyClose → tmux DETACHES but keeps
+    /// running). So: send Close, treat the wire as lost (NOT a user
+    /// quit), and let the normal reconnect path re-Welcome; the reducer
+    /// then auto-reopens `last_active` — which the UI pointed at the
+    /// switch target via `AppModel::begin_switch`.
+    SwitchWorkspace,
     /// Raw bytes typed into the terminal (keyboard/IME → PTY). Produced by
     /// `TerminalPanel::ui` and forwarded to the hub as a binary frame.
     SendInput(Vec<u8>),
@@ -57,6 +72,8 @@ pub enum BackendEvent {
         account: String,
     },
     Workspaces(Vec<cloudcode_proto::WorkspaceInfo>),
+    /// Reply to ListAgents — feeds the new-workspace agent dropdown.
+    Agents(Vec<cloudcode_proto::AgentInfo>),
     SessionOpened {
         agent: String,
         workspace: String,
@@ -66,6 +83,10 @@ pub enum BackendEvent {
         session_id: String,
     },
     SessionError(String),
+    /// The active session ended deliberately (claude exited, takeover by
+    /// another client, reset) — distinct from `SessionError` so the UI
+    /// can drop to the sidebar without treating it as a failure.
+    SessionClosed(Option<String>),
     PtyBytes(Vec<u8>),
     Disconnected,
 }
@@ -236,15 +257,19 @@ async fn reconnect(
             }
         }
 
-        tokio::time::sleep(backoff).await;
-        backoff = bump(backoff);
-
         match connect_and_welcome(cfg, event_tx, ctx).await {
             ConnectResult::Connected(w) => return Some(w),
             ConnectResult::UiGone => return None,
             // Any failure during reconnect is transient — keep retrying.
             // (A genuine bad-token would have failed the initial connect.)
-            ConnectResult::Fatal(_) => continue,
+            //
+            // Attempt FIRST, sleep on failure: a workspace switch rides
+            // this path (deliberate Close → reconnect), so the happy
+            // path must not eat a backoff delay before even trying.
+            ConnectResult::Fatal(_) => {
+                tokio::time::sleep(backoff).await;
+                backoff = bump(backoff);
+            }
         }
     }
 }
@@ -327,13 +352,16 @@ async fn handle_hub_frame(
     // `true` → keep looping (None); `false` → wire is dead (WireLost).
     let keep = match frame {
         HubToClient::WorkspaceList { items } => emit(event_tx, ctx, BackendEvent::Workspaces(items)),
-        HubToClient::WorkspaceCreated { .. } | HubToClient::WorkspaceDeleted { .. } => {
-            // Re-list so the picker reflects the change.
+        HubToClient::WorkspaceCreated { .. }
+        | HubToClient::WorkspaceDeleted { .. }
+        | HubToClient::WorkspaceReset { .. } => {
+            // Re-list so the sidebar reflects the change.
             wire.out_tx
                 .send(OutFrame::Text(ClientToHub::ListWorkspaces))
                 .await
                 .is_ok()
         }
+        HubToClient::AgentList { items } => emit(event_tx, ctx, BackendEvent::Agents(items)),
         HubToClient::SessionOpened {
             agent,
             workspace,
@@ -352,11 +380,9 @@ async fn handle_hub_frame(
         HubToClient::SessionError { message } => {
             emit(event_tx, ctx, BackendEvent::SessionError(message))
         }
-        HubToClient::SessionClosed { reason } => emit(
-            event_tx,
-            ctx,
-            BackendEvent::SessionError(reason.unwrap_or_else(|| "session closed".into())),
-        ),
+        HubToClient::SessionClosed { reason } => {
+            emit(event_tx, ctx, BackendEvent::SessionClosed(reason))
+        }
         HubToClient::Ping => wire
             .out_tx
             .send(OutFrame::Text(ClientToHub::Pong))
@@ -371,11 +397,9 @@ async fn handle_hub_frame(
             // The hub dropped us mid-session — reconnect rather than die.
             return Some(LoopExit::WireLost);
         }
-        // Frames the picker/session skeleton doesn't act on yet.
+        // Frames the desktop app doesn't act on.
         HubToClient::Welcome { .. }
         | HubToClient::AgentSelected { .. }
-        | HubToClient::AgentList { .. }
-        | HubToClient::WorkspaceReset { .. }
         | HubToClient::FsWriteResult { .. } => true,
     };
     if keep {
@@ -399,6 +423,7 @@ async fn handle_command(
 ) -> Option<LoopExit> {
     let frame = match cmd {
         UiCommand::ListWorkspaces => ClientToHub::ListWorkspaces,
+        UiCommand::ListAgents => ClientToHub::ListAgents,
         UiCommand::OpenSession { agent, workspace } => ClientToHub::OpenSession {
             workspace,
             agent,
@@ -409,10 +434,21 @@ async fn handle_command(
         },
         UiCommand::CreateWorkspace { name, agent } => ClientToHub::CreateWorkspace { name, agent },
         UiCommand::DeleteWorkspace { name, agent } => ClientToHub::DeleteWorkspace { name, agent },
+        UiCommand::ResetWorkspace { name, agent } => ClientToHub::ResetWorkspace { name, agent },
         UiCommand::SendInput(bytes) => {
             return wire_lost_if_send_failed(wire.out_tx.send(OutFrame::Binary(bytes)).await);
         }
         UiCommand::Resize { cols, rows } => ClientToHub::Resize { cols, rows },
+        UiCommand::SwitchWorkspace => {
+            // Deliberate connection cycle (see the UiCommand doc): the
+            // hub tears the active session down when the connection ends
+            // (tmux on the agent detaches but keeps running), and the
+            // reconnect path's auto-reopen lands on the switch target.
+            // Best-effort Close, then report the wire lost so `run`
+            // emits Disconnected and reconnects immediately.
+            let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Close)).await;
+            return Some(LoopExit::WireLost);
+        }
         UiCommand::Close => {
             let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Close)).await;
             return Some(LoopExit::UserQuit);

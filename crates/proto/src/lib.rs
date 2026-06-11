@@ -221,7 +221,7 @@ pub enum PaneLayout {
     Stacked,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct AgentInfo {
     pub name: String,
     #[serde(default)]
