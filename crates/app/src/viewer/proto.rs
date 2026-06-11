@@ -1,18 +1,63 @@
-//! App-local mirror of the hub's `ViewerInputEvent` wire shape.
+//! App-local mirror of the hub's viewer wire shapes.
 //!
 //! The desktop app does NOT depend on the agent/hub crates, so this is a
 //! hand-kept copy of the JSON contract. **Source of truth:**
-//! `crates/hub/src/tunnel.rs` (`ViewerInputEvent`) and the parse in
-//! `crates/hub/src/viewer_session.rs` (`parse_viewer_input`). Any change
-//! there MUST be mirrored here; the `json_roundtrip_*` tests below pin the
-//! exact serde form so drift fails the build.
+//! `crates/hub/src/tunnel.rs` (`ViewerInputEvent`, `TargetInfo`) and
+//! `crates/hub/src/viewer_session.rs` (`parse_viewer_uplink` for the uplink,
+//! `targets_wire_json` for the downlink Text envelope). Any change there
+//! MUST be mirrored here; the `json_roundtrip_*` / pinned-shape tests below
+//! pin the exact serde forms so drift fails the build.
 //!
 //! Wire shape: `#[serde(tag = "kind", rename_all = "snake_case")]` →
 //! flat objects like `{"kind":"mouse_move","x":10.0,"y":20.0}`. The app
 //! serializes these to the viewer ws as `Message::Text`; the hub relays
-//! them verbatim to the agent.
+//! them verbatim to the agent. P6 adds two more Text shapes on the same
+//! `kind` tag space:
+//!
+//!   * downlink: `{"kind":"targets","targets":[{id,title,url,kind}]}`
+//!     (hub `targets_wire_json` → [`ViewerDownlinkText::Targets`]);
+//!   * uplink:   `{"kind":"select_target","target_id":"…"}`
+//!     ([`select_target_json`] → hub `parse_viewer_uplink`).
 
 use serde::{Deserialize, Serialize};
+
+/// One CDP target (an agent-side Chrome tab) as carried in the downlink
+/// `targets` envelope. Field-for-field mirror of `hub::tunnel::TargetInfo`
+/// (which is what `targets_wire_json` serializes).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TargetInfo {
+    pub id: String,
+    pub title: String,
+    pub url: String,
+    /// `"page"` for now; reserved for future kinds (e.g. electron windows).
+    pub kind: String,
+}
+
+/// Downlink Text-frame envelope on the viewer ws. The hub's
+/// `targets_wire_json` is the source of truth for the `Targets` shape:
+/// `{"kind":"targets","targets":[…]}`. A `kind` envelope so future downlink
+/// text messages can multiplex on the same socket.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ViewerDownlinkText {
+    Targets { targets: Vec<TargetInfo> },
+}
+
+/// The non-input uplink kinds (same serde conventions as
+/// `ViewerInputEvent`); mirrors the hub's private `ControlUplink`.
+#[derive(Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ControlUplink<'a> {
+    SelectTarget { target_id: &'a str },
+}
+
+/// Serialize a tab-switch request into the exact uplink Text shape the
+/// hub's `parse_viewer_uplink` accepts:
+/// `{"kind":"select_target","target_id":"…"}`.
+pub fn select_target_json(target_id: &str) -> String {
+    serde_json::to_string(&ControlUplink::SelectTarget { target_id })
+        .expect("select_target serialization cannot fail")
+}
 
 /// A single user-input event for the browser viewer, expressed in
 /// viewport pixels (the panel does canvas→viewport scaling before
@@ -135,5 +180,72 @@ mod tests {
         let json = serde_json::to_string(&ev).unwrap();
         let back: ViewerInputEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, ev);
+    }
+
+    // --- downlink targets envelope (P6 multi-target) ----------------------
+
+    /// The exact downlink shape `hub::viewer_session::targets_wire_json`
+    /// produces (same data as its `targets_wire_shape_is_pinned` test).
+    /// If the hub's wire shape changes, this constant — and the mirror
+    /// types above — must change with it.
+    const HUB_TARGETS_JSON: &str = r#"{"kind":"targets","targets":[{"id":"T_A","title":"百度一下","url":"https://www.baidu.com/","kind":"page"},{"id":"T_B","title":"","url":"about:blank","kind":"page"}]}"#;
+
+    #[test]
+    fn downlink_targets_roundtrips_hub_shape() {
+        let parsed: ViewerDownlinkText = serde_json::from_str(HUB_TARGETS_JSON).unwrap();
+        let ViewerDownlinkText::Targets { targets } = &parsed;
+        assert_eq!(
+            targets,
+            &vec![
+                TargetInfo {
+                    id: "T_A".into(),
+                    title: "百度一下".into(),
+                    url: "https://www.baidu.com/".into(),
+                    kind: "page".into(),
+                },
+                TargetInfo {
+                    id: "T_B".into(),
+                    title: "".into(),
+                    url: "about:blank".into(),
+                    kind: "page".into(),
+                },
+            ]
+        );
+
+        // Serialize back and compare as Values (key order / whitespace
+        // agnostic) — pins our serde attrs to the hub's exact shape.
+        let got: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&parsed).unwrap()).unwrap();
+        let want: serde_json::Value = serde_json::from_str(HUB_TARGETS_JSON).unwrap();
+        assert_eq!(got, want, "downlink shape drifted from hub contract");
+    }
+
+    #[test]
+    fn downlink_targets_empty_list_keeps_envelope() {
+        // Browser idle: the hub still sends the envelope with an empty list.
+        let parsed: ViewerDownlinkText =
+            serde_json::from_str(r#"{"kind":"targets","targets":[]}"#).unwrap();
+        let ViewerDownlinkText::Targets { targets } = &parsed;
+        assert!(targets.is_empty());
+    }
+
+    #[test]
+    fn downlink_unknown_kind_is_an_error() {
+        // The client logs + skips these rather than tearing the ws down.
+        assert!(serde_json::from_str::<ViewerDownlinkText>(r#"{"kind":"nope"}"#).is_err());
+        assert!(serde_json::from_str::<ViewerDownlinkText>("not json").is_err());
+        assert!(serde_json::from_str::<ViewerDownlinkText>("{}").is_err());
+    }
+
+    // --- uplink select_target (P6 multi-target) ---------------------------
+
+    #[test]
+    fn select_target_json_exact_shape() {
+        // Byte-exact: this is precisely what `hub::parse_viewer_uplink`'s
+        // `uplink_parses_select_target` test feeds in.
+        assert_eq!(
+            select_target_json("ABC123"),
+            r#"{"kind":"select_target","target_id":"ABC123"}"#
+        );
     }
 }

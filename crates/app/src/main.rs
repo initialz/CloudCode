@@ -248,6 +248,10 @@ impl App {
             match ev {
                 ViewerEvent::Connected => panel.mark_connected(),
                 ViewerEvent::Frame(jpeg) => panel.set_frame(ctx, &jpeg),
+                // The agent's tab list (fresh on attach, then on every
+                // change) — the panel re-runs its agent-mirroring
+                // auto-select so the highlighted tab tracks the stream.
+                ViewerEvent::Targets(targets) => panel.set_targets(targets),
                 ViewerEvent::Disconnected => {
                     panel.mark_disconnected();
                     // The client thread has exited; drop our handle. Block an
@@ -760,11 +764,13 @@ impl App {
         }
     }
 
-    /// Draw the browser panel and forward its captured mouse/key/IME events
-    /// up the viewer ws. With no viewer handle (lazy connect pending / a
-    /// drop) the panel shows its placeholder and produces no events.
+    /// Draw the browser panel (tab bar + screencast) and forward what it
+    /// captured up the viewer ws: mouse/key/IME events as `SendInput`, a
+    /// tab click as `SelectTarget`. With no viewer handle (lazy connect
+    /// pending / a drop) the panel shows its placeholder and produces
+    /// nothing to forward.
     fn render_browser(&mut self, ui: &mut egui::Ui) {
-        let events = match &mut self.browser {
+        let output = match &mut self.browser {
             Some(panel) => panel.ui(ui),
             None => {
                 ui.colored_label(theme::TEXT_FAINT, "(browser not ready)");
@@ -772,8 +778,11 @@ impl App {
             }
         };
         if let Some(handle) = &self.viewer {
-            for ev in events {
+            for ev in output.input {
                 let _ = handle.cmd_tx.send(ViewerCommand::SendInput(ev));
+            }
+            if let Some(target_id) = output.select {
+                let _ = handle.cmd_tx.send(ViewerCommand::SelectTarget(target_id));
             }
         }
     }

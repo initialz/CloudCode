@@ -24,3 +24,6 @@ pub mod proto;
 // `ViewerEvent`s / `ViewerCommand`s between them.
 pub use client::{ViewerCommand, ViewerEvent, ViewerHandle};
 pub use panel::BrowserPanel;
+
+// Internal-only types (proto::TargetInfo, panel::ViewerUiOutput) ride
+// through the re-exported enums/return values; main.rs never names them.

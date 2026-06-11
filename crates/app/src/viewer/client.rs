@@ -23,7 +23,7 @@
 //! whether to reconnect. `ViewerCommand::Close` drops the ws; the hub fires
 //! `ViewerDetach` agent-side on disconnect, stopping the screencast.
 
-use crate::viewer::proto::ViewerInputEvent;
+use crate::viewer::proto::{select_target_json, TargetInfo, ViewerDownlinkText, ViewerInputEvent};
 use anyhow::{anyhow, Result};
 use futures::{SinkExt, StreamExt};
 use std::sync::mpsc::{Receiver, Sender};
@@ -35,6 +35,9 @@ pub enum ViewerCommand {
     /// A captured input event to inject into the remote browser. Serialized
     /// to JSON and sent up as a ws Text frame.
     SendInput(ViewerInputEvent),
+    /// Switch the screencast to another CDP target (a tab-bar click). Sent
+    /// up as the `{"kind":"select_target","target_id":…}` Text frame.
+    SelectTarget(String),
     /// Tear the viewer ws down (panel hidden / app quitting). Dropping the
     /// socket makes the hub send `ViewerDetach` to the agent.
     Close,
@@ -48,6 +51,9 @@ pub enum ViewerEvent {
     /// One screencast frame (raw JPEG bytes) — Task 3 decodes + uploads it
     /// as an egui texture.
     Frame(Vec<u8>),
+    /// The agent's current CDP target list (a downlink `targets` Text
+    /// frame) — drives the browser panel's tab bar.
+    Targets(Vec<TargetInfo>),
     /// The ws closed (hub closed us, agent stopped the screencast, network
     /// drop, or our own `Close`). The UI shows a placeholder; reconnect is
     /// the UI's call (Task 4 lazy-connect).
@@ -187,13 +193,31 @@ async fn event_loop<S>(
                             return; // UI gone
                         }
                     }
-                    // tungstenite answers pings itself; viewers get no text.
+                    // A downlink Text frame — currently only the `targets`
+                    // envelope (the agent's tab list). Unparseable text is
+                    // logged and skipped, never a teardown.
+                    Some(Ok(Message::Text(text))) => {
+                        match serde_json::from_str::<ViewerDownlinkText>(&text) {
+                            Ok(ViewerDownlinkText::Targets { targets }) => {
+                                if !emit(event_tx, ctx, ViewerEvent::Targets(targets)) {
+                                    return; // UI gone
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    error = %e,
+                                    "viewer: unparseable downlink text; skipping"
+                                );
+                            }
+                        }
+                    }
+                    // tungstenite answers pings itself.
                     Some(Ok(Message::Close(_))) | None => return,
                     Some(Err(e)) => {
                         tracing::debug!(error = %e, "viewer: ws read error");
                         return;
                     }
-                    // Text/Ping/Pong/Frame: nothing for the viewer to do.
+                    // Ping/Pong/Frame: nothing for the viewer to do.
                     Some(Ok(_)) => {}
                 }
             }
@@ -209,6 +233,13 @@ async fn event_loop<S>(
                                 Err(_) => continue, // unserializable; drop it
                             };
                             if ws.send(Message::Text(json)).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(ViewerCommand::SelectTarget(id)) => {
+                            // Tab switch: the exact uplink shape the hub's
+                            // `parse_viewer_uplink` accepts.
+                            if ws.send(Message::Text(select_target_json(&id))).await.is_err() {
                                 return;
                             }
                         }

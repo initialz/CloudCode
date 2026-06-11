@@ -34,7 +34,8 @@
 //! [`egui_key_to_viewer`]. `modifiers` is the CDP bitmask
 //! (Alt=1, Ctrl=2, Meta=4, Shift=8).
 
-use crate::viewer::proto::ViewerInputEvent;
+use crate::viewer::proto::{TargetInfo, ViewerInputEvent};
+use std::time::{Duration, Instant};
 use zune_jpeg::zune_core::bytestream::ZCursor;
 use zune_jpeg::zune_core::colorspace::ColorSpace;
 use zune_jpeg::zune_core::options::DecoderOptions;
@@ -110,10 +111,29 @@ pub fn ime_apply(
     }
 }
 
+/// What one [`BrowserPanel::ui`] frame produced: captured input events to
+/// forward as `ViewerCommand::SendInput`, plus an optional tab-bar click to
+/// forward as `ViewerCommand::SelectTarget`.
+#[derive(Debug, Default)]
+pub struct ViewerUiOutput {
+    pub input: Vec<ViewerInputEvent>,
+    /// Target id of an *inactive* tab the user clicked this frame.
+    pub select: Option<String>,
+}
+
+/// Max tab label width in characters (middle-truncated beyond this).
+const TAB_LABEL_MAX: usize = 24;
+
+/// How recently a frame must have arrived for the `LIVE` badge to show.
+/// Past this the stream is considered stalled and the badge simply hides
+/// (V1 keeps it binary — no separate STALE state; noted in the plan).
+const LIVE_FRESH: Duration = Duration::from_secs(2);
+
 /// The browser panel: holds the latest decoded frame as an egui texture plus
 /// its pixel dimensions, the IME composition state, and the last-known
 /// letterboxed image rect (so input mapping uses the same geometry the last
-/// frame was drawn with).
+/// frame was drawn with). P6 adds the tab-bar model: the agent's CDP target
+/// list and which target the stream is (believed to be) on.
 pub struct BrowserPanel {
     /// The uploaded texture for the latest good frame. `None` until the
     /// first successful decode; a decode error keeps the previous texture.
@@ -134,6 +154,17 @@ pub struct BrowserPanel {
     /// the placeholder text before the first frame arrives and after a drop.
     /// Set by the App from `ViewerEvent::{Connected,Disconnected}` (Task 4).
     connected: bool,
+    /// The agent's CDP target list (one tab per entry), from
+    /// `ViewerEvent::Targets`. Empty = agent browser idle (no pages).
+    targets: Vec<TargetInfo>,
+    /// The target id the stream is on. The wire doesn't carry "attached",
+    /// so this MIRRORS the agent's auto-select semantics via [`auto_select`]
+    /// on every targets update, and is set optimistically on a tab click
+    /// (the agent confirms by switching the stream).
+    current: Option<String>,
+    /// When the last frame arrived — drives the `LIVE` badge freshness
+    /// (see [`frame_is_live`]).
+    last_frame: Option<Instant>,
 }
 
 impl Default for BrowserPanel {
@@ -152,6 +183,9 @@ impl BrowserPanel {
             image_rect: None,
             focus_id: None,
             connected: false,
+            targets: Vec::new(),
+            current: None,
+            last_frame: None,
         }
     }
 
@@ -169,11 +203,27 @@ impl BrowserPanel {
     /// Mark the viewer ws disconnected: the panel keeps showing the last good
     /// frame dimmed isn't worth the complexity here, so we drop the texture
     /// and fall back to the placeholder, which now reads "disconnected".
+    ///
+    /// The tab-bar model is dropped too: targets can change while detached,
+    /// and a fresh attach makes the agent push a new list AND auto-select
+    /// the *first* target — keeping a remembered `current` would desync the
+    /// highlighted tab from the actual stream.
     pub fn mark_disconnected(&mut self) {
         self.connected = false;
         self.texture = None;
         self.frame_dims = None;
         self.image_rect = None;
+        self.targets.clear();
+        self.current = None;
+        self.last_frame = None;
+    }
+
+    /// Replace the tab-bar model with a fresh targets list (a downlink
+    /// `ViewerEvent::Targets`), re-running the agent-mirroring
+    /// [`auto_select`] so the highlighted tab tracks the actual stream.
+    pub fn set_targets(&mut self, targets: Vec<TargetInfo>) {
+        self.current = auto_select(&targets, &self.current);
+        self.targets = targets;
     }
 
     /// Decode a screencast JPEG and update the texture in place.
@@ -202,22 +252,29 @@ impl BrowserPanel {
             }
         }
         self.frame_dims = Some((w, h));
+        self.last_frame = Some(Instant::now());
         // A frame implies a live ws (covers the case where the Frame event
         // is drained before/without an explicit Connected).
         self.connected = true;
     }
 
-    /// Render the panel into `ui` and return the input events captured this
-    /// frame (to forward up the viewer ws as `ViewerCommand::SendInput`).
+    /// Render the panel into `ui` and return what it captured this frame:
+    /// input events (to forward as `ViewerCommand::SendInput`) and an
+    /// optional tab click (to forward as `ViewerCommand::SelectTarget`).
     ///
-    /// Draws the latest frame letterboxed into the available rect; with no
-    /// frame yet it shows a centered "browser idle" placeholder. Mouse
-    /// events are captured while hovered, keyboard/IME while focused, all in
-    /// frame-viewport pixel coordinates.
-    pub fn ui(&mut self, ui: &mut egui::Ui) -> Vec<ViewerInputEvent> {
-        let mut events = Vec::new();
+    /// Layout: the tab bar strip on top (only when targets exist), then the
+    /// latest frame letterboxed into the remaining rect; with no frame yet a
+    /// centered placeholder. Mouse events are captured while hovered,
+    /// keyboard/IME while focused, all in frame-viewport pixel coordinates.
+    pub fn ui(&mut self, ui: &mut egui::Ui) -> ViewerUiOutput {
+        let mut out = ViewerUiOutput::default();
 
-        // Take the whole available area as a click-and-drag focusable region.
+        // Tab bar BEFORE the image: a click is surfaced to the caller AND
+        // optimistically highlights the tab (the agent confirms by actually
+        // switching the stream / pushing a fresh targets list).
+        out.select = self.tab_bar(ui);
+
+        // Take the whole remaining area as a click-and-drag focusable region.
         let avail = ui.available_size();
         let (response, painter) =
             ui.allocate_painter(avail, egui::Sense::click_and_drag());
@@ -231,12 +288,16 @@ impl BrowserPanel {
         let frame = self.texture.as_ref().zip(self.frame_dims);
         let Some((texture, (fw, fh))) = frame else {
             // No frame yet → placeholder, and nothing to capture. The text
-            // reflects whether the ws is up (connecting/waiting) or down.
+            // reflects whether the ws is up (and, when it is, whether the
+            // agent's browser simply has no pages open yet).
             self.image_rect = None;
-            let msg = if self.connected {
-                "connecting to browser…"
-            } else {
+            let msg = if !self.connected {
                 "browser idle / not connected"
+            } else if self.targets.is_empty() {
+                // Agent browser idle: claude hasn't opened a page yet.
+                "agent browser idle — pages claude opens appear here"
+            } else {
+                "connecting to browser…"
             };
             painter.text(
                 panel_rect.center(),
@@ -245,7 +306,7 @@ impl BrowserPanel {
                 egui::FontId::proportional(16.0),
                 crate::theme::TEXT_MUTED,
             );
-            return events;
+            return out;
         };
 
         // Letterbox the frame inside the panel, preserving aspect ratio.
@@ -259,6 +320,13 @@ impl BrowserPanel {
             egui::Color32::WHITE,
         );
 
+        // `LIVE · w×h` badge (bottom-right): the honest "this is a mirror"
+        // marker, shown only while frames are actually flowing. A stalled
+        // stream (>2s without a frame) just hides it (V1 keeps it binary).
+        if frame_is_live(self.last_frame, Instant::now()) {
+            draw_live_badge(&painter, image_rect, fw, fh);
+        }
+
         // Grab focus on press so keyboard/IME route here.
         if response.clicked() || response.drag_started() {
             response.request_focus();
@@ -266,6 +334,7 @@ impl BrowserPanel {
         let focused = response.has_focus();
 
         // --- Mouse: move (hovered), buttons (press/release), wheel ---
+        let mut events = Vec::new();
         self.capture_mouse(ui, &response, image_rect, fw, fh, &mut events);
 
         // Anchor the OS IME candidate window near the pointer (or panel
@@ -295,7 +364,41 @@ impl BrowserPanel {
             self.capture_keys(&in_events, &mut events);
         }
 
-        events
+        out.input = events;
+        out
+    }
+
+    /// Render the tab strip (one tab per CDP target) and return the id of
+    /// an *inactive* tab clicked this frame, after optimistically marking it
+    /// current. Renders nothing when the target list is empty (the
+    /// placeholder under it explains the idle state).
+    fn tab_bar(&mut self, ui: &mut egui::Ui) -> Option<String> {
+        if self.targets.is_empty() {
+            return None;
+        }
+        let mut clicked: Option<String> = None;
+        egui::Frame::none()
+            .fill(crate::theme::BG1)
+            .inner_margin(egui::Margin::symmetric(crate::theme::SP_1, crate::theme::SP_1))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = crate::theme::SP_1;
+                    for t in &self.targets {
+                        let active = self.current.as_deref() == Some(t.id.as_str());
+                        let label = tab_label(&t.title, &t.url, TAB_LABEL_MAX);
+                        if tab_button(ui, &label, active) && !active {
+                            clicked = Some(t.id.clone());
+                        }
+                    }
+                });
+            });
+        if let Some(id) = &clicked {
+            // Optimistic: the agent confirms by switching the stream (and a
+            // racing close is corrected by the next Targets event).
+            self.current = Some(id.clone());
+        }
+        clicked
     }
 
     /// Capture pointer move / button / wheel into viewer events, mapping
@@ -411,6 +514,131 @@ impl BrowserPanel {
             }
         }
     }
+}
+
+/// Which target the stream is on after a targets update — the SAME rules
+/// the agent's `viewer.rs` forwarder applies (the wire doesn't carry
+/// "attached", so the app mirrors the decision instead):
+///
+///   * `current` still in the list → keep it;
+///   * `current` gone (tab closed) or `None` (idle) → the FIRST target;
+///   * empty list → `None` (agent browser idle).
+///
+/// PURE.
+pub fn auto_select(targets: &[TargetInfo], current: &Option<String>) -> Option<String> {
+    if let Some(cur) = current {
+        if targets.iter().any(|t| &t.id == cur) {
+            return Some(cur.clone());
+        }
+    }
+    targets.first().map(|t| t.id.clone())
+}
+
+/// Tab label text: the page title, falling back to the url's host when the
+/// title is empty (e.g. `about:blank`), middle-truncated to `max` chars
+/// with a single `…` so both the start and the end stay recognizable.
+///
+/// PURE.
+pub fn tab_label(title: &str, url: &str, max: usize) -> String {
+    let title = title.trim();
+    let base = if title.is_empty() {
+        url_host(url)
+    } else {
+        title.to_string()
+    };
+    middle_truncate(&base, max)
+}
+
+/// The host part of a url (`https://www.baidu.com/s?x=1` → `www.baidu.com`).
+/// Scheme-less urls (`about:blank`) pass through whole; an empty host falls
+/// back to the full url so the tab is never blank.
+fn url_host(url: &str) -> String {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    if host.is_empty() {
+        url.to_string()
+    } else {
+        host.to_string()
+    }
+}
+
+/// Middle-truncate `s` to at most `max` chars (char-counted, so CJK titles
+/// don't get split mid-codepoint), keeping head + `…` + tail.
+fn middle_truncate(s: &str, max: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".to_string();
+    }
+    let keep = max - 1; // room for the ellipsis
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let mut out: String = chars[..head].iter().collect();
+    out.push('…');
+    out.extend(&chars[chars.len() - tail..]);
+    out
+}
+
+/// Whether the screencast counts as live: a frame arrived within
+/// [`LIVE_FRESH`] of `now`. `None` (no frame yet) is never live.
+///
+/// PURE.
+pub fn frame_is_live(last_frame: Option<Instant>, now: Instant) -> bool {
+    last_frame.is_some_and(|t| now.duration_since(t) < LIVE_FRESH)
+}
+
+/// Paint one tab and report whether it was clicked. Active tab: BG2 fill,
+/// ACCENT text + a 2px accent underline; inactive: TEXT_MUTED on the strip's
+/// BG1 (subtle BG2 wash on hover). All theme tokens.
+fn tab_button(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
+    use crate::theme;
+    let text_color = if active { theme::ACCENT } else { theme::TEXT_MUTED };
+    let galley = ui.painter().layout_no_wrap(
+        label.to_string(),
+        egui::FontId::proportional(12.0),
+        text_color,
+    );
+    let pad = egui::vec2(theme::SP_2, theme::SP_1);
+    let (rect, response) =
+        ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response.clicked();
+    }
+    let painter = ui.painter();
+    if active {
+        painter.rect_filled(rect, theme::RADIUS / 2.0, theme::BG2);
+    } else if response.hovered() {
+        painter.rect_filled(rect, theme::RADIUS / 2.0, theme::BG2.linear_multiply(0.6));
+    }
+    painter.galley(rect.min + pad, galley, text_color);
+    if active {
+        let underline = egui::Rect::from_min_max(
+            egui::pos2(rect.min.x + 2.0, rect.max.y - 2.0),
+            egui::pos2(rect.max.x - 2.0, rect.max.y),
+        );
+        painter.rect_filled(underline, 1.0, theme::ACCENT);
+    }
+    response.clicked()
+}
+
+/// Paint the `LIVE · w×h` badge into the image's bottom-right corner:
+/// small TEXT_MUTED caps on a semi-transparent BG2 pill — the honest "this
+/// is a remote mirror" marker.
+fn draw_live_badge(painter: &egui::Painter, image_rect: egui::Rect, fw: usize, fh: usize) {
+    use crate::theme;
+    let galley = painter.layout_no_wrap(
+        format!("LIVE · {fw}×{fh}"),
+        egui::FontId::proportional(10.0),
+        theme::TEXT_MUTED,
+    );
+    let pad = egui::vec2(theme::SP_1 + 2.0, theme::SP_1);
+    let size = galley.size() + pad * 2.0;
+    let min = image_rect.max - size - egui::vec2(theme::SP_2, theme::SP_2);
+    let rect = egui::Rect::from_min_size(min, size);
+    painter.rect_filled(rect, theme::RADIUS / 2.0, theme::BG2.gamma_multiply(0.85));
+    painter.galley(rect.min + pad, galley, theme::TEXT_MUTED);
 }
 
 /// Texture sampling options: linear filtering so the letterboxed frame
@@ -893,6 +1121,121 @@ mod tests {
         );
         assert_eq!(out, vec![ViewerInputEvent::InsertText { text: "你".into() }]);
         assert!(!panel.ime.is_composing());
+    }
+
+    // ---- auto_select (mirrors the agent's forwarder rules) --------------
+
+    fn ti(id: &str) -> TargetInfo {
+        TargetInfo {
+            id: id.into(),
+            title: format!("title {id}"),
+            url: format!("https://example.com/{id}"),
+            kind: "page".into(),
+        }
+    }
+
+    #[test]
+    fn auto_select_table() {
+        let ab = vec![ti("A"), ti("B")];
+        let cases: Vec<(&[TargetInfo], Option<&str>, Option<&str>, &str)> = vec![
+            (&ab, Some("B"), Some("B"), "current still listed → keep"),
+            (&ab, Some("Z"), Some("A"), "current destroyed → first remaining"),
+            (&ab, None, Some("A"), "idle + targets appear → first"),
+            (&[], Some("A"), None, "all targets gone → idle"),
+            (&[], None, None, "stays idle on empty"),
+        ];
+        for (targets, current, want, why) in cases {
+            let got = auto_select(targets, &current.map(String::from));
+            assert_eq!(got.as_deref(), want, "{why}");
+        }
+    }
+
+    #[test]
+    fn set_targets_runs_auto_select_and_click_is_optimistic() {
+        let mut panel = BrowserPanel::new();
+        // First list: idle → first target auto-selected.
+        panel.set_targets(vec![ti("A"), ti("B")]);
+        assert_eq!(panel.current.as_deref(), Some("A"));
+        // A (optimistic) tab click, then a refresh keeping B → B sticks.
+        panel.current = Some("B".into());
+        panel.set_targets(vec![ti("B"), ti("C")]);
+        assert_eq!(panel.current.as_deref(), Some("B"));
+        // B closes → falls to the first remaining.
+        panel.set_targets(vec![ti("C")]);
+        assert_eq!(panel.current.as_deref(), Some("C"));
+        // Browser idle.
+        panel.set_targets(vec![]);
+        assert_eq!(panel.current, None);
+    }
+
+    #[test]
+    fn disconnect_clears_tab_model() {
+        // A fresh attach makes the agent push a new list and select the
+        // FIRST target — stale tabs/current must not survive a drop.
+        let mut panel = BrowserPanel::new();
+        panel.set_targets(vec![ti("A")]);
+        panel.mark_disconnected();
+        assert!(panel.targets.is_empty());
+        assert_eq!(panel.current, None);
+        assert!(panel.last_frame.is_none());
+    }
+
+    // ---- tab_label / truncation ------------------------------------------
+
+    #[test]
+    fn tab_label_short_title_kept_whole() {
+        assert_eq!(tab_label("GitHub", "https://github.com/", 24), "GitHub");
+    }
+
+    #[test]
+    fn tab_label_long_title_middle_truncated() {
+        let long = "An Extremely Long Page Title That Cannot Fit";
+        let got = tab_label(long, "https://x.com/", 24);
+        assert_eq!(got.chars().count(), 24, "truncated to max chars");
+        assert!(got.contains('…'));
+        assert!(got.starts_with("An Extremely"), "head preserved: {got}");
+        assert!(got.ends_with("Fit"), "tail preserved: {got}");
+    }
+
+    #[test]
+    fn tab_label_cjk_truncates_on_chars() {
+        let long: String = "中".repeat(30);
+        let got = tab_label(&long, "https://x.com/", 10);
+        assert_eq!(got.chars().count(), 10);
+        assert!(got.contains('…'));
+    }
+
+    #[test]
+    fn tab_label_empty_title_falls_back_to_url_host() {
+        assert_eq!(
+            tab_label("", "https://www.baidu.com/s?wd=x", 24),
+            "www.baidu.com"
+        );
+        // Scheme-less url (the about:blank tab) passes through whole.
+        assert_eq!(tab_label("  ", "about:blank", 24), "about:blank");
+    }
+
+    #[test]
+    fn tab_label_empty_everything_is_empty() {
+        assert_eq!(tab_label("", "", 24), "");
+    }
+
+    // ---- frame_is_live ----------------------------------------------------
+
+    #[test]
+    fn live_badge_freshness() {
+        let t0 = std::time::Instant::now();
+        assert!(!frame_is_live(None, t0), "no frame yet → not live");
+        assert!(frame_is_live(Some(t0), t0), "fresh frame → live");
+        assert!(
+            frame_is_live(Some(t0), t0 + Duration::from_millis(1999)),
+            "just under the window → live"
+        );
+        assert!(
+            !frame_is_live(Some(t0), t0 + Duration::from_secs(2)),
+            "at the boundary → stalled, badge hides"
+        );
+        assert!(!frame_is_live(Some(t0), t0 + Duration::from_secs(60)));
     }
 
     // ---- JPEG decode (embedded 2x2 fixture) ----------------------------
