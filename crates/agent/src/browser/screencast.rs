@@ -159,18 +159,67 @@ fn cmd_bring_to_front(id: i64) -> String {
     compact(json!({ "id": id, "method": "Page.bringToFront" }))
 }
 
+/// Default screencast viewport before any viewer resize arrives. Matches the
+/// pre-resize fixed size so behaviour is unchanged until the app measures its
+/// panel and sends a `ViewerResize`.
+pub const DEFAULT_SCREENCAST_WIDTH: u32 = 1280;
+pub const DEFAULT_SCREENCAST_HEIGHT: u32 = 800;
+
+/// Clamp bounds for a requested viewport (CSS px). Mirrors the agent-side
+/// clamp the design calls for; the app sends the panel's logical size, but a
+/// rogue / extreme value must never reach CDP.
+pub const MIN_VIEWPORT: u32 = 200;
+pub const MAX_VIEWPORT: u32 = 4096;
+
+/// Clamp a requested viewport dimension to `MIN_VIEWPORT..=MAX_VIEWPORT`.
+pub fn clamp_viewport(v: u32) -> u32 {
+    v.clamp(MIN_VIEWPORT, MAX_VIEWPORT)
+}
+
 fn cmd_start_screencast(id: i64) -> String {
+    cmd_start_screencast_sized(id, DEFAULT_SCREENCAST_WIDTH, DEFAULT_SCREENCAST_HEIGHT)
+}
+
+/// `Page.startScreencast` with explicit `maxWidth`/`maxHeight` so the frames
+/// arrive at the requested viewport instead of the fixed default. Chrome
+/// accepts re-issuing `startScreencast` on a live page with new max dims,
+/// which is how [`ScreencastSession::resize`] changes the frame size.
+fn cmd_start_screencast_sized(id: i64, w: u32, h: u32) -> String {
     compact(json!({
         "id": id,
         "method": "Page.startScreencast",
         "params": {
             "format": "jpeg",
             "quality": 60,
-            "maxWidth": 1280,
-            "maxHeight": 800,
+            "maxWidth": w,
+            "maxHeight": h,
             "everyNthFrame": 1,
         }
     }))
+}
+
+/// `Emulation.setDeviceMetricsOverride` — reflow the PAGE to `w×h` CSS px
+/// (device scale 1, non-mobile). This is the standard CDP way to make a live
+/// page lay out at a new viewport; pairing it with a sized screencast makes
+/// the frames match the app panel's aspect ratio (no letterbox bars).
+fn cmd_set_device_metrics(id: i64, w: u32, h: u32) -> String {
+    compact(json!({
+        "id": id,
+        "method": "Emulation.setDeviceMetricsOverride",
+        "params": {
+            "width": w,
+            "height": h,
+            "deviceScaleFactor": 1,
+            "mobile": false,
+        }
+    }))
+}
+
+/// `Emulation.clearDeviceMetricsOverride` — drop any viewport override so the
+/// page reverts to its window size. Sent on stop so a detached viewer doesn't
+/// leave the agent's page reflowed.
+fn cmd_clear_device_metrics(id: i64) -> String {
+    compact(json!({ "id": id, "method": "Emulation.clearDeviceMetricsOverride" }))
 }
 
 fn cmd_screencast_ack(id: i64, cdp_session: i64) -> String {
@@ -279,6 +328,34 @@ pub struct ScreencastSession {
     next_id: Arc<AtomicI64>,
 }
 
+/// A requested viewport size (CSS px), already clamped to
+/// `MIN_VIEWPORT..=MAX_VIEWPORT`. `Default` is the pre-resize fixed size so a
+/// session started before any `ViewerResize` behaves exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Viewport {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Viewport {
+            width: DEFAULT_SCREENCAST_WIDTH,
+            height: DEFAULT_SCREENCAST_HEIGHT,
+        }
+    }
+}
+
+impl Viewport {
+    /// Build a clamped viewport from raw requested dims.
+    pub fn clamped(width: u32, height: u32) -> Viewport {
+        Viewport {
+            width: clamp_viewport(width),
+            height: clamp_viewport(height),
+        }
+    }
+}
+
 impl Drop for ScreencastSession {
     /// Abort the ws task on drop. Critical: dropping a `JoinHandle` only
     /// DETACHES the task — without this, an abrupt agent↔hub disconnect (no
@@ -319,6 +396,19 @@ impl ScreencastSession {
         Self::start_on_target(&ws_url, frame_tx).await
     }
 
+    /// Like [`Self::start_on_target`] but at a specific viewport: the page is
+    /// reflowed via `Emulation.setDeviceMetricsOverride` and the screencast
+    /// started at matching max dims. The viewer manager calls this so a tab
+    /// switch re-applies the viewer's current size instead of snapping back
+    /// to the default.
+    pub async fn start_on_target_sized(
+        ws_url: &str,
+        frame_tx: mpsc::Sender<Vec<u8>>,
+        viewport: Viewport,
+    ) -> Result<Self> {
+        Self::start_on_target_inner(ws_url, frame_tx, viewport).await
+    }
+
     /// Connect directly to a page target's debugger websocket, start a JPEG
     /// screencast, and stream decoded frames to `frame_tx`. No page picking —
     /// the caller already knows the exact target (P6 tab switching).
@@ -331,6 +421,14 @@ impl ScreencastSession {
     ///      → `frame_tx`, ack each) and a command receiver (forward queued
     ///      outgoing commands to the ws).
     pub async fn start_on_target(ws_url: &str, frame_tx: mpsc::Sender<Vec<u8>>) -> Result<Self> {
+        Self::start_on_target_inner(ws_url, frame_tx, Viewport::default()).await
+    }
+
+    async fn start_on_target_inner(
+        ws_url: &str,
+        frame_tx: mpsc::Sender<Vec<u8>>,
+        viewport: Viewport,
+    ) -> Result<Self> {
         let (ws, _) = tokio_tungstenite::connect_async(ws_url)
             .await
             .map_err(|e| anyhow!("connecting CDP ws {ws_url}: {e}"))?;
@@ -347,9 +445,26 @@ impl ScreencastSession {
         sink.send(Message::Text(cmd_bring_to_front(mint(&next_id))))
             .await
             .map_err(|e| anyhow!("sending Page.bringToFront: {e}"))?;
-        sink.send(Message::Text(cmd_start_screencast(mint(&next_id))))
+        // Reflow the page to the requested viewport BEFORE starting the
+        // screencast, but only when a viewer has actually resized (non-
+        // default). At the default we skip the override entirely so behaviour
+        // is byte-for-byte unchanged from before this feature.
+        if viewport != Viewport::default() {
+            sink.send(Message::Text(cmd_set_device_metrics(
+                mint(&next_id),
+                viewport.width,
+                viewport.height,
+            )))
             .await
-            .map_err(|e| anyhow!("sending Page.startScreencast: {e}"))?;
+            .map_err(|e| anyhow!("sending Emulation.setDeviceMetricsOverride: {e}"))?;
+        }
+        sink.send(Message::Text(cmd_start_screencast_sized(
+            mint(&next_id),
+            viewport.width,
+            viewport.height,
+        )))
+        .await
+        .map_err(|e| anyhow!("sending Page.startScreencast: {e}"))?;
 
         // Command channel: input()/stop enqueue here; the task forwards to ws.
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(64);
@@ -434,10 +549,45 @@ impl ScreencastSession {
         }
     }
 
+    /// Resize this viewer's browser viewport to `(w, h)` CSS px so the page
+    /// reflows to the app panel's aspect ratio.
+    ///
+    /// The CDP sequence (queued through the SAME cmd channel as input, so it
+    /// serializes after any in-flight injection):
+    ///   1. `Emulation.setDeviceMetricsOverride {width, height}` — reflows the
+    ///      live page to the new viewport;
+    ///   2. `Page.startScreencast` re-issued with the new `maxWidth`/
+    ///      `maxHeight` — Chrome accepts re-running startScreencast on a live
+    ///      page and the subsequent frames arrive at the new size.
+    ///
+    /// `w`/`h` are clamped to `MIN_VIEWPORT..=MAX_VIEWPORT` first. Non-blocking
+    /// (`try_send`); if the cmd channel is momentarily full the resize is
+    /// dropped and the next one wins (the app re-sends on the trailing edge).
+    pub fn resize(&self, w: u32, h: u32) {
+        let vp = Viewport::clamped(w, h);
+        let metrics = cmd_set_device_metrics(
+            self.next_id.fetch_add(1, Ordering::Relaxed),
+            vp.width,
+            vp.height,
+        );
+        let restart = cmd_start_screencast_sized(
+            self.next_id.fetch_add(1, Ordering::Relaxed),
+            vp.width,
+            vp.height,
+        );
+        if self.cmd_tx.try_send(metrics).is_err() || self.cmd_tx.try_send(restart).is_err() {
+            tracing::warn!("screencast cmd channel full; dropping resize");
+        }
+    }
+
     /// Stop the screencast and tear the session down: enqueue
-    /// `Page.stopScreencast` (best-effort), then abort the ws task so the
-    /// websocket closes.
+    /// `Emulation.clearDeviceMetricsOverride` (so a detached viewer doesn't
+    /// leave the page reflowed) + `Page.stopScreencast` (both best-effort),
+    /// then abort the ws task so the websocket closes.
     pub async fn stop(self) {
+        let _ = self
+            .cmd_tx
+            .try_send(cmd_clear_device_metrics(self.next_id.fetch_add(1, Ordering::Relaxed)));
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let _ = self.cmd_tx.try_send(cmd_stop_screencast(id));
         // Give the task a brief moment to flush the stop command before abort.
@@ -900,6 +1050,68 @@ mod tests {
     }
 
     #[test]
+    fn start_screencast_sized_honors_dims() {
+        let v = parse(&cmd_start_screencast_sized(4, 800, 600));
+        assert_eq!(v["id"], 4);
+        assert_eq!(v["method"], "Page.startScreencast");
+        let p = &v["params"];
+        assert_eq!(p["format"], "jpeg");
+        assert_eq!(p["quality"], 60);
+        assert_eq!(p["maxWidth"], 800);
+        assert_eq!(p["maxHeight"], 600);
+        assert_eq!(p["everyNthFrame"], 1);
+        // The default builder is exactly the sized one at the default dims.
+        let d = parse(&cmd_start_screencast(4));
+        assert_eq!(d["params"]["maxWidth"], DEFAULT_SCREENCAST_WIDTH);
+        assert_eq!(d["params"]["maxHeight"], DEFAULT_SCREENCAST_HEIGHT);
+    }
+
+    #[test]
+    fn set_device_metrics_shape() {
+        let v = parse(&cmd_set_device_metrics(8, 800, 600));
+        assert_eq!(v["id"], 8);
+        assert_eq!(v["method"], "Emulation.setDeviceMetricsOverride");
+        let p = &v["params"];
+        assert_eq!(p["width"], 800);
+        assert_eq!(p["height"], 600);
+        assert_eq!(p["deviceScaleFactor"], 1);
+        assert_eq!(p["mobile"], false);
+    }
+
+    #[test]
+    fn clear_device_metrics_shape() {
+        let v = parse(&cmd_clear_device_metrics(9));
+        assert_eq!(v["id"], 9);
+        assert_eq!(v["method"], "Emulation.clearDeviceMetricsOverride");
+    }
+
+    #[test]
+    fn clamp_viewport_bounds() {
+        assert_eq!(clamp_viewport(0), MIN_VIEWPORT);
+        assert_eq!(clamp_viewport(199), MIN_VIEWPORT);
+        assert_eq!(clamp_viewport(200), 200);
+        assert_eq!(clamp_viewport(800), 800);
+        assert_eq!(clamp_viewport(4096), 4096);
+        assert_eq!(clamp_viewport(99999), MAX_VIEWPORT);
+        // The clamped constructor applies it to both dims.
+        assert_eq!(
+            Viewport::clamped(10, 99999),
+            Viewport {
+                width: MIN_VIEWPORT,
+                height: MAX_VIEWPORT
+            }
+        );
+        // Default is the pre-resize fixed size.
+        assert_eq!(
+            Viewport::default(),
+            Viewport {
+                width: DEFAULT_SCREENCAST_WIDTH,
+                height: DEFAULT_SCREENCAST_HEIGHT
+            }
+        );
+    }
+
+    #[test]
     fn screencast_ack_shape() {
         let v = parse(&cmd_screencast_ack(11, 42));
         assert_eq!(v["id"], 11);
@@ -1305,6 +1517,122 @@ mod tests {
 
         // Inject a MouseMove — must not panic.
         session.input(&ViewerInputEvent::MouseMove { x: 10.0, y: 10.0 });
+
+        session.stop().await;
+        drop(mgr);
+    }
+
+    /// Read the width/height from a baseline/progressive JPEG's first SOF
+    /// marker (0xFFC0..=0xFFCF except C4/C8/CC). Returns `(w, h)` or `None`.
+    /// Used by the resize integration test to check the post-resize frame
+    /// dims without pulling in a decoder dependency.
+    fn jpeg_dims(bytes: &[u8]) -> Option<(u16, u16)> {
+        let mut i = 2; // skip SOI (FF D8)
+        while i + 9 < bytes.len() {
+            if bytes[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = bytes[i + 1];
+            // Standalone markers (no length): RSTn, SOI, EOI, TEM, fill.
+            if marker == 0xD8 || marker == 0xD9 || (0xD0..=0xD7).contains(&marker) {
+                i += 2;
+                continue;
+            }
+            let len = ((bytes[i + 2] as usize) << 8) | bytes[i + 3] as usize;
+            let is_sof = (0xC0..=0xCF).contains(&marker)
+                && marker != 0xC4
+                && marker != 0xC8
+                && marker != 0xCC;
+            if is_sof {
+                let h = ((bytes[i + 5] as u16) << 8) | bytes[i + 6] as u16;
+                let w = ((bytes[i + 7] as u16) << 8) | bytes[i + 8] as u16;
+                return Some((w, h));
+            }
+            i += 2 + len;
+        }
+        None
+    }
+
+    /// Real-Chrome resize integration: start a screencast at the default size,
+    /// confirm a frame arrives, then `resize(800, 600)` and assert frames keep
+    /// flowing AND (best-effort) the decoded JPEG dims track the new viewport
+    /// (≤800×600, since `maxWidth`/`maxHeight` bound the frame). Proves the
+    /// `Emulation.setDeviceMetricsOverride` + re-issued `startScreencast`
+    /// sequence resizes a LIVE screencast.
+    ///
+    /// Run manually:
+    /// `cargo test -p cloudcode-agent screencast_resize_real -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "requires a real Chrome install; run manually"]
+    async fn screencast_resize_real_changes_frame_dims() {
+        use crate::browser::chrome::ChromeManager;
+        use crate::config::BrowserConfig;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let cfg = BrowserConfig {
+            enabled: true,
+            chrome_path: None,
+            cdp_port: 19246,
+            mcp_port: 7112,
+            mcp_command: None,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(ChromeManager::new(cfg, tmp.path()));
+        mgr.start().await.expect("Chrome should start and become ready");
+        let cdp = mgr.cdp_http_url();
+
+        let data_url = "data:text/html,<body style=margin:0><h1 style=font-size:80px>RESIZE</h1>";
+        let new_url = format!("{cdp}/json/new?{data_url}");
+        let client = reqwest::Client::new();
+        let opened = match client.put(&new_url).send().await {
+            Ok(r) if r.status().is_success() => true,
+            _ => matches!(client.get(&new_url).send().await, Ok(r) if r.status().is_success()),
+        };
+        assert!(opened, "failed to open a data: page target via /json/new");
+        tokio::time::sleep(Duration::from_millis(800)).await;
+
+        let (frame_tx, mut frame_rx) = mpsc::channel::<Vec<u8>>(8);
+        let session = ScreencastSession::start(&cdp, None, frame_tx)
+            .await
+            .expect("screencast should start");
+
+        // First frame at the default viewport.
+        let frame = tokio::time::timeout(Duration::from_secs(5), frame_rx.recv())
+            .await
+            .expect("first frame within 5s")
+            .expect("frame channel");
+        assert_eq!(&frame[0..2], &[0xFF, 0xD8], "default frame must be JPEG");
+        if let Some((w, h)) = jpeg_dims(&frame) {
+            eprintln!("default frame dims: {w}×{h}");
+        }
+
+        // Resize to 800×600 and drain a few frames; assert frames keep
+        // flowing and (once Chrome applies it) shrink to ≤800×600.
+        session.resize(800, 600);
+
+        let mut shrunk = false;
+        let mut got_post_frame = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(2), frame_rx.recv()).await {
+                Ok(Some(f)) => {
+                    got_post_frame = true;
+                    assert_eq!(&f[0..2], &[0xFF, 0xD8], "post-resize frame must be JPEG");
+                    if let Some((w, h)) = jpeg_dims(&f) {
+                        eprintln!("post-resize frame dims: {w}×{h}");
+                        if w <= 800 && h <= 600 && (w >= 700 || h >= 500) {
+                            shrunk = true;
+                            break;
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(got_post_frame, "frames must keep flowing after resize");
+        eprintln!("frames kept flowing after resize; dims tracked new size: {shrunk}");
 
         session.stop().await;
         drop(mgr);

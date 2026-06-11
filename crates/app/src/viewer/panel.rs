@@ -119,6 +119,106 @@ pub struct ViewerUiOutput {
     pub input: Vec<ViewerInputEvent>,
     /// Target id of an *inactive* tab the user clicked this frame.
     pub select: Option<String>,
+    /// A debounced viewport resize `(width, height)` in logical px to forward
+    /// as `ViewerCommand::Resize`, when the panel's render area changed enough
+    /// (and the debounce window elapsed). `None` on frames with no settled
+    /// resize to emit.
+    pub resize: Option<(u32, u32)>,
+}
+
+/// Debounce window for viewport resizes, mirroring the terminal's
+/// `ResizeThrottle`: emit the first change immediately, then coalesce rapid
+/// changes (a window drag) until the wire has been quiet this long.
+const VIEWPORT_DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// Minimum change (in logical px, on either axis) before we bother sending a
+/// resize. Sub-threshold jitter (sub-pixel layout rounding) is ignored so a
+/// still panel never re-sends.
+const VIEWPORT_MIN_DELTA: u32 = 4;
+
+/// Debounce + threshold gate for viewport resize emission. Pure logic
+/// (no egui), unit-tested. Mirrors `terminal::geom::ResizeThrottle` but in
+/// `(u32, u32)` logical px and with a px-delta threshold instead of exact
+/// equality (the panel rect wobbles by fractions of a px frame to frame).
+#[derive(Debug, Clone, Default)]
+pub struct ViewportThrottle {
+    /// The last dims we actually emitted (and when).
+    last_sent: Option<((u32, u32), Instant)>,
+    /// A changed-but-not-yet-emitted size, held back by the debounce window.
+    pending: Option<(u32, u32)>,
+}
+
+/// Whether `dims` differs from `last` by more than [`VIEWPORT_MIN_DELTA`] on
+/// either axis. `None` last (never sent) always counts as changed.
+fn viewport_changed(last: Option<(u32, u32)>, dims: (u32, u32)) -> bool {
+    match last {
+        None => true,
+        Some((lw, lh)) => {
+            lw.abs_diff(dims.0) >= VIEWPORT_MIN_DELTA || lh.abs_diff(dims.1) >= VIEWPORT_MIN_DELTA
+        }
+    }
+}
+
+impl ViewportThrottle {
+    pub fn new() -> ViewportThrottle {
+        ViewportThrottle::default()
+    }
+
+    /// Feed the current panel viewport at time `now`. Returns the dims to emit
+    /// (debounced + thresholded), or `None` to suppress this frame.
+    ///
+    /// Rules (mirroring `ResizeThrottle::update`):
+    ///   * No meaningful change from last sent → `None` (clear any pending).
+    ///   * Changed, first ever OR ≥ debounce since last send → emit now.
+    ///   * Changed within the window → stash as `pending`, return `None`.
+    pub fn update(&mut self, dims: (u32, u32), now: Instant) -> Option<(u32, u32)> {
+        match self.last_sent {
+            None => {
+                self.last_sent = Some((dims, now));
+                self.pending = None;
+                Some(dims)
+            }
+            Some((last_dims, last_at)) => {
+                if !viewport_changed(Some(last_dims), dims) {
+                    self.pending = None;
+                    return None;
+                }
+                if now.duration_since(last_at) >= VIEWPORT_DEBOUNCE {
+                    self.last_sent = Some((dims, now));
+                    self.pending = None;
+                    Some(dims)
+                } else {
+                    self.pending = Some(dims);
+                    None
+                }
+            }
+        }
+    }
+
+    /// Flush a pending (debounced) size if the window has elapsed. Called on
+    /// every frame so the trailing edge of a resize lands after the drag stops.
+    pub fn flush_pending(&mut self, now: Instant) -> Option<(u32, u32)> {
+        let dims = self.pending?;
+        match self.last_sent {
+            Some((last_dims, last_at)) => {
+                if !viewport_changed(Some(last_dims), dims) {
+                    self.pending = None;
+                    None
+                } else if now.duration_since(last_at) >= VIEWPORT_DEBOUNCE {
+                    self.last_sent = Some((dims, now));
+                    self.pending = None;
+                    Some(dims)
+                } else {
+                    None
+                }
+            }
+            None => {
+                self.last_sent = Some((dims, now));
+                self.pending = None;
+                Some(dims)
+            }
+        }
+    }
 }
 
 /// Max tab label width in characters (middle-truncated beyond this).
@@ -165,6 +265,10 @@ pub struct BrowserPanel {
     /// When the last frame arrived — drives the `LIVE` badge freshness
     /// (see [`frame_is_live`]).
     last_frame: Option<Instant>,
+    /// Debounce gate for viewport-resize emission: the panel measures its
+    /// render area each frame and this decides when to actually send a
+    /// `ViewerCommand::Resize` (so a window drag doesn't flood the wire).
+    viewport_throttle: ViewportThrottle,
 }
 
 impl Default for BrowserPanel {
@@ -186,6 +290,7 @@ impl BrowserPanel {
             targets: Vec::new(),
             current: None,
             last_frame: None,
+            viewport_throttle: ViewportThrottle::new(),
         }
     }
 
@@ -217,6 +322,9 @@ impl BrowserPanel {
         self.targets.clear();
         self.current = None;
         self.last_frame = None;
+        // A fresh attach starts at the agent's default viewport, so the next
+        // measured size must be re-sent (not suppressed as "unchanged").
+        self.viewport_throttle = ViewportThrottle::new();
     }
 
     /// Replace the tab-bar model with a fresh targets list (a downlink
@@ -281,6 +389,28 @@ impl BrowserPanel {
             ui.allocate_painter(avail, egui::Sense::click_and_drag());
         let panel_rect = response.rect;
         self.focus_id = Some(response.id);
+
+        // Measure the render area (where frames are drawn) in LOGICAL px and
+        // ask the agent to reflow the page to it, debounced. We want the page
+        // to match the panel, so the target is `panel_rect`'s logical size —
+        // the agent applies it via Emulation.setDeviceMetricsOverride, after
+        // which the letterbox becomes a near-exact fit. Sub-threshold jitter
+        // and rapid drags are coalesced by `ViewportThrottle`. `update`
+        // handles the leading edge; `flush_pending` the trailing edge after a
+        // drag settles.
+        let now = Instant::now();
+        let want = (
+            panel_rect.width().round().max(0.0) as u32,
+            panel_rect.height().round().max(0.0) as u32,
+        );
+        out.resize = if want.0 == 0 || want.1 == 0 {
+            // Zero-area (panel collapsed / not laid out yet) — never send.
+            None
+        } else {
+            self.viewport_throttle
+                .update(want, now)
+                .or_else(|| self.viewport_throttle.flush_pending(now))
+        };
 
         // Backdrop: a dark fill so the letterbox bars read as "outside the
         // page" rather than transparent gaps. Theme token, not a one-off.
@@ -1312,5 +1442,68 @@ mod tests {
     fn decode_garbage_returns_none() {
         assert!(decode_jpeg_to_rgba(b"not a jpeg at all").is_none());
         assert!(decode_jpeg_to_rgba(&[]).is_none());
+    }
+
+    // ---- ViewportThrottle (mirrors terminal ResizeThrottle, px-delta gate) --
+
+    #[test]
+    fn viewport_changed_threshold() {
+        assert!(viewport_changed(None, (800, 600)), "first ever → changed");
+        // Below the min delta on both axes → unchanged.
+        assert!(!viewport_changed(Some((800, 600)), (803, 602)));
+        assert!(!viewport_changed(Some((800, 600)), (797, 598)));
+        // At/over the threshold on either axis → changed.
+        assert!(viewport_changed(Some((800, 600)), (804, 600)));
+        assert!(viewport_changed(Some((800, 600)), (800, 596)));
+    }
+
+    #[test]
+    fn throttle_first_resize_emits_immediately() {
+        let mut t = ViewportThrottle::new();
+        let t0 = Instant::now();
+        assert_eq!(t.update((800, 600), t0), Some((800, 600)));
+    }
+
+    #[test]
+    fn throttle_suppresses_subthreshold_jitter() {
+        let mut t = ViewportThrottle::new();
+        let t0 = Instant::now();
+        assert_eq!(t.update((800, 600), t0), Some((800, 600)));
+        // A 2px wobble well past the window is still ignored.
+        assert_eq!(
+            t.update((802, 601), t0 + Duration::from_secs(1)),
+            None,
+            "sub-threshold change must not emit"
+        );
+    }
+
+    #[test]
+    fn throttle_debounces_then_flushes_trailing() {
+        let mut t = ViewportThrottle::new();
+        let t0 = Instant::now();
+        assert_eq!(t.update((800, 600), t0), Some((800, 600)));
+        // A real change too soon → stashed, not emitted.
+        assert_eq!(t.update((900, 700), t0 + Duration::from_millis(10)), None);
+        // Still inside the window → flush is a no-op.
+        assert_eq!(t.flush_pending(t0 + Duration::from_millis(20)), None);
+        // Past the window → the trailing edge lands.
+        assert_eq!(
+            t.flush_pending(t0 + Duration::from_millis(120)),
+            Some((900, 700))
+        );
+        // Nothing pending now.
+        assert_eq!(t.flush_pending(t0 + Duration::from_millis(300)), None);
+    }
+
+    #[test]
+    fn throttle_emits_change_after_window_elapses() {
+        let mut t = ViewportThrottle::new();
+        let t0 = Instant::now();
+        assert_eq!(t.update((800, 600), t0), Some((800, 600)));
+        // A change after the window emits immediately on update.
+        assert_eq!(
+            t.update((1000, 800), t0 + Duration::from_millis(150)),
+            Some((1000, 800))
+        );
     }
 }

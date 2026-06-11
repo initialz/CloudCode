@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "14";
+pub const PROTOCOL_VERSION: &str = "15";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
@@ -545,6 +545,17 @@ pub enum ServerMsg {
     ViewerSelectTarget {
         viewer_session_id: Uuid,
         target_id: String,
+    },
+    /// Resize this viewer's browser viewport so the page reflows to the
+    /// app panel's aspect ratio (no more letterbox bars). `width`/`height`
+    /// are the device-independent CSS px the page should render at (the
+    /// panel's logical size); the agent applies them via CDP
+    /// `Emulation.setDeviceMetricsOverride` plus a sized screencast and
+    /// clamps them to sane bounds (200..=4096). New in protocol v15.
+    ViewerResize {
+        viewer_session_id: Uuid,
+        width: u32,
+        height: u32,
     },
 }
 

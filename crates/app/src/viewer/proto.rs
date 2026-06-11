@@ -49,6 +49,7 @@ pub enum ViewerDownlinkText {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ControlUplink<'a> {
     SelectTarget { target_id: &'a str },
+    Resize { width: u32, height: u32 },
 }
 
 /// Serialize a tab-switch request into the exact uplink Text shape the
@@ -57,6 +58,15 @@ enum ControlUplink<'a> {
 pub fn select_target_json(target_id: &str) -> String {
     serde_json::to_string(&ControlUplink::SelectTarget { target_id })
         .expect("select_target serialization cannot fail")
+}
+
+/// Serialize a viewport-resize request into the exact uplink Text shape the
+/// hub's `parse_viewer_uplink` accepts:
+/// `{"kind":"resize","width":…,"height":…}`. `width`/`height` are the panel's
+/// logical (device-independent) px the agent should reflow the page to.
+pub fn resize_json(width: u32, height: u32) -> String {
+    serde_json::to_string(&ControlUplink::Resize { width, height })
+        .expect("resize serialization cannot fail")
 }
 
 /// A single user-input event for the browser viewer, expressed in
@@ -246,6 +256,16 @@ mod tests {
         assert_eq!(
             select_target_json("ABC123"),
             r#"{"kind":"select_target","target_id":"ABC123"}"#
+        );
+    }
+
+    #[test]
+    fn resize_json_exact_shape() {
+        // Byte-exact: precisely what `hub::parse_viewer_uplink`'s
+        // `uplink_parses_resize` test feeds in.
+        assert_eq!(
+            resize_json(800, 600),
+            r#"{"kind":"resize","width":800,"height":600}"#
         );
     }
 }

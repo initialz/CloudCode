@@ -23,7 +23,9 @@
 //! whether to reconnect. `ViewerCommand::Close` drops the ws; the hub fires
 //! `ViewerDetach` agent-side on disconnect, stopping the screencast.
 
-use crate::viewer::proto::{select_target_json, TargetInfo, ViewerDownlinkText, ViewerInputEvent};
+use crate::viewer::proto::{
+    resize_json, select_target_json, TargetInfo, ViewerDownlinkText, ViewerInputEvent,
+};
 use anyhow::{anyhow, Result};
 use futures::{SinkExt, StreamExt};
 use std::sync::mpsc::{Receiver, Sender};
@@ -38,6 +40,10 @@ pub enum ViewerCommand {
     /// Switch the screencast to another CDP target (a tab-bar click). Sent
     /// up as the `{"kind":"select_target","target_id":…}` Text frame.
     SelectTarget(String),
+    /// Resize the remote browser viewport to the panel's logical px so the
+    /// page reflows to the panel's aspect ratio. Sent up as the
+    /// `{"kind":"resize","width":…,"height":…}` Text frame.
+    Resize { width: u32, height: u32 },
     /// Tear the viewer ws down (panel hidden / app quitting). Dropping the
     /// socket makes the hub send `ViewerDetach` to the agent.
     Close,
@@ -240,6 +246,12 @@ async fn event_loop<S>(
                             // Tab switch: the exact uplink shape the hub's
                             // `parse_viewer_uplink` accepts.
                             if ws.send(Message::Text(select_target_json(&id))).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(ViewerCommand::Resize { width, height }) => {
+                            // Panel resize: reflow the remote page to match.
+                            if ws.send(Message::Text(resize_json(width, height))).await.is_err() {
                                 return;
                             }
                         }

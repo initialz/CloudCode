@@ -276,6 +276,20 @@ where
                         viewers.select_target(viewer_session_id, target_id).await;
                     });
                 }
+                Ok(ServerMsg::ViewerResize {
+                    viewer_session_id,
+                    width,
+                    height,
+                }) => {
+                    // Reflow the page + restart the screencast at the panel's
+                    // size. Touches the screencast cmd channel (and remembers
+                    // the size on the viewer) — spawn so the read loop never
+                    // blocks.
+                    let viewers = viewers.clone();
+                    tokio::spawn(async move {
+                        viewers.resize(viewer_session_id, width, height).await;
+                    });
+                }
                 // Stateful, ordered frames (the FsWriteInit → FsWriteChunk…
                 // → eof upload sequence) MUST run in arrival order. Spawning
                 // a task per frame (below) races them: a chunk handled before

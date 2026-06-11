@@ -517,7 +517,8 @@ impl PtyManager {
             ServerMsg::ViewerAttach { .. }
             | ServerMsg::ViewerDetach { .. }
             | ServerMsg::ViewerInput { .. }
-            | ServerMsg::ViewerSelectTarget { .. } => {}
+            | ServerMsg::ViewerSelectTarget { .. }
+            | ServerMsg::ViewerResize { .. } => {}
         }
     }
 

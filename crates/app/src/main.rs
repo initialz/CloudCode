@@ -840,6 +840,9 @@ impl App {
             if let Some(target_id) = output.select {
                 let _ = handle.cmd_tx.send(ViewerCommand::SelectTarget(target_id));
             }
+            if let Some((width, height)) = output.resize {
+                let _ = handle.cmd_tx.send(ViewerCommand::Resize { width, height });
+            }
         }
     }
 }

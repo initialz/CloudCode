@@ -122,6 +122,9 @@ pub fn parse_viewer_input(text: &str) -> Option<ViewerInputEvent> {
 pub enum ViewerUplink {
     Input(ViewerInputEvent),
     SelectTarget { target_id: String },
+    /// The app's panel measured its pixel size and wants the agent's page
+    /// to reflow to it. Relayed as `ServerMsg::ViewerResize`.
+    Resize { width: u32, height: u32 },
 }
 
 /// The non-input uplink kinds, parsed with the same serde conventions as
@@ -130,6 +133,7 @@ pub enum ViewerUplink {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ControlUplink {
     SelectTarget { target_id: String },
+    Resize { width: u32, height: u32 },
 }
 
 /// Parse any uplink text frame. Input kinds keep their exact pre-P6
@@ -141,6 +145,7 @@ pub fn parse_viewer_uplink(text: &str) -> Option<ViewerUplink> {
     }
     match serde_json::from_str::<ControlUplink>(text).ok()? {
         ControlUplink::SelectTarget { target_id } => Some(ViewerUplink::SelectTarget { target_id }),
+        ControlUplink::Resize { width, height } => Some(ViewerUplink::Resize { width, height }),
     }
 }
 
@@ -342,6 +347,13 @@ async fn relay_loop<Si, St>(
                                     target_id,
                                 }
                             }
+                            Some(ViewerUplink::Resize { width, height }) => {
+                                ServerMsg::ViewerResize {
+                                    viewer_session_id,
+                                    width,
+                                    height,
+                                }
+                            }
                             None => {
                                 tracing::debug!(viewer = %viewer_session_id, "unparseable viewer uplink frame; ignoring");
                                 continue;
@@ -468,12 +480,28 @@ mod tests {
     }
 
     #[test]
+    fn uplink_parses_resize() {
+        let got = parse_viewer_uplink(r#"{"kind":"resize","width":800,"height":600}"#).unwrap();
+        assert_eq!(
+            got,
+            ViewerUplink::Resize {
+                width: 800,
+                height: 600
+            }
+        );
+    }
+
+    #[test]
     fn uplink_garbage_is_none() {
         assert!(parse_viewer_uplink("not json").is_none());
         assert!(parse_viewer_uplink("{}").is_none());
         assert!(parse_viewer_uplink(r#"{"kind":"nope"}"#).is_none());
         // select_target missing its required field.
         assert!(parse_viewer_uplink(r#"{"kind":"select_target"}"#).is_none());
+        // resize with missing / malformed fields → None (ignored).
+        assert!(parse_viewer_uplink(r#"{"kind":"resize","width":800}"#).is_none());
+        assert!(parse_viewer_uplink(r#"{"kind":"resize"}"#).is_none());
+        assert!(parse_viewer_uplink(r#"{"kind":"resize","width":-5,"height":600}"#).is_none());
         assert!(parse_viewer_uplink("").is_none());
     }
 

@@ -31,7 +31,7 @@
 use crate::browser::chrome::ChromeManager;
 use crate::browser::mcp_endpoint::EndpointState;
 use crate::browser::screencast::{
-    page_ws_url, pick_page_entry_for_session, ScreencastSession, TargetWatcher,
+    page_ws_url, pick_page_entry_for_session, ScreencastSession, TargetWatcher, Viewport,
 };
 use crate::pty::OutFrame;
 use crate::tunnel::{pack_pty_frame, ClientMsg, TargetInfo, ViewerInputEvent, TAG_SCREENCAST_FRAME};
@@ -71,6 +71,11 @@ struct ViewerInner {
     /// (select vs auto-select). `input` uses `try_lock` and drops the event
     /// during a switch (momentary; input lag beats blocking the read loop).
     stream: tokio::sync::Mutex<StreamSlot>,
+    /// The viewer's desired browser viewport (CSS px), set by `ViewerResize`.
+    /// Stored at the viewer level (not the screencast) so a tab switch
+    /// re-applies the current size to the freshly-started screencast instead
+    /// of snapping back to the default. `std::sync::Mutex` (no await held).
+    viewport: std::sync::Mutex<Viewport>,
     /// The per-connection sender to the ws writer task (agent → hub).
     tx: mpsc::Sender<OutFrame>,
     /// Set by a deliberate teardown ([`ViewerEntry::shutdown`] — detach or
@@ -100,7 +105,12 @@ impl ViewerInner {
             );
             return false;
         };
-        let new = match ScreencastSession::start_on_target(&ws_url, self.frame_tx.clone()).await {
+        // Re-apply the viewer's current viewport so a tab switch keeps the
+        // panel-sized page instead of reverting to the default.
+        let vp = self.current_viewport();
+        let new = match ScreencastSession::start_on_target_sized(&ws_url, self.frame_tx.clone(), vp)
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 tracing::warn!(
@@ -130,6 +140,22 @@ impl ViewerInner {
     /// The target id currently being screencast, if any.
     async fn current_target(&self) -> Option<String> {
         self.stream.lock().await.as_ref().map(|(id, _)| id.clone())
+    }
+
+    /// The viewer's current desired viewport.
+    fn current_viewport(&self) -> Viewport {
+        *self.viewport.lock().expect("viewport lock")
+    }
+
+    /// Apply a viewer resize: clamp, remember it (so a future tab switch
+    /// re-applies it), and forward to the live screencast (no-op if idle —
+    /// the next `start_on_target_sized` picks up the remembered viewport).
+    async fn resize(&self, width: u32, height: u32) {
+        let vp = Viewport::clamped(width, height);
+        *self.viewport.lock().expect("viewport lock") = vp;
+        if let Some((_, session)) = self.stream.lock().await.as_ref() {
+            session.resize(vp.width, vp.height);
+        }
     }
 }
 
@@ -238,6 +264,7 @@ impl ViewerManager {
             cdp_http_url: cdp_http_url.clone(),
             frame_tx: frame_tx.clone(),
             stream: tokio::sync::Mutex::new(None),
+            viewport: std::sync::Mutex::new(Viewport::default()),
             tx: self.tx.clone(),
             detached: AtomicBool::new(false),
         });
@@ -354,6 +381,22 @@ impl ViewerManager {
                 tracing::debug!(viewer = %viewer_session_id, "input during target switch; dropping");
             }
         };
+    }
+
+    /// Apply a viewer viewport resize (the app panel measured its size). The
+    /// page reflows to `width×height` CSS px and the screencast frames arrive
+    /// at the matching aspect ratio. Remembered per-viewer so a later tab
+    /// switch re-applies it. No-op for an unknown viewer.
+    pub async fn resize(&self, viewer_session_id: Uuid, width: u32, height: u32) {
+        let Some(inner) = self
+            .sessions
+            .get(&viewer_session_id)
+            .map(|e| Arc::clone(&e.inner))
+        else {
+            tracing::debug!(viewer = %viewer_session_id, "resize for unknown viewer; dropping");
+            return;
+        };
+        inner.resize(width, height).await;
     }
 
     /// Stop and remove everything for `viewer_session_id`: the forwarder, the
@@ -521,6 +564,7 @@ mod tests {
             cdp_http_url: "http://127.0.0.1:1".into(), // never dialed in these tests
             frame_tx,
             stream: tokio::sync::Mutex::new(None),
+            viewport: std::sync::Mutex::new(Viewport::default()),
             tx: out_tx,
             detached: AtomicBool::new(false),
         })

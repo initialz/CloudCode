@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "14";
+pub const PROTOCOL_VERSION: &str = "15";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
@@ -569,6 +569,17 @@ pub enum ServerMsg {
         viewer_session_id: Uuid,
         target_id: String,
     },
+    /// Resize this viewer's browser viewport so the page reflows to the
+    /// app panel's aspect ratio (no more letterbox bars). `width`/`height`
+    /// are the device-independent CSS px the page should render at (the
+    /// panel's logical size); the agent applies them via CDP
+    /// `Emulation.setDeviceMetricsOverride` plus a sized screencast and
+    /// clamps them to sane bounds (200..=4096). New in protocol v15.
+    ViewerResize {
+        viewer_session_id: Uuid,
+        width: u32,
+        height: u32,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -843,6 +854,28 @@ mod tests {
             back,
             ServerMsg::ViewerSelectTarget { viewer_session_id, ref target_id }
                 if viewer_session_id == vid && target_id == "ABCDEF0123456789"
+        ));
+    }
+
+    #[test]
+    fn viewer_resize_roundtrip() {
+        let vid = Uuid::new_v4();
+        let msg = ServerMsg::ViewerResize {
+            viewer_session_id: vid,
+            width: 800,
+            height: 600,
+        };
+        let s = serde_json::to_string(&msg).unwrap();
+        let v: Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["type"], "viewer_resize");
+        assert_eq!(v["viewer_session_id"], vid.to_string());
+        assert_eq!(v["width"], 800);
+        assert_eq!(v["height"], 600);
+        let back: ServerMsg = serde_json::from_str(&s).unwrap();
+        assert!(matches!(
+            back,
+            ServerMsg::ViewerResize { viewer_session_id, width, height }
+                if viewer_session_id == vid && width == 800 && height == 600
         ));
     }
 }
