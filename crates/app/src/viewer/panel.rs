@@ -388,16 +388,19 @@ impl BrowserPanel {
             return None;
         }
         let mut clicked: Option<String> = None;
-        egui::Frame::none()
+        egui::Frame::new()
             .fill(crate::theme::BG1)
-            .inner_margin(egui::Margin::symmetric(crate::theme::SP_1, crate::theme::SP_1))
+            .inner_margin(egui::Margin::symmetric(
+                crate::theme::SP_1 as i8,
+                crate::theme::SP_1 as i8,
+            ))
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 // Horizontal scroll (id-salted: the split layout can host
                 // other scroll areas) so many tabs scroll instead of
                 // clipping off the strip's right edge.
                 egui::ScrollArea::horizontal()
-                    .id_source("viewer_tab_strip")
+                    .id_salt("viewer_tab_strip")
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = crate::theme::SP_1;

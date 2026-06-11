@@ -22,8 +22,8 @@ tokio-tungstenite.workspace = true
 rustls.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-eframe = "0.28"
-egui = "0.28"
+eframe = "0.32"
+egui = "0.32"
 alacritty_terminal = { workspace = true }
 unicode-width = { workspace = true }
 zune-jpeg = { workspace = true }

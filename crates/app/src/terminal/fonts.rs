@@ -114,7 +114,7 @@ pub fn install_cjk_font(ctx: &egui::Context) {
     const NAME: &str = "cjk_fallback";
     fonts.font_data.insert(
         NAME.to_owned(),
-        egui::FontData::from_owned(bytes),
+        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
     );
     // Append (not insert-at-0) so it's the LAST resort: ASCII keeps the
     // built-in face; CJK codepoints fall through to this.

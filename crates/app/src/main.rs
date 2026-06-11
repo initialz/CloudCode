@@ -498,9 +498,9 @@ impl App {
             return;
         }
 
-        egui::Frame::none()
+        egui::Frame::new()
             .fill(theme::BG2)
-            .rounding(theme::RADIUS)
+            .corner_radius(theme::RADIUS)
             .inner_margin(theme::SP_2)
             .show(ui, |ui| {
                 ui.add(
@@ -514,7 +514,7 @@ impl App {
                         self.new_agent = a.name.clone();
                     }
                 }
-                egui::ComboBox::from_id_source("new_ws_agent")
+                egui::ComboBox::from_id_salt("new_ws_agent")
                     .width(ui.available_width())
                     .selected_text(if self.new_agent.is_empty() {
                         "(no agents online)".to_string()
@@ -606,9 +606,12 @@ impl App {
         // area (replaces P3's full-screen reconnecting page — the model,
         // sidebar and panels all stay up).
         if reconnecting {
-            egui::Frame::none()
+            egui::Frame::new()
                 .fill(theme::WARN.linear_multiply(0.22))
-                .inner_margin(egui::Margin::symmetric(theme::SP_3, theme::SP_1 + 2.0))
+                .inner_margin(egui::Margin::symmetric(
+                    theme::SP_3 as i8,
+                    (theme::SP_1 + 2.0) as i8,
+                ))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
@@ -630,9 +633,12 @@ impl App {
 
         // Transient error toast (failed open/create/reopen).
         if let Some(err) = self.model.error.clone() {
-            egui::Frame::none()
+            egui::Frame::new()
                 .fill(theme::ERR.linear_multiply(0.18))
-                .inner_margin(egui::Margin::symmetric(theme::SP_3, theme::SP_1 + 2.0))
+                .inner_margin(egui::Margin::symmetric(
+                    theme::SP_3 as i8,
+                    (theme::SP_1 + 2.0) as i8,
+                ))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
@@ -775,6 +781,9 @@ impl App {
                     panel_rect.shrink(1.0),
                     theme::RADIUS,
                     egui::Stroke::new(2.0, theme::ACCENT),
+                    // Middle matches the pre-0.32 default stroke placement,
+                    // which the 1px shrink above was tuned for.
+                    egui::StrokeKind::Middle,
                 );
             }
             out
@@ -915,10 +924,10 @@ fn workspace_row(
             egui::pos2(rect.max.x - 52.0, rect.min.y),
             rect.max,
         );
-        let mut icons_ui = ui.child_ui(
-            icons_rect,
-            egui::Layout::right_to_left(egui::Align::Center),
-            None,
+        let mut icons_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(icons_rect)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
         );
         if icons_ui
             .small_button("🗑")
@@ -1020,16 +1029,16 @@ impl eframe::App for App {
             .default_width(theme::SIDEBAR_W)
             .min_width(160.0)
             .frame(
-                egui::Frame::none()
+                egui::Frame::new()
                     .fill(theme::BG1)
-                    .inner_margin(egui::Margin::symmetric(theme::SP_2, theme::SP_1)),
+                    .inner_margin(egui::Margin::symmetric(theme::SP_2 as i8, theme::SP_1 as i8)),
             )
             .show(ctx, |ui| {
                 self.render_sidebar(ui);
             });
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(theme::BG0))
+            .frame(egui::Frame::new().fill(theme::BG0))
             .show(ctx, |ui| {
                 self.render_content(ui);
             });

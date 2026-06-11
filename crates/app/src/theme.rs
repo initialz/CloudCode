@@ -74,56 +74,56 @@ pub fn apply(ctx: &egui::Context) {
     v.selection.bg_fill = ACCENT.linear_multiply(0.35);
     v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
 
-    v.window_rounding = egui::Rounding::same(RADIUS);
-    v.menu_rounding = egui::Rounding::same(RADIUS);
+    v.window_corner_radius = egui::CornerRadius::same(RADIUS as u8);
+    v.menu_corner_radius = egui::CornerRadius::same(RADIUS as u8);
     v.window_stroke = egui::Stroke::new(1.0, BORDER);
     v.popup_shadow = egui::epaint::Shadow {
-        offset: egui::vec2(0.0, 2.0),
-        blur: 8.0,
-        spread: 0.0,
+        offset: [0, 2],
+        blur: 8,
+        spread: 0,
         color: Color32::from_black_alpha(96),
     };
 
     // Widget states: flat fills off the layer scale, BORDER hairlines,
     // accent only on active/selected.
-    let rounding = egui::Rounding::same(RADIUS);
+    let corner_radius = egui::CornerRadius::same(RADIUS as u8);
     let w = &mut v.widgets;
     w.noninteractive.bg_fill = BG1;
     w.noninteractive.weak_bg_fill = BG1;
     w.noninteractive.bg_stroke = egui::Stroke::new(1.0, BORDER); // separators
     w.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT_MUTED);
-    w.noninteractive.rounding = rounding;
+    w.noninteractive.corner_radius = corner_radius;
 
     w.inactive.bg_fill = BG2;
     w.inactive.weak_bg_fill = BG2;
     w.inactive.bg_stroke = egui::Stroke::new(1.0, BORDER);
     w.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT);
-    w.inactive.rounding = rounding;
+    w.inactive.corner_radius = corner_radius;
 
     w.hovered.bg_fill = BG_HOVER;
     w.hovered.weak_bg_fill = BG_HOVER;
     w.hovered.bg_stroke = egui::Stroke::new(1.0, TEXT_FAINT);
     w.hovered.fg_stroke = egui::Stroke::new(1.5, TEXT);
-    w.hovered.rounding = rounding;
+    w.hovered.corner_radius = corner_radius;
 
     w.active.bg_fill = BG_ACTIVE;
     w.active.weak_bg_fill = BG_ACTIVE;
     w.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
     w.active.fg_stroke = egui::Stroke::new(1.5, TEXT);
-    w.active.rounding = rounding;
+    w.active.corner_radius = corner_radius;
 
     w.open.bg_fill = BG2;
     w.open.weak_bg_fill = BG2;
     w.open.bg_stroke = egui::Stroke::new(1.0, BORDER);
     w.open.fg_stroke = egui::Stroke::new(1.0, TEXT);
-    w.open.rounding = rounding;
+    w.open.corner_radius = corner_radius;
 
     // -- Spacing (the 4/8/12/16 scale) --
     let s = &mut style.spacing;
     s.item_spacing = egui::vec2(SP_2, SP_1 + 2.0);
     s.button_padding = egui::vec2(SP_2, SP_1);
-    s.menu_margin = egui::Margin::same(SP_2);
-    s.window_margin = egui::Margin::same(SP_3);
+    s.menu_margin = egui::Margin::same(SP_2 as i8);
+    s.window_margin = egui::Margin::same(SP_3 as i8);
     s.indent = SP_4;
     // Subtle scrollbar: thin, no background, only visible on hover/use.
     s.scroll.bar_width = 6.0;
@@ -154,7 +154,10 @@ mod tests {
             style.visuals.widgets.noninteractive.bg_stroke.color,
             BORDER
         );
-        assert_eq!(style.visuals.window_rounding, egui::Rounding::same(RADIUS));
+        assert_eq!(
+            style.visuals.window_corner_radius,
+            egui::CornerRadius::same(RADIUS as u8)
+        );
         assert!(style.spacing.scroll.floating, "scrollbar stays subtle");
     }
 }
