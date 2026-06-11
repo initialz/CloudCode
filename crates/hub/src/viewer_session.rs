@@ -381,7 +381,30 @@ mod tests {
     #[test]
     fn parse_mouse_move() {
         let ev = parse_viewer_input(r#"{"kind":"mouse_move","x":10.5,"y":20.0}"#).unwrap();
-        assert_eq!(ev, ViewerInputEvent::MouseMove { x: 10.5, y: 20.0 });
+        // `buttons` omitted by an older viewer → defaults to 0 (hover).
+        assert_eq!(
+            ev,
+            ViewerInputEvent::MouseMove {
+                x: 10.5,
+                y: 20.0,
+                buttons: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_mouse_move_with_buttons() {
+        // A drag move carries the held-button bitmask through verbatim.
+        let ev =
+            parse_viewer_input(r#"{"kind":"mouse_move","x":10.5,"y":20.0,"buttons":1}"#).unwrap();
+        assert_eq!(
+            ev,
+            ViewerInputEvent::MouseMove {
+                x: 10.5,
+                y: 20.0,
+                buttons: 1,
+            }
+        );
     }
 
     #[test]
@@ -398,6 +421,7 @@ mod tests {
                 button: "left".into(),
                 down: true,
                 click_count: 1,
+                buttons: 0,
             }
         );
     }
@@ -459,7 +483,11 @@ mod tests {
         let got = parse_viewer_uplink(r#"{"kind":"mouse_move","x":10.5,"y":20.0}"#).unwrap();
         assert_eq!(
             got,
-            ViewerUplink::Input(ViewerInputEvent::MouseMove { x: 10.5, y: 20.0 })
+            ViewerUplink::Input(ViewerInputEvent::MouseMove {
+                x: 10.5,
+                y: 20.0,
+                buttons: 0,
+            })
         );
         let got = parse_viewer_uplink(r#"{"kind":"insert_text","text":"你好"}"#).unwrap();
         assert_eq!(

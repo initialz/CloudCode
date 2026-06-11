@@ -76,8 +76,16 @@ pub fn resize_json(width: u32, height: u32) -> String {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ViewerInputEvent {
-    /// Pointer moved (no button change).
-    MouseMove { x: f64, y: f64 },
+    /// Pointer moved. `buttons` is the CDP held-button bitmask
+    /// (Left=1, Right=2, Middle=4) currently pressed — non-zero means a
+    /// drag (so Chrome tracks it instead of treating it as a hover).
+    /// `#[serde(default)]` keeps pre-v16 peers wire-compatible (0 = hover).
+    MouseMove {
+        x: f64,
+        y: f64,
+        #[serde(default)]
+        buttons: u32,
+    },
     /// A mouse button went down or up at `(x, y)`.
     MouseButton {
         x: f64,
@@ -88,6 +96,9 @@ pub enum ViewerInputEvent {
         down: bool,
         /// CDP `clickCount` (1 = single, 2 = double, …).
         click_count: u32,
+        /// CDP held-button bitmask AFTER this event.
+        #[serde(default)]
+        buttons: u32,
     },
     /// Scroll wheel; `dx`/`dy` are CDP deltaX/deltaY.
     Wheel { x: f64, y: f64, dx: f64, dy: f64 },
@@ -125,8 +136,12 @@ mod tests {
     #[test]
     fn json_roundtrip_mouse_move() {
         pin(
-            &ViewerInputEvent::MouseMove { x: 10.5, y: 20.0 },
-            r#"{"kind":"mouse_move","x":10.5,"y":20.0}"#,
+            &ViewerInputEvent::MouseMove {
+                x: 10.5,
+                y: 20.0,
+                buttons: 1,
+            },
+            r#"{"kind":"mouse_move","x":10.5,"y":20.0,"buttons":1}"#,
         );
     }
 
@@ -139,8 +154,40 @@ mod tests {
                 button: "left".into(),
                 down: true,
                 click_count: 1,
+                buttons: 1,
             },
+            r#"{"kind":"mouse_button","x":1.0,"y":2.0,"button":"left","down":true,"click_count":1,"buttons":1}"#,
+        );
+    }
+
+    /// Back-compat: a pre-v16 peer omits `buttons`; `#[serde(default)]`
+    /// fills 0 (hover / no held buttons).
+    #[test]
+    fn mouse_events_default_buttons_when_absent() {
+        let mv: ViewerInputEvent =
+            serde_json::from_str(r#"{"kind":"mouse_move","x":1.0,"y":2.0}"#).unwrap();
+        assert_eq!(
+            mv,
+            ViewerInputEvent::MouseMove {
+                x: 1.0,
+                y: 2.0,
+                buttons: 0,
+            }
+        );
+        let mb: ViewerInputEvent = serde_json::from_str(
             r#"{"kind":"mouse_button","x":1.0,"y":2.0,"button":"left","down":true,"click_count":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            mb,
+            ViewerInputEvent::MouseButton {
+                x: 1.0,
+                y: 2.0,
+                button: "left".into(),
+                down: true,
+                click_count: 1,
+                buttons: 0,
+            }
         );
     }
 

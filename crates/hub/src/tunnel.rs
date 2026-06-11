@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "15";
+pub const PROTOCOL_VERSION: &str = "16";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
@@ -49,8 +49,17 @@ pub fn unpack_pty_frame(buf: &[u8]) -> Option<(u8, Uuid, &[u8])> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ViewerInputEvent {
-    /// Pointer moved (no button change).
-    MouseMove { x: f64, y: f64 },
+    /// Pointer moved. `buttons` is the CDP held-button bitmask
+    /// (Left=1, Right=2, Middle=4) of buttons currently pressed — non-zero
+    /// means a drag in progress, so Chrome tracks the move instead of
+    /// treating it as a bare hover. `#[serde(default)]` keeps pre-v16
+    /// peers (which omit it) wire-compatible: absent → 0 → hover.
+    MouseMove {
+        x: f64,
+        y: f64,
+        #[serde(default)]
+        buttons: u32,
+    },
     /// A mouse button went down or up at `(x, y)`.
     MouseButton {
         x: f64,
@@ -61,6 +70,11 @@ pub enum ViewerInputEvent {
         down: bool,
         /// CDP `clickCount` (1 = single, 2 = double, …).
         click_count: u32,
+        /// CDP held-button bitmask AFTER this event (the full set of
+        /// buttons pressed once the press/release is applied). Defaults
+        /// to 0 for pre-v16 peers.
+        #[serde(default)]
+        buttons: u32,
     },
     /// Scroll wheel; `dx`/`dy` are CDP deltaX/deltaY.
     Wheel { x: f64, y: f64, dx: f64, dy: f64 },

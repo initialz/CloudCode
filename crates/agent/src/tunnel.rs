@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "15";
+pub const PROTOCOL_VERSION: &str = "16";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
@@ -49,8 +49,17 @@ pub fn unpack_pty_frame(buf: &[u8]) -> Option<(u8, Uuid, &[u8])> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ViewerInputEvent {
-    /// Pointer moved (no button change).
-    MouseMove { x: f64, y: f64 },
+    /// Pointer moved. `buttons` is the CDP held-button bitmask
+    /// (Left=1, Right=2, Middle=4) of buttons currently pressed — non-zero
+    /// means a drag in progress, so Chrome tracks the move instead of
+    /// treating it as a bare hover. `#[serde(default)]` keeps pre-v16
+    /// peers (which omit it) wire-compatible: absent → 0 → hover.
+    MouseMove {
+        x: f64,
+        y: f64,
+        #[serde(default)]
+        buttons: u32,
+    },
     /// A mouse button went down or up at `(x, y)`.
     MouseButton {
         x: f64,
@@ -61,6 +70,11 @@ pub enum ViewerInputEvent {
         down: bool,
         /// CDP `clickCount` (1 = single, 2 = double, …).
         click_count: u32,
+        /// CDP held-button bitmask AFTER this event (the full set of
+        /// buttons pressed once the press/release is applied). Defaults
+        /// to 0 for pre-v16 peers.
+        #[serde(default)]
+        buttons: u32,
     },
     /// Scroll wheel; `dx`/`dy` are CDP deltaX/deltaY.
     Wheel { x: f64, y: f64, dx: f64, dy: f64 },
@@ -654,13 +668,18 @@ mod tests {
     fn viewer_input_roundtrip_all_variants() {
         let vid = Uuid::new_v4();
         let events = vec![
-            ViewerInputEvent::MouseMove { x: 1.0, y: 2.0 },
+            ViewerInputEvent::MouseMove {
+                x: 1.0,
+                y: 2.0,
+                buttons: 1,
+            },
             ViewerInputEvent::MouseButton {
                 x: 3.0,
                 y: 4.0,
                 button: "left".into(),
                 down: true,
                 click_count: 2,
+                buttons: 1,
             },
             ViewerInputEvent::Wheel {
                 x: 5.0,
@@ -708,7 +727,11 @@ mod tests {
         // Lock the snake_case `kind` discriminants the JS viewer emits.
         let cases = [
             (
-                ViewerInputEvent::MouseMove { x: 0.0, y: 0.0 },
+                ViewerInputEvent::MouseMove {
+                    x: 0.0,
+                    y: 0.0,
+                    buttons: 0,
+                },
                 "mouse_move",
             ),
             (
@@ -718,6 +741,7 @@ mod tests {
                     button: "left".into(),
                     down: true,
                     click_count: 1,
+                    buttons: 1,
                 },
                 "mouse_button",
             ),
@@ -749,6 +773,36 @@ mod tests {
             let v: Value = serde_json::from_str(&serde_json::to_string(&ev).unwrap()).unwrap();
             assert_eq!(v["kind"], kind);
         }
+    }
+
+    #[test]
+    fn viewer_input_buttons_default_when_absent() {
+        // Pre-v16 peers omit `buttons`; `#[serde(default)]` fills 0 (hover).
+        let mv: ViewerInputEvent =
+            serde_json::from_str(r#"{"kind":"mouse_move","x":1.0,"y":2.0}"#).unwrap();
+        assert_eq!(
+            mv,
+            ViewerInputEvent::MouseMove {
+                x: 1.0,
+                y: 2.0,
+                buttons: 0,
+            }
+        );
+        let mb: ViewerInputEvent = serde_json::from_str(
+            r#"{"kind":"mouse_button","x":1.0,"y":2.0,"button":"left","down":true,"click_count":1}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            mb,
+            ViewerInputEvent::MouseButton {
+                x: 1.0,
+                y: 2.0,
+                button: "left".into(),
+                down: true,
+                click_count: 1,
+                buttons: 0,
+            }
+        );
     }
 
     #[test]

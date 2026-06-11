@@ -741,13 +741,27 @@ mod tests {
         // Inject viewer input down the same path the hub relay uses: a mouse
         // move and an IME InsertText (Chinese). Must not panic; must NOT trip a
         // ViewerClosed error on the channel.
-        manager.input(viewer_session_id, &ViewerInputEvent::MouseMove { x: 20.0, y: 20.0 });
+        manager.input(
+            viewer_session_id,
+            &ViewerInputEvent::MouseMove {
+                x: 20.0,
+                y: 20.0,
+                buttons: 0,
+            },
+        );
         manager.input(
             viewer_session_id,
             &ViewerInputEvent::InsertText { text: "你好".into() },
         );
         // Input to an unknown viewer is a harmless no-op (no panic).
-        manager.input(Uuid::new_v4(), &ViewerInputEvent::MouseMove { x: 0.0, y: 0.0 });
+        manager.input(
+            Uuid::new_v4(),
+            &ViewerInputEvent::MouseMove {
+                x: 0.0,
+                y: 0.0,
+                buttons: 0,
+            },
+        );
 
         // Drain briefly: confirm the channel is still alive and hasn't surfaced
         // an error ViewerClosed off the input path.

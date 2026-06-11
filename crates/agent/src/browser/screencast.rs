@@ -237,10 +237,12 @@ fn cmd_stop_screencast(id: i64) -> String {
 /// Map a [`ViewerInputEvent`] to its CDP `Input.*` command (compact JSON).
 fn input_to_cdp(id: i64, ev: &ViewerInputEvent) -> String {
     let v = match ev {
-        ViewerInputEvent::MouseMove { x, y } => json!({
+        ViewerInputEvent::MouseMove { x, y, buttons } => json!({
             "id": id,
             "method": "Input.dispatchMouseEvent",
-            "params": { "type": "mouseMoved", "x": x, "y": y }
+            // `buttons` is the held-button bitmask; non-zero makes Chrome
+            // treat this as a drag instead of a hover (slider tracking).
+            "params": { "type": "mouseMoved", "x": x, "y": y, "buttons": buttons }
         }),
         ViewerInputEvent::MouseButton {
             x,
@@ -248,6 +250,7 @@ fn input_to_cdp(id: i64, ev: &ViewerInputEvent) -> String {
             button,
             down,
             click_count,
+            buttons,
         } => json!({
             "id": id,
             "method": "Input.dispatchMouseEvent",
@@ -255,8 +258,11 @@ fn input_to_cdp(id: i64, ev: &ViewerInputEvent) -> String {
                 "type": if *down { "mousePressed" } else { "mouseReleased" },
                 "x": x,
                 "y": y,
+                // CDP wants BOTH: `button` = the one that changed,
+                // `buttons` = the full held mask after the event.
                 "button": button,
                 "clickCount": click_count,
+                "buttons": buttons,
             }
         }),
         ViewerInputEvent::Wheel { x, y, dx, dy } => json!({
@@ -1130,12 +1136,30 @@ mod tests {
 
     #[test]
     fn mouse_move_maps() {
-        let ev = ViewerInputEvent::MouseMove { x: 10.0, y: 20.0 };
+        let ev = ViewerInputEvent::MouseMove {
+            x: 10.0,
+            y: 20.0,
+            buttons: 0,
+        };
         let v = parse(&input_to_cdp(1, &ev));
         assert_eq!(v["method"], "Input.dispatchMouseEvent");
         assert_eq!(v["params"]["type"], "mouseMoved");
         assert_eq!(v["params"]["x"], 10.0);
         assert_eq!(v["params"]["y"], 20.0);
+        assert_eq!(v["params"]["buttons"], 0);
+    }
+
+    #[test]
+    fn mouse_move_drag_carries_buttons() {
+        // Left held during a drag → buttons=1 so Chrome tracks it as a drag.
+        let ev = ViewerInputEvent::MouseMove {
+            x: 10.0,
+            y: 20.0,
+            buttons: 1,
+        };
+        let v = parse(&input_to_cdp(1, &ev));
+        assert_eq!(v["params"]["type"], "mouseMoved");
+        assert_eq!(v["params"]["buttons"], 1);
     }
 
     #[test]
@@ -1146,12 +1170,15 @@ mod tests {
             button: "left".to_string(),
             down: true,
             click_count: 2,
+            buttons: 1,
         };
         let v = parse(&input_to_cdp(1, &ev));
         assert_eq!(v["method"], "Input.dispatchMouseEvent");
         assert_eq!(v["params"]["type"], "mousePressed");
         assert_eq!(v["params"]["button"], "left");
         assert_eq!(v["params"]["clickCount"], 2);
+        // CDP gets both the changed button and the full held mask.
+        assert_eq!(v["params"]["buttons"], 1);
     }
 
     #[test]
@@ -1162,9 +1189,12 @@ mod tests {
             button: "right".to_string(),
             down: false,
             click_count: 1,
+            buttons: 0,
         };
         let v = parse(&input_to_cdp(1, &ev));
         assert_eq!(v["params"]["type"], "mouseReleased");
+        assert_eq!(v["params"]["button"], "right");
+        assert_eq!(v["params"]["buttons"], 0);
     }
 
     #[test]
@@ -1232,6 +1262,7 @@ mod tests {
             button: "left".to_string(),
             down: true,
             click_count: 1,
+            buttons: 1,
         };
         let s = serde_json::to_string(&ev).unwrap();
         assert!(s.contains("\"kind\":\"mouse_button\""), "got {s}");
@@ -1516,7 +1547,11 @@ mod tests {
         );
 
         // Inject a MouseMove — must not panic.
-        session.input(&ViewerInputEvent::MouseMove { x: 10.0, y: 10.0 });
+        session.input(&ViewerInputEvent::MouseMove {
+            x: 10.0,
+            y: 10.0,
+            buttons: 0,
+        });
 
         session.stop().await;
         drop(mgr);

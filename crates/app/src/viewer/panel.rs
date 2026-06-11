@@ -269,6 +269,11 @@ pub struct BrowserPanel {
     /// render area each frame and this decides when to actually send a
     /// `ViewerCommand::Resize` (so a window drag doesn't flood the wire).
     viewport_throttle: ViewportThrottle,
+    /// The last `MouseMove` position (frame px) we emitted, used to de-dupe
+    /// identical hover positions so an idle pointer doesn't spam the wire
+    /// every frame. Reset whenever the held-button mask changes (so the
+    /// first move of a drag always goes out). `None` until the first move.
+    last_move: Option<(f64, f64)>,
 }
 
 impl Default for BrowserPanel {
@@ -291,6 +296,7 @@ impl BrowserPanel {
             current: None,
             last_frame: None,
             viewport_throttle: ViewportThrottle::new(),
+            last_move: None,
         }
     }
 
@@ -556,7 +562,7 @@ impl BrowserPanel {
     /// Capture pointer move / button / wheel into viewer events, mapping
     /// screen px → frame-viewport px through `image_rect`.
     fn capture_mouse(
-        &self,
+        &mut self,
         ui: &egui::Ui,
         response: &egui::Response,
         image_rect: egui::Rect,
@@ -564,12 +570,43 @@ impl BrowserPanel {
         fh: usize,
         out: &mut Vec<ViewerInputEvent>,
     ) {
-        // Pointer move (only while hovering the image area).
-        if response.hovered() {
-            if let Some(pos) = response.hover_pos() {
-                let (x, y) = panel_to_frame(pos, image_rect, fw, fh);
-                out.push(ViewerInputEvent::MouseMove { x, y });
+        // Held-button bitmask for THIS frame (Left=1/Right=2/Middle=4). A
+        // drag is "any button held", which is what makes a slider follow.
+        let buttons = response.ctx.input(|i| {
+            egui_buttons_mask(
+                i.pointer.button_down(egui::PointerButton::Primary),
+                i.pointer.button_down(egui::PointerButton::Secondary),
+                i.pointer.button_down(egui::PointerButton::Middle),
+            )
+        });
+
+        // Pointer move — during BOTH hover AND drag. While dragging, the
+        // pointer can leave the image rect (e.g. dragging a slider past its
+        // end); `interact_pointer_pos` stays valid there, and
+        // `panel_to_frame` clamps it to the frame edge. While merely
+        // hovering, use `hover_pos`.
+        let dragging =
+            buttons != 0 || response.dragged() || response.interact_pointer_pos().is_some();
+        let move_pos = if dragging {
+            response.interact_pointer_pos()
+        } else if response.hovered() {
+            response.hover_pos()
+        } else {
+            None
+        };
+        if let Some(pos) = move_pos {
+            let (x, y) = panel_to_frame(pos, image_rect, fw, fh);
+            // Always send while a button is held (so the drag tracks
+            // frame-by-frame); while hovering, de-dupe identical positions
+            // to avoid per-frame wire spam.
+            if buttons != 0 || self.last_move != Some((x, y)) {
+                out.push(ViewerInputEvent::MouseMove { x, y, buttons });
+                self.last_move = Some((x, y));
             }
+        } else {
+            // Pointer left entirely: forget the last position so the next
+            // hover/drag re-emits its first move.
+            self.last_move = None;
         }
 
         // Button presses/releases. egui's `interact_pointer_pos` is the
@@ -590,7 +627,11 @@ impl BrowserPanel {
                         button: name.to_string(),
                         down: true,
                         click_count,
+                        buttons,
                     });
+                    // A button-state change starts a fresh move-dedup run so
+                    // the press's first drag move is never suppressed.
+                    self.last_move = None;
                 }
                 if response.ctx.input(|i| i.pointer.button_released(btn)) {
                     out.push(ViewerInputEvent::MouseButton {
@@ -599,7 +640,9 @@ impl BrowserPanel {
                         button: name.to_string(),
                         down: false,
                         click_count,
+                        buttons,
                     });
+                    self.last_move = None;
                 }
             }
         }
@@ -892,6 +935,27 @@ pub fn panel_to_frame(
     )
 }
 
+/// CDP held-button bitmask from the three egui pointer-button "down" flags.
+/// Bits match CDP `Input.dispatchMouseEvent`'s `buttons` field: Left=1,
+/// Right=2, Middle=4 (OR-ed for chords). A non-zero result on a `mouseMoved`
+/// is what makes Chrome treat the move as a drag (slider tracking) rather
+/// than a hover.
+///
+/// PURE.
+pub fn egui_buttons_mask(primary_down: bool, secondary_down: bool, middle_down: bool) -> u32 {
+    let mut m = 0;
+    if primary_down {
+        m |= 1; // Left
+    }
+    if secondary_down {
+        m |= 2; // Right
+    }
+    if middle_down {
+        m |= 4; // Middle
+    }
+    m
+}
+
 /// CDP modifier bitmask from egui modifiers (Alt=1, Ctrl=2, Meta=4,
 /// Shift=8). On macOS the ⌘ key is `mac_cmd` → CDP Meta; `command` is
 /// egui's cross-platform "primary" flag (Ctrl on win/linux, ⌘ on mac) so we
@@ -1095,6 +1159,22 @@ mod tests {
         // Far to the lower-right → clamps to (frame_w, frame_h).
         let (x, y) = panel_to_frame(pos2(9999.0, 9999.0), img, 1000, 500);
         assert_eq!((x, y), (1000.0, 500.0));
+    }
+
+    // ---- egui_buttons_mask ---------------------------------------------
+
+    #[test]
+    fn egui_buttons_mask_table() {
+        // none → 0 (hover).
+        assert_eq!(egui_buttons_mask(false, false, false), 0);
+        // single buttons.
+        assert_eq!(egui_buttons_mask(true, false, false), 1); // left
+        assert_eq!(egui_buttons_mask(false, true, false), 2); // right
+        assert_eq!(egui_buttons_mask(false, false, true), 4); // middle
+        // chords OR together.
+        assert_eq!(egui_buttons_mask(true, true, false), 3); // left+right
+        assert_eq!(egui_buttons_mask(true, false, true), 5); // left+middle
+        assert_eq!(egui_buttons_mask(true, true, true), 7); // all three
     }
 
     // ---- modifiers_bitmask ---------------------------------------------
