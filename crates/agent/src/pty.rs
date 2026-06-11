@@ -703,6 +703,22 @@ impl PtyManager {
             }
             claude_args.push("--mcp-config".to_string());
             claude_args.push(mcp_cfg_path.to_string_lossy().to_string());
+            // Steer claude to the injected cc-browser MCP for ALL browser work.
+            // Without this, claude may reach for its own Playwright/Puppeteer (or
+            // open a browser via the shell), which runs OUTSIDE our CDP endpoint
+            // and therefore never appears in the CloudCode viewer. The cc-browser
+            // server drives the agent's resident Chrome that the viewer mirrors.
+            claude_args.push("--append-system-prompt".to_string());
+            claude_args.push(
+                "For ANY web browsing or browser automation, you MUST use the \
+                 `cc-browser` MCP server's tools (browser_navigate, browser_click, \
+                 browser_snapshot, etc.). Do NOT launch your own browser, and do \
+                 NOT run playwright/puppeteer/chromium yourself via the shell — \
+                 those run outside CloudCode and the user cannot see them. The \
+                 cc-browser browser is mirrored live to the user's screen, so they \
+                 can watch and take over."
+                    .to_string(),
+            );
         }
 
         // Open the PTY.

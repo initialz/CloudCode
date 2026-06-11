@@ -604,13 +604,20 @@ impl TerminalPanel {
         // Consume keyboard/IME/clipboard events only while we hold focus, so
         // typing into the workspace picker (or elsewhere) isn't swallowed.
         if focused {
-            let events: Vec<egui::Event> =
-                ui.input(|i| i.filtered_events(&egui::EventFilter {
-                    tab: true,
-                    horizontal_arrows: true,
-                    vertical_arrows: true,
-                    escape: true,
-                }));
+            let filter = egui::EventFilter {
+                tab: true,
+                horizontal_arrows: true,
+                vertical_arrows: true,
+                escape: true,
+            };
+            // CRITICAL: lock focus with this filter. Without it, egui ALSO
+            // processes Tab/arrows/Escape for its own focus navigation —
+            // pressing Esc once would surrender our focus (and arrows would
+            // move focus away), so the terminal would receive a key exactly
+            // ONCE and then go dead. set_focus_lock_filter tells egui those
+            // keys belong to us. (This is what TextEdit does internally.)
+            ui.memory_mut(|m| m.set_focus_lock_filter(response.id, filter.clone()));
+            let events: Vec<egui::Event> = ui.input(|i| i.filtered_events(&filter));
 
             // Clipboard first: egui synthesizes Copy (Cmd/Ctrl-C) and
             // Paste(s) (Cmd/Ctrl-V) from the platform shortcuts, so we don't
