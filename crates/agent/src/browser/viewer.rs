@@ -36,6 +36,7 @@ use crate::browser::screencast::{
 use crate::pty::OutFrame;
 use crate::tunnel::{pack_pty_frame, ClientMsg, TargetInfo, ViewerInputEvent, TAG_SCREENCAST_FRAME};
 use dashmap::DashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -72,6 +73,17 @@ struct ViewerInner {
     stream: tokio::sync::Mutex<StreamSlot>,
     /// The per-connection sender to the ws writer task (agent → hub).
     tx: mpsc::Sender<OutFrame>,
+    /// Set by a deliberate teardown ([`ViewerEntry::shutdown`] — detach or
+    /// attach-replace) BEFORE the forwarder is aborted. The forwarder's exit
+    /// path reads it to tell "watcher died under us" (browser-level CDP ws
+    /// lost → emit `ViewerClosed`) apart from "we are being torn down on
+    /// purpose" (hub route already going away → stay quiet). An `AtomicBool`
+    /// on the shared inner is the simplest race-safe carrier: the flag is
+    /// stored before `abort()`, so a forwarder that still gets to run its
+    /// exit path observes it. (The abort itself usually cancels the forwarder
+    /// before it reaches the check; the flag covers the window where the
+    /// channel-closed exit raced the abort.)
+    detached: AtomicBool,
 }
 
 impl ViewerInner {
@@ -127,7 +139,9 @@ impl ViewerInner {
 /// Teardown cascade (covers both explicit `detach` and "manager dropped on
 /// reconnect"): dropping the entry drops the [`TargetWatcher`], whose `Drop`
 /// aborts its ws task → the change channel closes → the forwarder's `recv`
-/// yields `None` and it exits → its `Arc<ViewerInner>` drops → the
+/// yields `None` and it exits (its `ViewerClosed` report on that path fails
+/// harmlessly on a dropped connection — the `OutFrame` channel is gone too)
+/// → its `Arc<ViewerInner>` drops → the
 /// `ScreencastSession` inside (if any) drops, and ITS `Drop` aborts the CDP
 /// ws task. `shutdown` additionally aborts the forwarder and stops the
 /// screencast promptly (flushing `Page.stopScreencast`).
@@ -139,6 +153,10 @@ struct ViewerEntry {
 
 impl ViewerEntry {
     async fn shutdown(self) {
+        // Mark the teardown deliberate BEFORE aborting: if the forwarder is
+        // mid-exit (watcher channel closed in the same instant), it must NOT
+        // report `ViewerClosed` for a detach the hub itself initiated.
+        self.inner.detached.store(true, Ordering::SeqCst);
         self.forwarder.abort();
         self.inner.stop_current().await;
         // `self.watcher` drops here, aborting the watcher's ws task.
@@ -193,7 +211,7 @@ impl ViewerManager {
         // per-viewer subscriptions would save browser-level CDP connections,
         // but viewer count is single digits, so per-viewer is the simpler
         // correct choice; revisit if viewers ever multiply.)
-        let (chg_tx, mut chg_rx) = mpsc::channel::<Vec<TargetInfo>>(TARGETS_QUEUE);
+        let (chg_tx, chg_rx) = mpsc::channel::<Vec<TargetInfo>>(TARGETS_QUEUE);
         let watcher = match TargetWatcher::start(&cdp_http_url, chg_tx).await {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -221,6 +239,7 @@ impl ViewerManager {
             frame_tx: frame_tx.clone(),
             stream: tokio::sync::Mutex::new(None),
             tx: self.tx.clone(),
+            detached: AtomicBool::new(false),
         });
 
         // Initial screencast: per-session page hint (P4), else active page.
@@ -269,45 +288,10 @@ impl ViewerManager {
             }
         });
 
-        // Forwarder: every watcher change (including the watcher's initial
-        // list, possibly empty) goes to the hub as ViewerTargets, then drives
-        // the auto-select rules:
-        //   * current target destroyed → stop, start the first remaining page
-        //     (or go idle if none);
-        //   * idle and a page target appears → start streaming it.
-        // The app mirrors this auto-select logic UI-side.
-        let fwd_inner = Arc::clone(&inner);
-        let forwarder = tokio::spawn(async move {
-            while let Some(targets) = chg_rx.recv().await {
-                if fwd_inner
-                    .tx
-                    .send(OutFrame::Text(ClientMsg::ViewerTargets {
-                        viewer_session_id,
-                        targets: targets.clone(),
-                    }))
-                    .await
-                    .is_err()
-                {
-                    return; // Hub connection gone.
-                }
-                match fwd_inner.current_target().await {
-                    Some(cur) if !targets.iter().any(|t| t.id == cur) => {
-                        // Our tab vanished: drop the dead stream, then pick up
-                        // the first surviving page (or stay idle).
-                        fwd_inner.stop_current().await;
-                        if let Some(first) = targets.first() {
-                            fwd_inner.switch_to(first.id.clone()).await;
-                        }
-                    }
-                    None => {
-                        if let Some(first) = targets.first() {
-                            fwd_inner.switch_to(first.id.clone()).await;
-                        }
-                    }
-                    Some(_) => {} // Current tab still alive: nothing to do.
-                }
-            }
-        });
+        // Forwarder: see [`forward_watcher_changes`] (factored out so the
+        // watcher-loss → `ViewerClosed` exit path is unit-testable without a
+        // real CDP connection).
+        let forwarder = tokio::spawn(forward_watcher_changes(Arc::clone(&inner), chg_rx));
 
         self.sessions.insert(
             viewer_session_id,
@@ -382,6 +366,93 @@ impl ViewerManager {
     }
 }
 
+/// The forwarder task body: every watcher change (including the watcher's
+/// initial list, possibly empty) goes to the hub as `ViewerTargets`, then
+/// drives the auto-select rules:
+///   * current target destroyed → stop, start the [`preferred_target`] of
+///     the remaining pages (or go idle if none);
+///   * idle and a page target appears → start streaming the preferred one.
+/// The app mirrors this auto-select logic UI-side (`app::viewer::panel::
+/// auto_select`) — the two must stay in lockstep, like the wire shape.
+///
+/// Exit: the loop ends when the watcher's change channel closes. That is
+/// either a deliberate teardown (detach / attach-replace aborted us and is
+/// dropping the watcher — `inner.detached` is set first) or the watcher's
+/// browser-level CDP ws died under us (agent Chrome crashed/was killed). In
+/// the latter case the viewer would otherwise just freeze on its last frame,
+/// so we report `ViewerClosed` for a clean close on the app side. (When the
+/// whole hub connection is being dropped — manager drop on reconnect — the
+/// send simply fails; harmless.)
+async fn forward_watcher_changes(inner: Arc<ViewerInner>, mut chg_rx: mpsc::Receiver<Vec<TargetInfo>>) {
+    let viewer_session_id = inner.viewer_session_id;
+    while let Some(targets) = chg_rx.recv().await {
+        if inner
+            .tx
+            .send(OutFrame::Text(ClientMsg::ViewerTargets {
+                viewer_session_id,
+                targets: targets.clone(),
+            }))
+            .await
+            .is_err()
+        {
+            return; // Hub connection gone.
+        }
+        match inner.current_target().await {
+            Some(cur) if !targets.iter().any(|t| t.id == cur) => {
+                // Our tab vanished: drop the dead stream, then pick up the
+                // preferred surviving page (or stay idle).
+                inner.stop_current().await;
+                if let Some(next) = preferred_target(&targets) {
+                    inner.switch_to(next.id.clone()).await;
+                }
+            }
+            None => {
+                if let Some(next) = preferred_target(&targets) {
+                    inner.switch_to(next.id.clone()).await;
+                }
+            }
+            Some(_) => {} // Current tab still alive: nothing to do.
+        }
+    }
+    // Watcher change channel closed. Deliberate teardown (detached flag set
+    // by `ViewerEntry::shutdown` before aborting us) → the hub is already
+    // tearing the viewer route down; stay quiet. Otherwise the browser-level
+    // CDP ws died (e.g. agent Chrome crashed): report a clean close instead
+    // of leaving the viewer frozen on its last frame.
+    if !inner.detached.load(Ordering::SeqCst) {
+        tracing::warn!(
+            viewer = %viewer_session_id,
+            "target watcher channel closed (browser connection lost); closing viewer"
+        );
+        let _ = inner
+            .tx
+            .send(OutFrame::Text(ClientMsg::ViewerClosed {
+                viewer_session_id,
+                reason: Some("browser connection lost".to_string()),
+            }))
+            .await;
+    }
+}
+
+/// The target the screencast should land on when (re)selecting without an
+/// explicit user pick: the first non-(`about:blank` | `chrome://`) page,
+/// falling back to the first page, else `None`.
+///
+/// LOCKSTEP: the app's `app::viewer::panel::auto_select` applies the same
+/// preference when its `current` is gone/unset — the wire doesn't carry
+/// "attached", so the app *mirrors* this decision to keep the highlighted
+/// tab on the tab actually being streamed. Change one, change both. The
+/// initial attach pick (`pick_page_entry_for_session`, P4) already prefers
+/// non-blank pages the same way.
+///
+/// PURE.
+fn preferred_target(targets: &[TargetInfo]) -> Option<&TargetInfo> {
+    targets
+        .iter()
+        .find(|t| !t.url.starts_with("about:blank") && !t.url.starts_with("chrome://"))
+        .or_else(|| targets.first())
+}
+
 /// `GET /json` + [`pick_page_entry_for_session`]: resolve the initial
 /// `(target_id, ws_url)` for an attach. `None` on fetch failure or when no
 /// suitable page exists (both leave the viewer idle).
@@ -403,6 +474,121 @@ mod tests {
     use crate::config::BrowserConfig;
     use crate::tunnel::unpack_pty_frame;
     use std::time::Duration;
+
+    fn ti(id: &str, url: &str) -> TargetInfo {
+        TargetInfo {
+            id: id.into(),
+            title: format!("title {id}"),
+            url: url.into(),
+            kind: "page".into(),
+        }
+    }
+
+    // ---- preferred_target (lockstep with app::viewer::panel::auto_select) --
+
+    #[test]
+    fn preferred_target_table() {
+        let blank_then_real = vec![ti("B", "about:blank"), ti("R", "https://example.com/")];
+        let only_blank = vec![ti("B", "about:blank")];
+        let chrome_then_real = vec![ti("C", "chrome://newtab/"), ti("R", "https://example.com/")];
+        let all_blankish = vec![ti("B", "about:blank"), ti("C", "chrome://gpu")];
+        let cases: Vec<(&[TargetInfo], Option<&str>, &str)> = vec![
+            (&blank_then_real, Some("R"), "blank + real → the real page"),
+            (&only_blank, Some("B"), "only blank → fall back to it"),
+            (&chrome_then_real, Some("R"), "chrome:// + real → the real page"),
+            (&all_blankish, Some("B"), "all blankish → first page"),
+            (&[], None, "empty → none"),
+        ];
+        for (targets, want, why) in cases {
+            assert_eq!(preferred_target(targets).map(|t| t.id.as_str()), want, "{why}");
+        }
+    }
+
+    // ---- forwarder exit path (Fix 1): watcher loss vs deliberate detach ----
+
+    /// A `ViewerInner` with live channels but no CDP anywhere near it — enough
+    /// to drive [`forward_watcher_changes`] (which only touches CDP via
+    /// `switch_to`, never reached when only empty target lists flow).
+    fn test_inner(out_tx: mpsc::Sender<OutFrame>) -> Arc<ViewerInner> {
+        let (frame_tx, _frame_rx_kept_alive) = mpsc::channel::<Vec<u8>>(FRAME_QUEUE);
+        // Leak the receiver into a no-op task so frame_tx stays usable.
+        tokio::spawn(async move {
+            let mut rx = _frame_rx_kept_alive;
+            while rx.recv().await.is_some() {}
+        });
+        Arc::new(ViewerInner {
+            viewer_session_id: Uuid::new_v4(),
+            cdp_http_url: "http://127.0.0.1:1".into(), // never dialed in these tests
+            frame_tx,
+            stream: tokio::sync::Mutex::new(None),
+            tx: out_tx,
+            detached: AtomicBool::new(false),
+        })
+    }
+
+    /// Watcher change channel closing WITHOUT a detach (browser-level CDP ws
+    /// died) → the forwarder reports `ViewerClosed { reason: "browser
+    /// connection lost" }` so the viewer gets a clean close, not a frozen
+    /// last frame.
+    #[tokio::test]
+    async fn forwarder_emits_viewer_closed_when_watcher_dies() {
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(8);
+        let inner = test_inner(out_tx);
+        let viewer = inner.viewer_session_id;
+        let (chg_tx, chg_rx) = mpsc::channel::<Vec<TargetInfo>>(TARGETS_QUEUE);
+
+        let fwd = tokio::spawn(forward_watcher_changes(Arc::clone(&inner), chg_rx));
+        // One ordinary (empty) change flows through as ViewerTargets…
+        chg_tx.send(vec![]).await.unwrap();
+        // …then the watcher dies: its change sender drops.
+        drop(chg_tx);
+        fwd.await.unwrap();
+
+        match out_rx.recv().await {
+            Some(OutFrame::Text(ClientMsg::ViewerTargets { viewer_session_id, targets })) => {
+                assert_eq!(viewer_session_id, viewer);
+                assert!(targets.is_empty());
+            }
+            Some(OutFrame::Text(_)) => panic!("expected ViewerTargets first, got another text frame"),
+            Some(OutFrame::Binary(_)) => panic!("expected ViewerTargets first, got a binary frame"),
+            None => panic!("expected ViewerTargets first, channel closed"),
+        }
+        match out_rx.recv().await {
+            Some(OutFrame::Text(ClientMsg::ViewerClosed { viewer_session_id, reason })) => {
+                assert_eq!(viewer_session_id, viewer);
+                assert_eq!(reason.as_deref(), Some("browser connection lost"));
+            }
+            Some(OutFrame::Text(_)) => panic!("expected ViewerClosed, got another text frame"),
+            Some(OutFrame::Binary(_)) => panic!("expected ViewerClosed, got a binary frame"),
+            None => panic!("expected ViewerClosed on watcher loss, channel closed"),
+        }
+    }
+
+    /// The same channel close during a DELIBERATE teardown (detach set the
+    /// flag before aborting) must stay quiet — the hub viewer route is
+    /// already being torn down.
+    #[tokio::test]
+    async fn forwarder_stays_quiet_on_deliberate_detach() {
+        let (out_tx, mut out_rx) = mpsc::channel::<OutFrame>(8);
+        let inner = test_inner(out_tx);
+        let (chg_tx, chg_rx) = mpsc::channel::<Vec<TargetInfo>>(TARGETS_QUEUE);
+
+        // Detach marks first (as ViewerEntry::shutdown does), then the
+        // watcher drops. (No abort here: this exercises exactly the race
+        // window where the forwarder reaches its exit path anyway.)
+        inner.detached.store(true, Ordering::SeqCst);
+        let fwd = tokio::spawn(forward_watcher_changes(Arc::clone(&inner), chg_rx));
+        drop(chg_tx);
+        fwd.await.unwrap();
+
+        // Drop the last `ViewerInner` (it holds the only remaining out_tx
+        // clone) so a quiet channel reads as a clean None, not a hang.
+        drop(inner);
+        assert!(
+            out_rx.recv().await.is_none(),
+            "no ViewerClosed (or anything else) on a deliberate detach"
+        );
+    }
 
     /// P2 end-to-end (T1+T2) integration: drive the real agent-internal viewer
     /// path against a real headless Chrome — `ViewerManager::attach` →

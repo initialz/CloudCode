@@ -4,9 +4,10 @@
 > 统一深色主题、持久侧边栏 IA、workspace 切换零损失（tmux 持久化叙事）、
 > 带 tab 条的多 target CDP 镜像面板、注意力光环 (attention halo)、重连横幅。
 >
-> 自动化覆盖（已绿，无需你重跑）：`cargo test --workspace`（369 个纯逻辑单测，6 ignored）——
+> 自动化覆盖（已绿，无需你重跑）：`cargo test --workspace`（372 个纯逻辑单测，6 ignored）——
 > 含主题 token smoke、`apply_event` reducer 全路径（连接/切换/重连/错误）、tab 标题截断
-> (`tab_label` 中英文)、`auto_select` 表驱动（5 cases）、`frame_is_live` 边界、
+> (`tab_label` 中英文)、`auto_select` 表驱动（10 cases，含 [blank, real] 初选）、agent 侧
+> `preferred_target` 表 + forwarder 断流/静默 detach 两路（Fix 1）、`frame_is_live` 边界、
 > `switch_decision` 表、sidebar `row_badge` 表、`TargetInfo` JSON 往返、`targets_wire_json`、
 > hub uplink `parse_viewer_uplink`（含 select_target）、`apply_target_event` 表驱动、
 > JPEG decode 2×2 fixture、letterbox/panel→frame 坐标换算、IME 合成态、全部 P4 viewer 逻辑。
@@ -122,6 +123,12 @@ RUST_LOG=debug cargo run -p cloudcode-app
       - 若第二个 tab 是当前活动 tab，切换无需用户干预。
 - [ ] **让 claude 关闭所有页面** → tab 条消失，面板回到空闲占位
       `agent browser idle — pages claude opens appear here`。
+- [ ] **`[about:blank, 真实页面]` 初选探针**：让 agent Chrome 同时存在一个 `about:blank`
+      tab 和一个真实页面（如 example.com），然后 attach（切到 Browser/Split 视图触发
+      viewer ws 重建）→ tab 条**高亮真实页面的 tab**，且面板渲染的正是该页内容
+      （高亮与实际流一致）。两侧共享规则：「首个非 (about:blank|chrome://) 页面；
+      否则首个页面；否则无」——agent `preferred_target` / `pick_page_entry_for_session`
+      与 app `auto_select` 必须 lockstep。
 
 ---
 
@@ -168,7 +175,9 @@ RUST_LOG=debug cargo run -p cloudcode-app
       - 内容区**顶部出现橙色横幅**（`reconnecting to <hub>…` + 旋转器 +
         `· your session keeps running on the agent` 灰色小字）；
       - 侧边栏底部状态变为橙色 `● reconnecting…`；
-      - 面板**置灰但不清空**（terminal grid + 最后一帧浏览器画面保留，用户能看清是哪个 session）；
+      - **terminal 面板置灰但不清空**（terminal grid 保留，用户能看清是哪个 session）；
+        **browser 面板回到空闲/断连占位**（viewer ws 随连接掉线，texture 被清掉——
+        **不是**保留最后一帧；只有终端 grid 是置灰保留的）；
       - **输入被 disable**（terminal/browser 不接收键盘/鼠标，UI 已 disabled_ui 包住）。
 - [ ] 恢复 hub → app 自动重连（backend 的退避重试）：
       - 橙色横幅消失；
@@ -177,6 +186,25 @@ RUST_LOG=debug cargo run -p cloudcode-app
         进入同一 workspace 的 session（tmux 一直在跑，重 attach 无损失）；
       - 面板恢复可用。
 - [ ] 验证：没有卡死 Error 全屏；没有清空 terminal 内容（重连期间保留）。
+
+---
+
+### 8. agent Chrome 崩溃 → 干净断流（Fix 1 探针）
+
+> agent 的常驻 Chrome 半路死掉（崩溃 / 被 kill）时，viewer 不应冻在最后一帧：
+> agent 侧 forwarder 检测到 browser 级 CDP ws 断开，主动上报
+> `ViewerClosed { reason: "browser connection lost" }`，hub 关闭 viewer 路由。
+
+- [ ] 投屏进行中（`LIVE` 角标亮着），**在 agent 机器上 kill 掉 agent 的 Chrome 进程**
+      （注意是 agent 拉起的那个 headless/常驻 Chrome，不是你本地浏览器）。
+- [ ] app 侧：**干净断流**而非冻帧——browser 面板回到占位文字（viewer ws 被 hub 关闭 →
+      Disconnected → texture 清空），`LIVE` 角标消失；终端面板不受影响。
+- [ ] agent 日志可见 `target watcher channel closed (browser connection lost)`。
+- [ ] **恢复**：等 agent 把 Chrome 拉回（或重启 agent）后，**切到 Terminal-only 再切回
+      Browser/Split**（清除 viewer 的 retry_blocked 闩，见下「生命周期说明」）→
+      viewer ws 重建 → tab 条与投屏恢复。
+- [ ] 对照：正常 detach（切 Terminal-only / 切 workspace）**不**产生上述
+      `browser connection lost` 日志或多余的 ViewerClosed（deliberate-detach 静默路径）。
 
 ---
 
@@ -199,6 +227,10 @@ RUST_LOG=debug cargo run -p cloudcode-app
 
 ## 已知 P6 限制
 
+- **多 viewer tab 争抢**：Chrome 只对前台 tab 出帧（CDP screencast 限制）。两个 viewer
+  （例如 webterm 验证页 + desktop app）同时附加且**选了不同 tab** 时，每次选 tab 都把
+  自己的页提到 Chrome 前台（`Page.bringToFront`），会互相把对方的流冻住（对方 `LIVE`
+  角标消失，帧停在最后一张）。solo-use 单人操作下可接受，V1 不解决。
 - **注意力光环仅覆盖当前 attach 的 session**：Bell 只在附加中的 PTY 流里可检测；未 attach
   的 workspace 无法感知 bell（跨会话通知需 agent 侧钩子，P7+ 未来工作）。
 - **tab 关闭按钮缺失（V1）**：关页面需通过 claude。

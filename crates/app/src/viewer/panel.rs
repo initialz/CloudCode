@@ -206,8 +206,9 @@ impl BrowserPanel {
     ///
     /// The tab-bar model is dropped too: targets can change while detached,
     /// and a fresh attach makes the agent push a new list AND auto-select
-    /// the *first* target — keeping a remembered `current` would desync the
-    /// highlighted tab from the actual stream.
+    /// its *preferred* target (first non-blank, see [`auto_select`]) —
+    /// keeping a remembered `current` would desync the highlighted tab from
+    /// the actual stream.
     pub fn mark_disconnected(&mut self) {
         self.connected = false;
         self.texture = None;
@@ -539,8 +540,15 @@ impl BrowserPanel {
 /// "attached", so the app mirrors the decision instead):
 ///
 ///   * `current` still in the list → keep it;
-///   * `current` gone (tab closed) or `None` (idle) → the FIRST target;
+///   * `current` gone (tab closed) or `None` (idle) → the first
+///     non-(`about:blank` | `chrome://`) target, falling back to the first;
 ///   * empty list → `None` (agent browser idle).
+///
+/// LOCKSTEP: the preference mirrors the agent's `preferred_target`
+/// (`agent::browser::viewer`) and its initial attach pick
+/// (`pick_page_entry_for_session`) — both prefer a real page over a blank
+/// one, so the highlighted tab matches the tab actually being streamed even
+/// when the list is `[about:blank, real-page]`. Change one, change both.
 ///
 /// PURE.
 pub fn auto_select(targets: &[TargetInfo], current: &Option<String>) -> Option<String> {
@@ -549,7 +557,11 @@ pub fn auto_select(targets: &[TargetInfo], current: &Option<String>) -> Option<S
             return Some(cur.clone());
         }
     }
-    targets.first().map(|t| t.id.clone())
+    targets
+        .iter()
+        .find(|t| !t.url.starts_with("about:blank") && !t.url.starts_with("chrome://"))
+        .or_else(|| targets.first())
+        .map(|t| t.id.clone())
 }
 
 /// Tab label text: the page title, falling back to the url's host when the
@@ -1152,15 +1164,34 @@ mod tests {
         }
     }
 
+    fn ti_at(id: &str, url: &str) -> TargetInfo {
+        TargetInfo {
+            id: id.into(),
+            title: String::new(),
+            url: url.into(),
+            kind: "page".into(),
+        }
+    }
+
     #[test]
     fn auto_select_table() {
         let ab = vec![ti("A"), ti("B")];
+        // The lockstep cases (mirroring the agent's `preferred_target`):
+        // a blank tab ahead of a real page must not win the highlight.
+        let blank_real = vec![ti_at("BL", "about:blank"), ti_at("R", "https://example.com/")];
+        let chrome_real = vec![ti_at("CH", "chrome://newtab/"), ti_at("R", "https://example.com/")];
+        let only_blank = vec![ti_at("BL", "about:blank")];
         let cases: Vec<(&[TargetInfo], Option<&str>, Option<&str>, &str)> = vec![
             (&ab, Some("B"), Some("B"), "current still listed → keep"),
             (&ab, Some("Z"), Some("A"), "current destroyed → first remaining"),
             (&ab, None, Some("A"), "idle + targets appear → first"),
             (&[], Some("A"), None, "all targets gone → idle"),
             (&[], None, None, "stays idle on empty"),
+            (&blank_real, None, Some("R"), "[blank, real] at attach → the real page (lockstep with agent)"),
+            (&blank_real, Some("Z"), Some("R"), "current destroyed → first NON-BLANK remaining"),
+            (&blank_real, Some("BL"), Some("BL"), "current = blank but still listed → keep (no forced hop)"),
+            (&chrome_real, None, Some("R"), "[chrome://, real] → the real page"),
+            (&only_blank, None, Some("BL"), "only blank → fall back to it"),
         ];
         for (targets, current, want, why) in cases {
             let got = auto_select(targets, &current.map(String::from));
@@ -1188,8 +1219,8 @@ mod tests {
 
     #[test]
     fn disconnect_clears_tab_model() {
-        // A fresh attach makes the agent push a new list and select the
-        // FIRST target — stale tabs/current must not survive a drop.
+        // A fresh attach makes the agent push a new list and select its
+        // preferred target — stale tabs/current must not survive a drop.
         let mut panel = BrowserPanel::new();
         panel.set_targets(vec![ti("A")]);
         panel.mark_disconnected();
