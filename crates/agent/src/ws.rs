@@ -99,6 +99,10 @@ async fn run_once(state: Arc<AppState>) -> Result<(), RunError> {
 
     let (tx, mut rx) = mpsc::channel::<OutFrame>(SEND_QUEUE);
 
+    // 武装 proxy:handle_post 经这条活连接向 hub 发 RemoteMcp 帧。
+    // 每次重连都用新 sender 重新武装。
+    state.mcp.set_hub_sender(tx.clone()).await;
+
     // Hand the live sender to the agent-level audit task. Cleared on
     // any return from this function so audit pauses (rather than
     // silently dropping events) until reconnect re-arms the slot.
@@ -179,6 +183,29 @@ where
                 }
                 Ok(ServerMsg::Rejected { reason }) => {
                     return Err(classify_reject(reason));
+                }
+                // client 后端子进程的回程帧:按 (session, server, id)
+                // 配对交还阻塞中的 claude POST。在此拦截,不进
+                // PtyManager(那边只有穷尽性空臂)。
+                Ok(ServerMsg::RemoteMcp {
+                    session_id,
+                    server,
+                    payload,
+                }) => {
+                    state.mcp.resolve_response(session_id, &server, payload);
+                }
+                // client 的远程-MCP 通道没了(后端不可用 / 子进程死亡 /
+                // client 收摊):立刻 fail 该会话所有在飞请求,claude
+                // 拿到干净的 JSON-RPC 错误而不是干等超时。
+                Ok(ServerMsg::RemoteMcpClosed {
+                    session_id,
+                    server: _,
+                    reason,
+                }) => {
+                    state.mcp.fail_pending(
+                        session_id,
+                        reason.as_deref().unwrap_or("remote MCP channel closed"),
+                    );
                 }
                 Ok(ServerMsg::UpdateAgent {
                     request_id,

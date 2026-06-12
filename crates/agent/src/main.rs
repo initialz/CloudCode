@@ -28,6 +28,9 @@ pub struct AppState {
     /// agent-level audit task (spawned once at startup) can ship
     /// `UserInteraction` frames to the hub.
     pub audit_slot: audit::SenderSlot,
+    /// 远程-MCP proxy 状态:PtyManager(注册每会话 token、写
+    /// --mcp-config)与 HTTP handler / ws 层共享同一实例。
+    pub mcp: mcp_proxy::McpProxy,
 }
 
 #[derive(Parser)]
@@ -208,6 +211,10 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         .unwrap_or_else(name::default_agent_name);
     tracing::info!(agent = %name, "starting cloudcode-agent");
 
+    // McpProxy 与 PtyManager 必须共享同一实例(开会话时注册的路由要
+    // 对 HTTP handler 可见),先于两者构建。
+    let mcp = mcp_proxy::McpProxy::new();
+
     let manager = Arc::new(PtyManager::new(
         config.claude.clone(),
         config.tools.tools.clone(),
@@ -215,6 +222,8 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         config.tmux.clone(),
         config.recording.clone(),
         config.sandbox.clone(),
+        mcp.clone(),
+        config.remote_mcp.clone(),
     )?);
 
     // Process-level audit pipeline: watches ~/.claude/projects/ and
@@ -236,7 +245,21 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         config,
         manager,
         audit_slot,
+        mcp,
     });
+
+    // 进程内 localhost 远程-MCP proxy 端点:claude 连这里,帧经
+    // agent<->hub ws 隧道到绑定 client。enabled=false 时整个监听面
+    // 都不存在。
+    if state.config.remote_mcp.enabled {
+        let mcp_state = state.mcp.clone();
+        let port = state.config.remote_mcp.port;
+        tokio::spawn(async move {
+            if let Err(e) = mcp_proxy::serve(mcp_state, port).await {
+                tracing::error!(error = %e, "remote MCP proxy endpoint exited");
+            }
+        });
+    }
 
     ws::run(state).await
 }

@@ -42,6 +42,15 @@ pub struct PtyManager {
     tmux_conf: Option<PathBuf>,
     sessions: Arc<DashMap<Uuid, Arc<PtyHandle>>>,
     write_sessions: crate::fs::WriteSessions,
+    /// 远程-MCP proxy(与 AppState.mcp 共享 Arc 内部):open_session
+    /// 在此注册工作区 token 路由,HTTP handler 即时可见。
+    mcp: crate::mcp_proxy::McpProxy,
+    /// `[remote_mcp]` 配置快照(enabled / port / manifest 路径)。
+    remote_mcp: crate::config::RemoteMcpConfig,
+    /// 每工作区一枚稳定 remote-MCP token,键 (account, workspace)。
+    /// 首次注入时铸造、之后每次 open 复用并对新 session_id 重注册
+    /// (决策 D12);仅 workspace delete/reset 时移除并注销。
+    workspace_tokens: DashMap<(String, String), String>,
 }
 
 struct PtyHandle {
@@ -70,6 +79,8 @@ impl PtyManager {
         // just figures out whether sandbox is structurally possible
         // (macOS today) and stands the wrapper-path ready.
         _sandbox: SandboxConfig,
+        mcp: crate::mcp_proxy::McpProxy,
+        remote_mcp: crate::config::RemoteMcpConfig,
     ) -> Result<Self> {
         // Fail fast if tmux is not installed.
         let tmux_path = which::which(&tmux.executable).with_context(|| {
@@ -173,6 +184,9 @@ impl PtyManager {
             tmux_conf,
             sessions: Arc::new(DashMap::new()),
             write_sessions: crate::fs::new_write_sessions(),
+            mcp,
+            remote_mcp,
+            workspace_tokens: DashMap::new(),
         })
     }
 

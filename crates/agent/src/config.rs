@@ -24,6 +24,10 @@ pub struct Config {
     pub recording: RecordingConfig,
     #[serde(default)]
     pub sandbox: SandboxConfig,
+    /// `[remote_mcp]` 段:agent 侧远程-MCP proxy(cc-browser 管道)
+    /// 开关与端点(决策 D10)。整段缺省 = 全默认(零配置即用)。
+    #[serde(default)]
+    pub remote_mcp: RemoteMcpConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +135,41 @@ pub struct SandboxConfig {
     pub enabled: bool,
 }
 
+fn remote_mcp_default_enabled() -> bool {
+    true
+}
+
+fn remote_mcp_default_port() -> u16 {
+    7110
+}
+
+/// `[remote_mcp]` 段:远程-MCP proxy 设置。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteMcpConfig {
+    /// 总开关:false 时不启动 localhost 端点、不向 claude 注入任何
+    /// MCP 配置。默认 true。
+    #[serde(default = "remote_mcp_default_enabled")]
+    pub enabled: bool,
+    /// proxy 监听端口(仅绑定 127.0.0.1)。
+    #[serde(default = "remote_mcp_default_port")]
+    pub port: u16,
+    /// 静态工具表(JSON **数组**文件)路径:Phase E 在无 client 时用
+    /// 它应答 tools/list;缺省 = 空表。dev-browser 的 manifest 内容
+    /// 属计划②(决策 D17)。
+    #[serde(default)]
+    pub tools_manifest: Option<PathBuf>,
+}
+
+impl Default for RemoteMcpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 7110,
+            tools_manifest: None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct RecordingConfig {
     /// Where asciinema `*.cast` files land. Defaults to
@@ -200,6 +239,33 @@ impl Default for RecordingConfig {
             dir: default_record_dir(),
             keep_days: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod remote_mcp_config_tests {
+    use super::*;
+
+    #[test]
+    fn remote_mcp_defaults() {
+        // 段缺省整体:Default 实现。
+        let d = RemoteMcpConfig::default();
+        assert!(d.enabled);
+        assert_eq!(d.port, 7110);
+        assert_eq!(d.tools_manifest, None);
+
+        // 段存在但字段缺省:serde 字段默认。
+        let c: RemoteMcpConfig = toml::from_str("").unwrap();
+        assert!(c.enabled);
+        assert_eq!(c.port, 7110);
+
+        // 显式覆盖。
+        let c: RemoteMcpConfig =
+            toml::from_str("enabled = false\nport = 7200\ntools_manifest = \"/etc/cc/tools.json\"")
+                .unwrap();
+        assert!(!c.enabled);
+        assert_eq!(c.port, 7200);
+        assert_eq!(c.tools_manifest, Some(PathBuf::from("/etc/cc/tools.json")));
     }
 }
 
