@@ -287,16 +287,18 @@ impl McpHost {
             return Err(McpHostError::BackendUnavailable("spawn failed".to_string()));
         };
         if chan.feed(payload).is_err() {
-            // 泵死(子进程崩溃/EOF):收摊并计一次失败;下一帧惰性重生。
+            // 泵死(子进程崩溃/EOF):收摊并计一次失败 —— pump 级失败与
+            // spawn 级失败一样累计入上限,否则"起得来但活不住"的后端会
+            // 每帧无限重生(feed 只是入队、那一刻 pump 还活着,不能据此
+            // 判定健康并清零)。下一帧惰性重生;连续 3 次死 → 60s 冷却。
             self.chan = None;
             self.note_failure();
             return Err(McpHostError::BackendUnavailable(
                 "backend subprocess died".to_string(),
             ));
         }
-        // feed 成功视为后端活着:清零连续失败计数(上限只惩罚连续失败,
-        // 偶发崩溃 + claude 主动重试 = 每次重试一次重生机会)。
-        self.consecutive_failures = 0;
+        // feed 入队成功。连续失败计数只在冷却到期时清零(见 spawn_channel),
+        // 不在此清零 —— 见上面注释。
         Ok(())
     }
 
@@ -611,5 +613,36 @@ mod tests {
             .expect("frame within 10s")
             .expect("alive");
         assert!(next.contains(r#""id":2"#) && !next.contains("serverInfo"), "got: {next}");
+    }
+
+    /// 回归:后端 spawn 正常但 pump 秒死("起得来活不住"),也必须在
+    /// 有限次 deliver 内撞上冷却,而不是每帧无限重生。
+    #[tokio::test]
+    async fn host_pump_death_loop_is_bounded_by_cooldown() {
+        if !node_available() {
+            return;
+        }
+        let fixture =
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/exit-on-frame-mcp.mjs");
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let mut host = McpHost::new(("node".to_string(), vec![fixture.to_string()]), out_tx);
+        let mut saw_cooldown = false;
+        for _ in 0..30 {
+            if let Err(e) = host
+                .deliver(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_string())
+                .await
+            {
+                if e.to_string().contains("cooldown") {
+                    saw_cooldown = true;
+                    break;
+                }
+            }
+            // 给泵一点时间感知子进程退出,使下一帧的 feed 命中"泵已死"。
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            saw_cooldown,
+            "spawn-ok-but-pump-dies backend must hit the cooldown within 30 delivers, not storm forever"
+        );
     }
 }
