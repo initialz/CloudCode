@@ -403,7 +403,7 @@ impl PtyManager {
                     Err(e) => Some(e),
                     Ok(()) => {
                         let workspace_root = self.workspace_root();
-                        match crate::fs::write_init(
+                        crate::fs::write_init(
                             &self.write_sessions,
                             &workspace_root,
                             &account,
@@ -412,10 +412,7 @@ impl PtyManager {
                             request_id,
                         )
                         .await
-                        {
-                            Ok(()) => None,
-                            Err(e) => Some(e),
-                        }
+                        .err()
                     }
                 };
                 if let Some(e) = error {
