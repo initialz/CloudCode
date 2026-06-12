@@ -71,10 +71,11 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, pre_auth: Option
     let (mut sink, mut stream) = socket.split();
 
     // ---- Hello (auth) ----
-    let account_name = match authenticate(&state, &mut sink, &mut stream, pre_auth).await {
-        Some(a) => a,
-        None => return,
-    };
+    let (account_name, remote_mcp_capable) =
+        match authenticate(&state, &mut sink, &mut stream, pre_auth).await {
+            Some(a) => a,
+            None => return,
+        };
 
     // Subscribe to the per-account kick channel BEFORE entering the
     // loop so an admin "disconnect" fired between authenticate() and
@@ -91,6 +92,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>, pre_auth: Option
         account_name,
         selected_agent: None,
         active: None,
+        remote_mcp_capable,
         fs_uploads: HashMap::new(),
     };
 
@@ -191,6 +193,9 @@ struct ConnCtx {
     account_name: String,
     selected_agent: Option<Arc<AgentConn>>,
     active: Option<ActiveSession>,
+    /// client 在 `Hello.remote_mcp_capable` 宣称的能力位,连接建立时
+    /// 捕获,随每次 `ServerMsg::PtyOpen` 转交 agent。
+    remote_mcp_capable: bool,
     /// In-flight CLI file-drop uploads, keyed by request_id. Each entry
     /// is the sender half of the chunk stream feeding a spawned
     /// `upload_file_to_agent`; `FsWriteChunk` frames push decoded bytes
@@ -251,7 +256,7 @@ async fn authenticate<S, R>(
     sink: &mut S,
     stream: &mut R,
     pre_auth: Option<String>,
-) -> Option<String>
+) -> Option<(String, bool)>
 where
     S: SinkExt<Message, Error = axum::Error> + Unpin,
     R: futures::Stream<Item = Result<Message, axum::Error>> + Unpin,
@@ -261,9 +266,13 @@ where
     // and the frame's `version` field is part of the contract. We just
     // ignore the embedded token when we already trust the cookie.
     let hello = tokio::time::timeout(HELLO_TIMEOUT, stream.next()).await;
-    let token = match hello {
+    let (token, remote_mcp_capable) = match hello {
         Ok(Some(Ok(Message::Text(s)))) => match serde_json::from_str::<ClientToHub>(&s) {
-            Ok(ClientToHub::Hello { token, .. }) => token,
+            Ok(ClientToHub::Hello {
+                token,
+                remote_mcp_capable,
+                ..
+            }) => (token, remote_mcp_capable),
             _ => {
                 let _ = send_client(
                     sink,
@@ -292,7 +301,7 @@ where
         {
             return None;
         }
-        return Some(account_name);
+        return Some((account_name, remote_mcp_capable));
     }
 
     // Token-authed (CLI client) path — original behavior.
@@ -323,7 +332,7 @@ where
             {
                 return None;
             }
-            Some(name)
+            Some((name, remote_mcp_capable))
         }
         Err(reason) => {
             state.audit.write(AuditEvent {
@@ -851,6 +860,7 @@ where
                     sandbox_mode: Some(sandbox_mode),
                     tool,
                     env,
+                    remote_mcp_capable: ctx.remote_mcp_capable,
                 })
                 .await
                 .is_err()

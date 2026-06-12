@@ -343,6 +343,14 @@ pub enum ServerMsg {
         /// extra env" instead of failing to parse.
         #[serde(default)]
         env: std::collections::HashMap<String, String>,
+        /// Whether the bound client can host a remote-MCP backend
+        /// subprocess (it has a backend command configured). Captured
+        /// from `Hello.remote_mcp_capable`. `#[serde(default)]` so a
+        /// pre-negotiation hub degrades to "not capable". Phase D gates
+        /// MCP injection on it; Phase E flips injection to always-on
+        /// and uses this only for attach/list_changed tracking.
+        #[serde(default)]
+        remote_mcp_capable: bool,
     },
     PtyResize {
         session_id: Uuid,
@@ -592,6 +600,32 @@ mod remote_mcp_tests {
         );
         match serde_json::from_str::<ServerMsg>(&wire).unwrap() {
             ServerMsg::RemoteMcpClosed { reason, .. } => assert_eq!(reason, None),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn pty_open_without_capability_defaults_false() {
+        // 构造一个带 capability 的 PtyOpen,序列化后把新字段从 JSON 里
+        // 删掉,再反序列化 —— 模拟旧 hub 发来的帧,必须降级为 false。
+        let msg = ServerMsg::PtyOpen {
+            session_id: Uuid::new_v4(),
+            account: "acct".to_string(),
+            workspace: "ws".to_string(),
+            cols: 80,
+            rows: 24,
+            claude_args: vec![],
+            sandbox: false,
+            sandbox_mode: None,
+            tool: None,
+            env: std::collections::HashMap::new(),
+            remote_mcp_capable: true,
+        };
+        let mut v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&msg).unwrap()).unwrap();
+        v.as_object_mut().unwrap().remove("remote_mcp_capable");
+        match serde_json::from_str::<ServerMsg>(&v.to_string()).unwrap() {
+            ServerMsg::PtyOpen { remote_mcp_capable, .. } => assert!(!remote_mcp_capable),
             _ => panic!("wrong variant"),
         }
     }

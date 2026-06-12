@@ -189,6 +189,7 @@ impl PtyManager {
                 sandbox_mode,
                 tool,
                 env,
+                remote_mcp_capable,
             } => {
                 self.open_session(
                     session_id,
@@ -201,6 +202,7 @@ impl PtyManager {
                     sandbox_mode,
                     tool,
                     env,
+                    remote_mcp_capable,
                     tx,
                 )
                 .await;
@@ -525,6 +527,7 @@ impl PtyManager {
         sandbox_mode: Option<String>,
         tool: Option<String>,
         env: HashMap<String, String>,
+        remote_mcp_capable: bool,
         tx: mpsc::Sender<OutFrame>,
     ) {
         if let Err(e) = validate_name(&account, "account") {
@@ -584,6 +587,10 @@ impl PtyManager {
         // somehow vanished between create_dir_all and now; fall back
         // to the raw path in that pathological case.
         let cwd = std::fs::canonicalize(&cwd_raw).unwrap_or(cwd_raw);
+
+        // capability 在 Phase D 用于 MCP 注入、Phase E 用于 attach 标记;
+        // 此处先行记录,排障时可直接看到协商结果。
+        tracing::debug!(%session_id, remote_mcp_capable, "open_session: client capability");
 
         // Open the PTY.
         let size = PtySize {
