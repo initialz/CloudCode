@@ -44,6 +44,9 @@ pub async fn connect(hub_url: &str, token: &str) -> Result<Wire> {
     let hello = ClientToHub::Hello {
         token: token.to_string(),
         version: PTY_PROTOCOL_VERSION.into(),
+        // Task 8(Phase C)接真值 mcp_host::backend_command().is_some();
+        // 在宿主模块存在前恒 false,行为与旧 client 一致。
+        remote_mcp_capable: false,
     };
     sink.send(Message::Text(serde_json::to_string(&hello)?))
         .await

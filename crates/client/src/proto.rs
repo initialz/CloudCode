@@ -3,8 +3,11 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// 文档性镜像版本(本常量两侧均 #[allow(dead_code)],hub 不校验;
+/// 跨版本安全靠 Hello.remote_mcp_capable 缺省 false + 读循环对未知帧
+/// 容忍跳过)。与 crates/hub/src/pty_proto.rs 同步改动。
 #[allow(dead_code)]
-pub const PTY_PROTOCOL_VERSION: &str = "1";
+pub const PTY_PROTOCOL_VERSION: &str = "2";
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -12,6 +15,11 @@ pub enum ClientToHub {
     Hello {
         token: String,
         version: String,
+        /// 本 client 能否承载远程-MCP 后端子进程(配置了后端命令)。
+        /// 缺省 false:旧 client / webterm SPA 不发该字段,hub→agent
+        /// 链路便绝不向其转发 RemoteMcp 帧(决策 D5/D6)。
+        #[serde(default)]
+        remote_mcp_capable: bool,
     },
     /// Pre-session: bind this client connection to an agent. `None` lets the
     /// hub pick the first online agent (alphabetically). All subsequent
@@ -89,6 +97,20 @@ pub enum ClientToHub {
         #[serde(default)]
         eof: bool,
     },
+    /// In-session:client 侧后端 MCP 子进程回向 claude 的一帧不透明
+    /// JSON-RPC。hub 打上当前活动会话的 session_id 转发给绑定 agent
+    ///(ServerMsg::RemoteMcp)。负载中途零解析。
+    RemoteMcp {
+        server: String,
+        payload: String,
+    },
+    /// In-session:client 拆除其远程-MCP 通道(后端不可用 / 子进程
+    /// 死亡 / 收摊)。agent 据此立刻 fail 该会话在飞请求。
+    RemoteMcpClosed {
+        server: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
     /// Voluntary client-initiated close (ends the whole connection).
     Close,
     Pong,
@@ -152,6 +174,19 @@ pub enum HubToClient {
         #[serde(default)]
         error: Option<String>,
     },
+    /// claude(经 agent proxy)指向 client 侧后端 MCP 子进程的一帧
+    /// 不透明 JSON-RPC。负载中途零解析。
+    RemoteMcp {
+        server: String,
+        payload: String,
+    },
+    /// hub/agent 侧拆除远程-MCP 通道;client 应停掉后端子进程
+    ///(保留握手缓存,见 Phase C)。
+    RemoteMcpClosed {
+        server: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
     Ping,
 }
 
@@ -178,4 +213,83 @@ pub struct WorkspaceInfo {
     pub tmux_alive: bool,
     #[serde(default)]
     pub has_client: bool,
+}
+
+#[cfg(test)]
+mod remote_mcp_tests {
+    use super::*;
+
+    #[test]
+    fn remote_mcp_both_directions_roundtrip_byte_exact() {
+        let original = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"zebra":1,"alpha":2}}"#;
+        let c = ClientToHub::RemoteMcp {
+            server: "cc-browser".to_string(),
+            payload: original.to_string(),
+        };
+        let j = serde_json::to_string(&c).unwrap();
+        assert!(j.contains("\"type\":\"remote_mcp\""), "tag mismatch: {j}");
+        match serde_json::from_str::<ClientToHub>(&j).unwrap() {
+            ClientToHub::RemoteMcp { server, payload } => {
+                assert_eq!(server, "cc-browser");
+                assert_eq!(payload, original);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let h = HubToClient::RemoteMcp {
+            server: "cc-browser".to_string(),
+            payload: original.to_string(),
+        };
+        let j2 = serde_json::to_string(&h).unwrap();
+        assert!(j2.contains("\"type\":\"remote_mcp\""), "tag mismatch: {j2}");
+        match serde_json::from_str::<HubToClient>(&j2).unwrap() {
+            HubToClient::RemoteMcp { server, payload } => {
+                assert_eq!(server, "cc-browser");
+                assert_eq!(payload, original);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn remote_mcp_closed_roundtrips_and_defaults() {
+        let c = ClientToHub::RemoteMcpClosed {
+            server: "cc-browser".to_string(),
+            reason: Some("backend unavailable".to_string()),
+        };
+        let j = serde_json::to_string(&c).unwrap();
+        assert!(j.contains("\"type\":\"remote_mcp_closed\""), "tag mismatch: {j}");
+        match serde_json::from_str::<ClientToHub>(&j).unwrap() {
+            ClientToHub::RemoteMcpClosed { server, reason } => {
+                assert_eq!(server, "cc-browser");
+                assert_eq!(reason.as_deref(), Some("backend unavailable"));
+            }
+            _ => panic!("wrong variant"),
+        }
+        // 线上省略 reason → None
+        let from_wire: HubToClient =
+            serde_json::from_str(r#"{"type":"remote_mcp_closed","server":"cc-browser"}"#).unwrap();
+        match from_wire {
+            HubToClient::RemoteMcpClosed { server, reason } => {
+                assert_eq!(server, "cc-browser");
+                assert_eq!(reason, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn hello_without_capability_defaults_false() {
+        // 旧 client / webterm SPA 的 Hello 没有该字段 → 必须解析成功且为 false。
+        let j = r#"{"type":"hello","token":"t","version":"1"}"#;
+        match serde_json::from_str::<ClientToHub>(j).unwrap() {
+            ClientToHub::Hello { remote_mcp_capable, .. } => assert!(!remote_mcp_capable),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn pty_protocol_version_is_2() {
+        assert_eq!(PTY_PROTOCOL_VERSION, "2");
+    }
 }

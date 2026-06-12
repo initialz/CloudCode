@@ -1130,6 +1130,9 @@ where
             }
             true
         }
+        // 临时哑臂:Task 5(Phase B)替换为按会话绑定的真实转发。
+        // client 侧要到 Phase C 才会发出这两类帧,此前丢弃无影响。
+        ClientToHub::RemoteMcp { .. } | ClientToHub::RemoteMcpClosed { .. } => true,
         ClientToHub::Close => false,
         ClientToHub::Hello { .. } | ClientToHub::Pong => true,
     }
