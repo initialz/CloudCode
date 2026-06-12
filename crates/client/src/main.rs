@@ -1,4 +1,5 @@
 mod input;
+mod mcp_host;
 mod menu;
 mod mouse_filter;
 mod paste_detect;
