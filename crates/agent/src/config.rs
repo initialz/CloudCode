@@ -28,6 +28,10 @@ pub struct Config {
     /// 开关与端点(决策 D10)。整段缺省 = 全默认(零配置即用)。
     #[serde(default)]
     pub remote_mcp: RemoteMcpConfig,
+    /// `[browser]` 段:agent 本机 web 无头后端(计划②)。整段缺省 =
+    /// 全默认(零配置即用)。
+    #[serde(default)]
+    pub browser: BrowserConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,6 +174,35 @@ impl Default for RemoteMcpConfig {
     }
 }
 
+fn browser_default_web_enabled() -> bool {
+    true
+}
+
+/// `[browser]` 段(计划②):agent 本机 `web` 无头浏览器后端。与
+/// `[remote_mcp]` 平行 —— 那边管 cc-browser proxy,这边只管注入配置
+/// 里的 web stdio 条目。整段缺省 = 全默认零配置。
+#[derive(Debug, Clone, Deserialize)]
+pub struct BrowserConfig {
+    /// 是否注入 `web` stdio server 条目。false ⇒ 注入配置只含
+    /// cc-browser(回到计划①单 server 形态)。默认 true。
+    #[serde(default = "browser_default_web_enabled")]
+    pub web_enabled: bool,
+    /// 整条 web 后端命令覆盖(空白分隔)。缺省 = 内置默认
+    /// `npx -y @playwright/mcp@<pin> --headless`
+    /// (pin 常量在 mcp_proxy.rs::PLAYWRIGHT_MCP_PKG)。
+    #[serde(default)]
+    pub web_backend: Option<String>,
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            web_enabled: true,
+            web_backend: None,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 pub struct RecordingConfig {
     /// Where asciinema `*.cast` files land. Defaults to
@@ -266,6 +299,47 @@ mod remote_mcp_config_tests {
         assert!(!c.enabled);
         assert_eq!(c.port, 7200);
         assert_eq!(c.tools_manifest, Some(PathBuf::from("/etc/cc/tools.json")));
+    }
+}
+
+#[cfg(test)]
+mod browser_config_tests {
+    use super::*;
+
+    #[test]
+    fn browser_defaults() {
+        // 段缺省整体:Default 实现。
+        let d = BrowserConfig::default();
+        assert!(d.web_enabled);
+        assert_eq!(d.web_backend, None);
+
+        // 段存在但字段缺省:serde 字段默认。
+        let c: BrowserConfig = toml::from_str("").unwrap();
+        assert!(c.web_enabled);
+        assert_eq!(c.web_backend, None);
+
+        // 显式覆盖。
+        let c: BrowserConfig = toml::from_str(
+            "web_enabled = false\nweb_backend = \"npx -y @playwright/mcp@0.0.76 --headless --browser=chromium\"",
+        )
+        .unwrap();
+        assert!(!c.web_enabled);
+        assert_eq!(
+            c.web_backend.as_deref(),
+            Some("npx -y @playwright/mcp@0.0.76 --headless --browser=chromium")
+        );
+    }
+
+    #[test]
+    fn config_without_browser_section_gets_defaults() {
+        // 整段缺省 = 全默认零配置;既有 agent.toml(无 [browser])解析
+        // 不变且拿到默认 browser。
+        let cfg: Config = toml::from_str(
+            "[hub]\nurl = \"wss://h\"\n\n[auth]\nregistration_token = \"t\"\n",
+        )
+        .unwrap();
+        assert!(cfg.browser.web_enabled);
+        assert_eq!(cfg.browser.web_backend, None);
     }
 }
 

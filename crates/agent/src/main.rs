@@ -361,6 +361,14 @@ extra_args     = []
 # [remote_mcp]
 # enabled = true
 # port    = 7110
+
+# [browser] controls the agent-local headless `web` browser entry that
+# gets injected into claude's per-session MCP config (plan ②). Default:
+# enabled, pinned playwright-mcp via npx (requires node >= 18 on this
+# host). Uncomment to override.
+# [browser]
+# web_enabled = true
+# web_backend = "npx -y @playwright/mcp@0.0.76 --headless --browser=chromium"
 "#
     );
 
