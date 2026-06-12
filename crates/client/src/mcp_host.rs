@@ -32,12 +32,14 @@ pub fn backend_command() -> Option<(String, Vec<String>)> {
 }
 
 /// 已 spawn 的 MCP 子进程,说「按行分隔的 JSON-RPC over stdio」。
+#[allow(dead_code)] // Task 6+ 接线后使用
 pub struct McpProcess {
     child: Child,
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
 }
 
+#[allow(dead_code)] // Task 6+ 接线后使用
 impl McpProcess {
     pub fn spawn(program: &str, args: &[String]) -> std::io::Result<Self> {
         let mut child = Command::new(program)
@@ -63,7 +65,13 @@ impl McpProcess {
     /// 读下一帧;子进程 EOF → None。空行跳过。
     pub async fn next_frame(&mut self) -> Option<String> {
         loop {
-            let line = self.lines.next_line().await.ok()??;
+            let line = match self.lines.next_line().await {
+                Ok(opt) => opt,
+                Err(e) => {
+                    tracing::warn!("mcp subprocess stdout read error: {e}");
+                    return None;
+                }
+            }?;
             if line.trim().is_empty() {
                 continue;
             }
