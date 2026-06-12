@@ -185,6 +185,11 @@ fn browser_default_web_enabled() -> bool {
 pub struct BrowserConfig {
     /// 是否注入 `web` stdio server 条目。false ⇒ 注入配置只含
     /// cc-browser(回到计划①单 server 形态)。默认 true。
+    ///
+    /// 警告:`web` 无头后端需要 agent 沙箱允许运行 chromium。在严格
+    /// 沙箱主机上 chromium 可能被拦(已确认 macOS:strict sandbox 下
+    /// chromium 崩溃 SIGTRAP,ICU data fd 被阻;Task 7.1 2026-06-13 实测)。
+    /// 此时设 `web_enabled = false`(cc-browser 仍可用)或放宽沙箱 profile。
     #[serde(default = "browser_default_web_enabled")]
     pub web_enabled: bool,
     /// 整条 web 后端命令覆盖(空白分隔)。缺省 = 内置默认

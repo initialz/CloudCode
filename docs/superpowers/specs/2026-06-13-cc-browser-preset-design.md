@@ -215,7 +215,7 @@ Rules:
 | `cc-browser` 后端(playwright-mcp)崩溃 | `McpHost` 既有退避重启;持久 profile 保登录态 | 一次失败,重试通常成功 |
 | client 端缺 node / npx 失败 | spawn 失败走 `McpHost` 既有退避/冷却,最终在飞请求收 JSON-RPC 错误 | 错误文案引导检查 node 安装;`web` 不受影响 |
 | `web` 后端 spawn 失败(缺 node / 沙箱拦 / 拉包超时) | 该 server 由 claude 直管:claude 按自身 MCP 失败语义报告 server 不可用,`--strict-mcp-config` 下其余工作不受影响 | claude 告知用户 web 浏览不可用;**不得**自行改用 `cc-browser`(规则 3 同理,需用户确认) |
-| **agent 沙箱拦 headless chromium**(首要风险) | 本计划**首要复验**:在 `SandboxExec --home` 内实跑 `npx -y @playwright/mcp@0.0.76 --headless` + 一次真实导航(重点:沙箱网络访问、chromium 临时文件/共享内存写)。desktop-app 线 P1 实测过 agent 上能跑 Chrome(`feature/desktop-app`),大概率 OK。**若拦**:降级方案按序 ① 放宽沙箱 profile(为 chromium 所需路径/能力开白名单);② 不可放宽则 `web_enabled` 默认翻 false + 文档化要求(用户在非沙箱 agent 上启用),`cc-browser` 单独照常 | 验证结论与所选降级写回本 spec(见开放问题) |
+| **agent 沙箱拦 headless chromium**(首要风险) | **2026-06-13 Task 7.1 复验结论(macOS,DECISIVE):非沙箱可跑(`chrome-headless-shell --headless --dump-dom https://example.com` → "Example Domain" ✅);agent strict sandbox 内 chromium 崩溃 `Trace/BPT trap: 5`(SIGTRAP),stderr `icudtl.dat not found in bundle` + `Invalid file descriptor to ICU data received`——chromium 经 passed-fd 加载 ICU i18n 数据,被 macOS SBPL 沙箱拦死。证实首要风险:strict-sandbox macOS agent 上默认 `web_enabled=true` 会让 web 后端崩溃。** 降级按序 ① 放宽沙箱 profile(为 chromium 所需路径/能力 + ICU data fd 开白名单);② 不可放宽则设 `web_enabled=false`(现已有确证的 macOS 触发条件)+ 文档化要求,`cc-browser` 单独照常。Linux agent(`sandbox/linux.rs`,机制不同)需用户另行复验 | 已写回本 spec(见开放问题 1);config.rs `web_enabled` 文档 + README 已加警告 |
 | 首次 `npx` 拉包慢 | 见组件 6 三层处理(超时兜底 / 预热 / vendoring 开放项) | 最坏情况:首次调用一次超时错误,重试即成 |
 | 任意请求超时 / client 中途断开 | 计划①分层超时与 `fail_pending` 原样生效(仅 `cc-browser` 路径涉及) | 不挂死,可执行文案 |
 
@@ -254,9 +254,10 @@ Rules:
 
 ## 开放问题(实现计划阶段确定)
 
-1. **agent 沙箱复验结论**:`SandboxExec` 内 playwright-mcp + headless chromium 是否直接可跑;不可跑时落哪一档降级(放宽 profile vs `web_enabled` 默认 false + 文档化)。这是实现计划的第一个任务。
+1. **agent 沙箱复验结论(2026-06-13 已复验,DECISIVE)**:`SandboxExec` 内 headless chromium **在 macOS strict sandbox 下不可跑**——非沙箱基线 `chrome-headless-shell --headless --dump-dom https://example.com` 正常返回 "Example Domain";套上 `cloudcode-agent sandbox-exec --mode strict` 后 chromium 崩溃 `Trace/BPT trap: 5`(SIGTRAP),stderr `icudtl.dat not found in bundle` + `Invalid file descriptor to ICU data received`。根因:chromium 经 passed-fd 机制加载 ICU i18n 数据,被 macOS SBPL 沙箱(`sandbox/macos.rs` + `profile.sb`)阻断。**证实本 spec 首要风险:strict-sandbox macOS agent 上默认 `web_enabled=true` 会让 web 后端崩溃。** 降级:① 放宽沙箱 profile 为 chromium(含 ICU data fd)开白名单;② 不可放宽则 `web_enabled=false`(cc-browser 仍可用)——现已有确证的 macOS 触发条件。**Caveat**:此结论仅限 macOS;生产 Linux agent(`sandbox/linux.rs`,不同机制)需用户另行复验。默认值不改(`web_enabled` 仍默认 true),由用户按其 agent 平台决定。
+   - **Task 7 backend smoke(非沙箱)PASS**:playwright-mcp 握手 + `tools/list` ✅;`browser_navigate https://example.com` 真实拉起 chromium 并返回(含浏览器启动 46s)。pin 的 `@playwright/mcp@0.0.76` 后端命令在沙箱外完全可用。
 2. **playwright-mcp 分发:npx 惰性拉取(当前默认)vs vendored 进安装包**。零手动配置已达成,首跑延迟是唯一痛点;预热(组件 6)是否足够、vendoring 是否值得包体积代价,在此拍定。
-3. **`web` 后端 chromium 首次下载**:playwright-mcp 冷机首跑缺浏览器内核时的行为(自动下载的耗时与可行性 / 是否在安装文档与 `install.sh` 中加 `npx playwright install chromium` 预装步骤 / 复用本机已装 Chrome)。
+3. **`web` 后端 chromium 首次下载(2026-06-13 已实测)**:`npx -y @playwright/mcp@0.0.76` 暖缓存启动 ≈1s;`playwright install chromium` 首次下载 = 93.4 MiB / ≈61s。冷机一次性付出 chromium 下载(约一分钟)+ npx 拉取;暖缓存后 ≈1s。结论:首拉延迟可接受为一次性成本,是否在安装文档/`install.sh` 加预装步骤(把这一分钟前移到安装期)留作落地选项。
 4. **pin 版本升级策略**:`@playwright/mcp@0.0.76` 升级的节奏与验证清单(两后端共用一个 pin;升级需重跑双后端冒烟),以及 pin 常量在代码中的单点存放。
 5. **实现级落点**:`[browser]` 字段最终命名与默认 `profile_dir` 确切路径、`mcp_config_json` 新签名、agent 侧 `[browser]` 与既有 `[remote_mcp]` 的代码组织、预热的挂接点。
 

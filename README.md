@@ -35,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh 
 cloudcode --init && $EDITOR ~/.config/cloudcode/config.toml && cloudcode
 ```
 
-> **Browser preset:** the default web-browsing backends on both the agent (headless) and the client (visible window) run `@playwright/mcp` via `npx` — install **node >= 18** on both machines to use them. Without node, everything else works; browser tool calls return an actionable error instead.
+> **Browser preset:** the default web-browsing backends on both the agent (headless) and the client (visible window) run `@playwright/mcp` via `npx` — install **node >= 18** on both machines to use them. Without node, everything else works; browser tool calls return an actionable error instead. The agent `web` (headless) backend also needs the agent's sandbox to allow chromium; if your agent runs claude in a strict sandbox that blocks chromium (confirmed on macOS), set `[browser].web_enabled = false` (local `cc-browser` is unaffected) or relax the sandbox profile.
 
 Open the admin UI at `http://<hub>:7101/admin/`, paste the admin token, grant your account access to the agent, and you're done. The user-facing browser client lives at `http://<hub>:7100/`.
 
