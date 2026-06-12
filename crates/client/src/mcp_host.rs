@@ -38,6 +38,7 @@ pub struct BrowserConfig {
     pub enabled: bool,
     /// 整条后端命令覆盖(空白分隔)。缺省 = 内置默认
     /// `npx -y @playwright/mcp@<pin> --user-data-dir=<profile_dir>`。
+    /// 路径中不得含空格(parse_backend 按空白切分,无引号解析)。
     #[serde(default)]
     pub backend: Option<String>,
     /// 持久 profile 路径(拼进默认命令的 --user-data-dir)。缺省 =
@@ -65,7 +66,15 @@ impl Default for BrowserConfig {
 /// XDG_STATE_HOME,通常 ~/.local/state/cloudcode)下的 browser-profile。
 /// 定不出 state 目录(无 home)→ None,调用方按「无后端」处理。
 fn default_profile_dir() -> Option<std::path::PathBuf> {
-    crate::state_dir().ok().map(|d| d.join("browser-profile"))
+    match crate::state_dir() {
+        Ok(d) => Some(d.join("browser-profile")),
+        Err(_) => {
+            tracing::warn!(
+                "无法确定 state 目录,cc-browser 默认后端不可用(设 CLOUDCODE_STATE_DIR 可修)"
+            );
+            None
+        }
+    }
 }
 
 /// 创建 profile 目录并(unix)收紧 0700:登录态(cookie/会话)落在
@@ -115,6 +124,28 @@ fn backend_command_from(
             format!("--user-data-dir={}", profile.display()),
         ],
     ))
+}
+
+/// `backend_command` 会不会返回 Some —— 纯判断,不碰文件系统(不建
+/// profile 目录)。供 wire.rs 设 Hello 能力位用;真正 spawn 走
+/// `backend_command`(那条才建目录)。与 backend_command_from 的可用性
+/// 判断逐条对齐。
+pub fn capable_for_hello(cfg: &BrowserConfig) -> bool {
+    capable_from(std::env::var("CC_REMOTE_MCP_BACKEND").ok().as_deref(), cfg)
+}
+
+/// 纯函数内核(env 注入为形参,单测不碰进程环境)。
+fn capable_from(env_backend: Option<&str>, cfg: &BrowserConfig) -> bool {
+    if let Some(cmd) = env_backend {
+        return parse_backend(cmd).is_some();
+    }
+    if !cfg.enabled {
+        return false;
+    }
+    if cfg.backend.is_some() {
+        return cfg.backend.as_deref().and_then(parse_backend).is_some();
+    }
+    cfg.profile_dir.is_some() || default_profile_dir().is_some()
 }
 
 /// 已 spawn 的 MCP 子进程,说「按行分隔的 JSON-RPC over stdio」。
@@ -580,6 +611,68 @@ mod tests {
             profile_dir: Some(std::path::PathBuf::from("/unused")),
         };
         assert_eq!(backend_command_from(None, &cfg), None);
+    }
+
+    #[test]
+    fn capable_from_env_wins_even_when_disabled() {
+        // env 注入后端 ⇒ capable,纵使 enabled=false(与 backend_command_from
+        // 的 env-over-disabled 语义对齐)。
+        let cfg = BrowserConfig {
+            enabled: false,
+            backend: None,
+            profile_dir: None,
+        };
+        assert!(capable_from(Some("node /tmp/echo.mjs"), &cfg));
+        // 空白 env 串 ⇒ parse_backend None ⇒ 不可用(显式"没有后端")。
+        assert!(!capable_from(Some("   "), &cfg));
+    }
+
+    #[test]
+    fn capable_from_disabled_without_env_is_false() {
+        let cfg = BrowserConfig {
+            enabled: false,
+            backend: None,
+            profile_dir: Some(std::path::PathBuf::from("/unused")),
+        };
+        assert!(!capable_from(None, &cfg));
+    }
+
+    #[test]
+    fn capable_from_explicit_backend_is_true() {
+        let cfg = BrowserConfig {
+            enabled: true,
+            backend: Some("node /tmp/x.mjs".to_string()),
+            profile_dir: None,
+        };
+        assert!(capable_from(None, &cfg));
+    }
+
+    #[test]
+    fn capable_from_default_path_with_profile_dir_is_true() {
+        let cfg = BrowserConfig {
+            enabled: true,
+            backend: None,
+            profile_dir: Some(std::path::PathBuf::from("/some/profile")),
+        };
+        assert!(capable_from(None, &cfg));
+    }
+
+    #[test]
+    fn capable_from_has_no_directory_side_effect() {
+        // 纯判断绝不建 profile 目录(对照 backend_command_from 会建)。
+        let dir = tempfile::tempdir().unwrap();
+        let prof = dir.path().join("never-created");
+        let cfg = BrowserConfig {
+            enabled: true,
+            backend: None,
+            profile_dir: Some(prof.clone()),
+        };
+        assert!(capable_from(None, &cfg));
+        assert!(
+            !prof.exists(),
+            "capable_from must not create the profile dir: {}",
+            prof.display()
+        );
     }
 
     #[tokio::test]

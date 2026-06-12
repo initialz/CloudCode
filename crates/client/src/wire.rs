@@ -49,8 +49,9 @@ pub async fn connect(
         token: token.to_string(),
         version: PTY_PROTOCOL_VERSION.into(),
         // 解析得出后端命令 = 本机能承载远程-MCP 后端(决策 D9→P1:
-        // 内置默认存在后,[browser].enabled=true 时恒为 true)。
-        remote_mcp_capable: crate::mcp_host::backend_command(browser).is_some(),
+        // 内置默认存在后,[browser].enabled=true 时恒为 true)。纯判断
+        // (capable_for_hello),不碰文件系统 —— 真正 spawn 才建 profile 目录。
+        remote_mcp_capable: crate::mcp_host::capable_for_hello(browser),
     };
     sink.send(Message::Text(serde_json::to_string(&hello)?))
         .await

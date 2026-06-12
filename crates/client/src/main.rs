@@ -314,6 +314,7 @@ token   = "cc_PASTE_TOKEN_HERE"
 # enabled     = true
 # backend     = "npx -y @playwright/mcp@0.0.76 --user-data-dir=/custom/profile --browser=firefox"
 # profile_dir = "/custom/profile"
+# 注:设了 backend 时 profile_dir 被忽略(显式 backend 自带 --user-data-dir)。
 "#;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
