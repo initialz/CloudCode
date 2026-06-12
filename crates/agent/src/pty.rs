@@ -627,46 +627,32 @@ impl PtyManager {
                         .unwrap_or_else(|| Uuid::new_v4().simple().to_string())
                 })
                 .clone();
-            self.mcp.register(token.clone(), session_id);
             let mcp_cfg = crate::mcp_proxy::mcp_config_json(self.remote_mcp.port, &token);
             let mcp_cfg_path = cwd.join(".cloudcode").join("mcp-remote.json");
             if let Some(parent) = mcp_cfg_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
+                if let Err(e) = std::fs::create_dir_all(parent) {
+                    tracing::warn!(error = %e, "failed to create .cloudcode dir for remote MCP config");
+                }
             }
-            // 配置内含 bearer token:从创建那一刻就是 0600(不留
-            // 「先写后 chmod」的全局可读窗口)。
-            #[cfg(unix)]
-            let write_res = {
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(&mcp_cfg_path)
-                    .and_then(|mut f| f.write_all(mcp_cfg.as_bytes()))
-            };
-            #[cfg(not(unix))]
-            let write_res = std::fs::write(&mcp_cfg_path, &mcp_cfg);
-            if let Err(e) = write_res {
-                tracing::warn!(error = %e, "failed to write remote MCP config");
+            // 路由注册 + 注入 --mcp-config 只在配置确实落盘后进行:把
+            // claude 指向一个缺失/部分的 --mcp-config(且会随每次 tmux
+            // respawn 粘性重现)比「干净地无 cc-browser 启动」更糟。
+            match write_remote_mcp_config_0600(&mcp_cfg_path, mcp_cfg.as_bytes(), session_id) {
+                Ok(()) => {
+                    self.mcp.register(token.clone(), session_id);
+                    // 进程级注入:--mcp-config + --strict-mcp-config + 通用
+                    // 引导 prompt。绝不写全局 ~/.claude.json,绝不 `claude
+                    // mcp add`(D11 铁律)。strict 保证 claude 只看到这份
+                    // 配置 —— 同机其他 claude 进程零影响。
+                    claude_args.extend(crate::mcp_proxy::claude_mcp_args(&mcp_cfg_path));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to write remote MCP config; skipping cc-browser injection this open"
+                    );
+                }
             }
-            // `.mode(0o600)` 只在创建时生效;老文件穿过 truncate 仍保
-            // 留原 mode(可能 0644),显式修一遍。
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &mcp_cfg_path,
-                    std::fs::Permissions::from_mode(0o600),
-                );
-            }
-            // 进程级注入:--mcp-config + --strict-mcp-config + 通用
-            // 引导 prompt。绝不写全局 ~/.claude.json,绝不 `claude mcp
-            // add`(D11 铁律)。strict 保证 claude 只看到这份配置 ——
-            // 同机其他 claude 进程(没带这些 flag)零影响。
-            claude_args.extend(crate::mcp_proxy::claude_mcp_args(&mcp_cfg_path));
         }
 
         // Open the PTY.
@@ -1799,6 +1785,49 @@ impl Recorder {
 /// 会直接启动失败(决策 D11;M1-M3 未做此门控,本计划修正)。
 fn should_inject_mcp(enabled: bool, remote_mcp_capable: bool, tool_name: &str) -> bool {
     enabled && remote_mcp_capable && tool_name == "claude"
+}
+
+/// 原子写一份含 bearer token 的 0600 配置:写进同目录临时文件
+/// (创建即 0600,不留「先写后 chmod」的 0644 窗口)再 rename 覆盖
+/// 目标 —— 目标永远是「要么旧内容、要么完整的新 0600 文件」,绝无
+/// 部分写入或短暂可读窗口。临时名带 session_id,避免同一工作区并发
+/// open 撞名。
+fn write_remote_mcp_config_0600(
+    path: &Path,
+    contents: &[u8],
+    session_id: Uuid,
+) -> std::io::Result<()> {
+    let tmp = path.with_file_name(format!("mcp-remote.json.{}.tmp", session_id.simple()));
+    let res = {
+        #[cfg(unix)]
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .and_then(|mut f| {
+                    f.write_all(contents)?;
+                    f.flush()
+                })
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&tmp, contents)
+        }
+    };
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn validate_name(name: &str, kind: &str) -> std::result::Result<(), String> {
