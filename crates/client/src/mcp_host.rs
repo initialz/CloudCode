@@ -233,6 +233,124 @@ impl McpChannel {
     }
 }
 
+/// 后端连续 spawn 失败的上限;达到后进入冷却,期间一律快速失败
+/// (relay 回发 RemoteMcpClosed,agent 立刻把在飞请求转成 JSON-RPC
+/// 错误,claude 毫秒级可见,绝不等满超时)。
+const MAX_CONSECUTIVE_SPAWN_FAILURES: u32 = 3;
+/// 冷却时长;到点后允许再试(计数清零重来)。
+const SPAWN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 宿主投递失败 —— relay 据此回发 `ClientToHub::RemoteMcpClosed`。
+#[derive(Debug)]
+pub enum McpHostError {
+    BackendUnavailable(String),
+}
+
+impl std::fmt::Display for McpHostError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            McpHostError::BackendUnavailable(why) => write!(f, "backend unavailable: {why}"),
+        }
+    }
+}
+
+/// 通用 MCP 宿主:一个插槽。惰性拉起后端子进程(首帧到达才 spawn)、
+/// 桥 stdio⇄隧道、崩溃带退避重启(连续失败上限 + 冷却)、握手缓存重放。
+pub struct McpHost {
+    backend: (String, Vec<String>),
+    chan: Option<McpChannel>,
+    handshake: Arc<Mutex<Vec<String>>>,
+    out_tx: mpsc::Sender<String>,
+    consecutive_failures: u32,
+    cooldown_until: Option<tokio::time::Instant>,
+}
+
+impl McpHost {
+    pub fn new(backend: (String, Vec<String>), out_tx: mpsc::Sender<String>) -> Self {
+        Self {
+            backend,
+            chan: None,
+            handshake: Arc::new(Mutex::new(Vec::new())),
+            out_tx,
+            consecutive_failures: 0,
+            cooldown_until: None,
+        }
+    }
+
+    /// 投递一帧给后端;后端没在跑就先(按重放语义)拉起。
+    /// Err = 后端不可用,调用方应回发 RemoteMcpClosed 快速失败。
+    pub async fn deliver(&mut self, payload: String) -> Result<(), McpHostError> {
+        if self.chan.is_none() {
+            self.spawn_channel().await?;
+        }
+        let Some(chan) = self.chan.as_ref() else {
+            return Err(McpHostError::BackendUnavailable("spawn failed".to_string()));
+        };
+        if chan.feed(payload).is_err() {
+            // 泵死(子进程崩溃/EOF):收摊并计一次失败;下一帧惰性重生。
+            self.chan = None;
+            self.note_failure();
+            return Err(McpHostError::BackendUnavailable(
+                "backend subprocess died".to_string(),
+            ));
+        }
+        // feed 成功视为后端活着:清零连续失败计数(上限只惩罚连续失败,
+        // 偶发崩溃 + claude 主动重试 = 每次重试一次重生机会)。
+        self.consecutive_failures = 0;
+        Ok(())
+    }
+
+    /// 收摊当前后端(响应 HubToClient::RemoteMcpClosed)。握手缓存
+    /// 保留,之后的惰性重生靠它重放续接。
+    pub fn shutdown(&mut self) {
+        self.chan = None; // drop → 泵退出 → kill_on_drop 收尸
+    }
+
+    fn note_failure(&mut self) {
+        self.consecutive_failures += 1;
+        if self.consecutive_failures >= MAX_CONSECUTIVE_SPAWN_FAILURES {
+            self.cooldown_until = Some(tokio::time::Instant::now() + SPAWN_COOLDOWN);
+        }
+    }
+
+    async fn spawn_channel(&mut self) -> Result<(), McpHostError> {
+        if let Some(until) = self.cooldown_until {
+            if tokio::time::Instant::now() < until {
+                return Err(McpHostError::BackendUnavailable(
+                    "backend restarting too fast; in cooldown".to_string(),
+                ));
+            }
+            self.cooldown_until = None;
+            self.consecutive_failures = 0;
+        }
+        let (prog, args) = self.backend.clone();
+        let empty = self.handshake.lock().expect("handshake mutex").is_empty();
+        let started = if empty {
+            McpChannel::start(&prog, &args, self.out_tx.clone(), self.handshake.clone())
+        } else {
+            McpChannel::start_replayed(&prog, &args, self.out_tx.clone(), self.handshake.clone())
+                .await
+        };
+        match started {
+            Ok(ch) => {
+                self.chan = Some(ch);
+                Ok(())
+            }
+            Err(e) => {
+                self.note_failure();
+                tracing::warn!(
+                    error = %e,
+                    failures = self.consecutive_failures,
+                    "failed to start MCP backend subprocess"
+                );
+                Err(McpHostError::BackendUnavailable(format!(
+                    "failed to start backend: {e}"
+                )))
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,5 +533,83 @@ mod tests {
         assert_eq!(cache.lock().unwrap().len(), 1, "replayed frame must not grow cache");
         drop(chan);
         assert_eq!(cache.lock().unwrap().len(), 1, "cache outlives the channel");
+    }
+
+    #[tokio::test]
+    async fn host_lazy_spawns_and_roundtrips_via_echo_stub() {
+        if !node_available() {
+            return;
+        }
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/echo-mcp.mjs");
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let mut host = McpHost::new(("node".to_string(), vec![fixture.to_string()]), out_tx);
+        // 首帧触发惰性 spawn;echo 桩应答按 id 配对回来。
+        host.deliver(
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hi"}}}"#
+                .to_string(),
+        )
+        .await
+        .expect("deliver");
+        let resp = out_rx.recv().await.expect("echo response");
+        assert!(resp.contains(r#""id":3"#) && resp.contains("echo: hi"), "got: {resp}");
+    }
+
+    #[tokio::test]
+    async fn host_spawn_failure_caps_then_cools_down() {
+        // 不存在的程序:每次 deliver 都 spawn 失败;到上限后进入冷却,
+        // 冷却中不再尝试 spawn、错误文案可区分(快速失败)。
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let mut host = McpHost::new(
+            ("/nonexistent/cloudcode-test-backend".to_string(), vec![]),
+            out_tx,
+        );
+        for _ in 0..MAX_CONSECUTIVE_SPAWN_FAILURES {
+            let err = host
+                .deliver(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#.to_string())
+                .await
+                .expect_err("spawn must fail");
+            assert!(err.to_string().contains("failed to start backend"), "got: {err}");
+        }
+        let err = host
+            .deliver(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#.to_string())
+            .await
+            .expect_err("must be cooling down");
+        assert!(err.to_string().contains("cooldown"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn host_shutdown_keeps_handshake_cache_for_respawn() {
+        if !node_available() {
+            return;
+        }
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/echo-mcp.mjs");
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let mut host = McpHost::new(("node".to_string(), vec![fixture.to_string()]), out_tx);
+        host.deliver(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#
+                .to_string(),
+        )
+        .await
+        .expect("deliver initialize");
+        let init_resp = out_rx.recv().await.expect("initialize response");
+        assert!(init_resp.contains("serverInfo"));
+        host.deliver(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string())
+            .await
+            .expect("deliver initialized");
+
+        // 模拟 HubToClient::RemoteMcpClosed:收摊。缓存必须健在。
+        host.shutdown();
+        assert_eq!(host.handshake.lock().unwrap().len(), 2);
+
+        // 下一帧触发带重放的惰性重生:直接得到 tools/list 响应,且不
+        // 泄漏重复的 initialize 响应。
+        host.deliver(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#.to_string())
+            .await
+            .expect("deliver after shutdown");
+        let next = tokio::time::timeout(std::time::Duration::from_secs(10), out_rx.recv())
+            .await
+            .expect("frame within 10s")
+            .expect("alive");
+        assert!(next.contains(r#""id":2"#) && !next.contains("serverInfo"), "got: {next}");
     }
 }
