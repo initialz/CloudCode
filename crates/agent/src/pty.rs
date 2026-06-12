@@ -611,7 +611,7 @@ impl PtyManager {
         // session_id,这里把同一 token 对新 session_id 重注册(覆盖式)
         // —— tmux 里活着的 claude(内存持 token)与重启的 claude(从
         // 字节稳定的 mcp-remote.json 重读)都路由到活会话。
-        if should_inject_mcp(self.remote_mcp.enabled, remote_mcp_capable, &tool_name) {
+        if should_inject_mcp(self.remote_mcp.enabled, &tool_name) {
             let token = self
                 .workspace_tokens
                 .entry((account.clone(), workspace.clone()))
@@ -1788,13 +1788,12 @@ impl Recorder {
 
 /// Common name rules for accounts and workspaces (must be safe to drop into
 /// a path component and a tmux session name).
-/// 注入决策(纯函数,单测):Phase D = enabled && capable && claude。
-/// Phase E(Task 14)翻转为 enabled && claude(始终广告,决策 D7)。
-/// tool 门是硬条件:--mcp-config/--strict-mcp-config/
-/// --append-system-prompt 是 claude 专属 flag,喂给 codex 等其他工具
-/// 会直接启动失败(决策 D11;M1-M3 未做此门控,本计划修正)。
-fn should_inject_mcp(enabled: bool, remote_mcp_capable: bool, tool_name: &str) -> bool {
-    enabled && remote_mcp_capable && tool_name == "claude"
+/// 注入决策(纯函数,单测):Phase E 起 = enabled && claude ——
+/// **不再**看 client capability(始终广告,决策 D7):claude 冷启动
+/// 也要拿到 cc-browser 配置,无 client 时由 proxy 权威 fallback 应答。
+/// tool 门是硬条件:这些是 claude 专属 flag(决策 D11)。
+fn should_inject_mcp(enabled: bool, tool_name: &str) -> bool {
+    enabled && tool_name == "claude"
 }
 
 /// 原子写一份含 bearer token 的 0600 配置:写进同目录临时文件
@@ -2093,14 +2092,13 @@ mod remote_mcp_inject_tests {
     use super::*;
 
     #[test]
-    fn inject_gates_on_enabled_capability_and_claude() {
-        // Phase D 语义:三个条件齐才注入。Phase E(Task 14)翻转为
-        // 始终广告(去掉 capability 条件),届时本测试同步更新。
-        assert!(should_inject_mcp(true, true, "claude"));
-        assert!(!should_inject_mcp(false, true, "claude"), "disabled kills injection");
-        assert!(!should_inject_mcp(true, false, "claude"), "incapable client: no injection");
+    fn inject_gates_on_enabled_and_claude_only() {
+        // Phase E 语义:始终广告 —— capability 不再参与注入决策
+        // (它只驱动 attach 跟踪与 list_changed)。
+        assert!(should_inject_mcp(true, "claude"));
+        assert!(!should_inject_mcp(false, "claude"), "disabled kills injection");
         assert!(
-            !should_inject_mcp(true, true, "codex"),
+            !should_inject_mcp(true, "codex"),
             "claude-only flags must never reach other tools"
         );
     }

@@ -211,9 +211,11 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         .unwrap_or_else(name::default_agent_name);
     tracing::info!(agent = %name, "starting cloudcode-agent");
 
-    // McpProxy 与 PtyManager 必须共享同一实例(开会话时注册的路由要
-    // 对 HTTP handler 可见),先于两者构建。
-    let mcp = mcp_proxy::McpProxy::new();
+    // McpProxy 与 PtyManager 必须共享同一实例,先于两者构建。静态
+    // 工具表(始终广告的冷启动 tools/list 内容)启动时载入一次。
+    let static_tools =
+        mcp_proxy::load_tools_manifest(config.remote_mcp.tools_manifest.as_deref());
+    let mcp = mcp_proxy::McpProxy::with_static_tools(static_tools);
 
     let manager = Arc::new(PtyManager::new(
         config.claude.clone(),

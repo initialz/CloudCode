@@ -58,6 +58,11 @@ pub struct McpProxy {
     /// 当前有 capable client 在线的会话集合(PtyOpen 标记 / PtyClose
     /// 摘除)。在线 → 帧转发;离线 → 权威 fallback(Task 14)。
     attached: Arc<DashMap<Uuid, ()>>,
+    /// 无 client 在线时 tools/list 的权威应答内容:JSON **数组**原文
+    /// (来自 [remote_mcp].tools_manifest,缺省 "[]")。数据不是代码,
+    /// 不破坏 proxy 的 backend 无关性;dev-browser 的 manifest 内容
+    /// 属计划②(决策 D17)。
+    static_tools: Arc<String>,
 }
 
 impl Default for McpProxy {
@@ -68,11 +73,17 @@ impl Default for McpProxy {
 
 impl McpProxy {
     pub fn new() -> Self {
+        Self::with_static_tools("[]".to_string())
+    }
+
+    /// 带静态工具表构造(main.rs 启动时从 manifest 文件载入)。
+    pub fn with_static_tools(static_tools: String) -> Self {
         Self {
             routes: Arc::new(DashMap::new()),
             pending: Arc::new(DashMap::new()),
             to_hub: Arc::new(RwLock::new(None)),
             attached: Arc::new(DashMap::new()),
+            static_tools: Arc::new(static_tools),
         }
     }
 
@@ -199,6 +210,67 @@ fn jsonrpc_error(id_raw: &str, code: i64, message: &str) -> String {
     )
 }
 
+/// 调用时无可用 client/后端的可执行文案(-32004,决策 D13)。claude
+/// 会把它转达给用户;webterm-only 接入恒走此路径。
+const NO_CLIENT_MSG: &str = "cc-browser backend is not connected: no cloudcode CLI client \
+with a configured MCP backend is attached to this session (the web terminal cannot host \
+local tools). Ask the user to open the cloudcode CLI on their local machine, then retry \
+after they confirm it is connected.";
+
+/// 无 client 在线时的权威应答(决策 D7/D16):initialize 本地应答
+/// (回显请求的 protocolVersion、声明 tools.listChanged),tools/list
+/// 用静态表,其余请求 → -32004 可执行文案。
+fn fallback_request(id_raw: &str, body: &str, tools_json: &str) -> String {
+    let v: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    let method = v
+        .as_ref()
+        .and_then(|x| x.get("method"))
+        .and_then(|m| m.as_str())
+        .unwrap_or("");
+    match method {
+        "initialize" => {
+            let proto = v
+                .as_ref()
+                .and_then(|x| x.get("params"))
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(|s| s.as_str())
+                .unwrap_or("2025-06-18");
+            format!(
+                r#"{{"jsonrpc":"2.0","id":{id_raw},"result":{{"protocolVersion":{proto_json},"capabilities":{{"tools":{{"listChanged":true}}}},"serverInfo":{{"name":"{CC_BROWSER_SERVER}","version":"{ver}"}}}}}}"#,
+                proto_json = serde_json::Value::String(proto.to_string()),
+                ver = env!("CARGO_PKG_VERSION"),
+            )
+        }
+        "tools/list" => format!(
+            r#"{{"jsonrpc":"2.0","id":{id_raw},"result":{{"tools":{tools_json}}}}}"#
+        ),
+        _ => jsonrpc_error(id_raw, -32004, NO_CLIENT_MSG),
+    }
+}
+
+/// 读静态工具表(JSON 数组文件)。读不到 / 不是数组 → 告警 + 空表,
+/// 坏 manifest 绝不拖垮 agent 启动。
+pub fn load_tools_manifest(path: Option<&std::path::Path>) -> String {
+    let Some(path) = path else {
+        return "[]".to_string();
+    };
+    match std::fs::read_to_string(path) {
+        Ok(s) => match serde_json::from_str::<Vec<serde_json::Value>>(&s) {
+            Ok(_) => s.trim().to_string(),
+            Err(e) => {
+                tracing::warn!(error = %e, path = %path.display(),
+                    "tools_manifest is not a JSON array; using empty list");
+                "[]".to_string()
+            }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, path = %path.display(),
+                "cannot read tools_manifest; using empty list");
+            "[]".to_string()
+        }
+    }
+}
+
 /// token 前 8 字符,日志用(不泄密)。
 fn token_prefix(token: &str) -> &str {
     let end = token
@@ -297,6 +369,12 @@ pub async fn handle_post(token: &str, body: String, state: &McpProxy) -> PostOut
                 "remote MCP session not registered (token unknown or expired)",
             ))
         }
+        // 路由已注册但无 capable client 在线(冷启动 / webterm-only /
+        // client 掉线后):权威 fallback —— 始终广告(决策 D7)。
+        (Some(id), Some(session_id)) if !state.is_attached(session_id) => {
+            tracing::debug!(%session_id, "remote MCP request while detached; fallback answering");
+            PostOutcome::Response(fallback_request(&id, &body, state.static_tools.as_str()))
+        }
         // 已知会话的请求:转发并阻塞等配对响应,method 感知选档。
         (Some(id), Some(session_id)) => {
             let timeout = timeout_for(&body);
@@ -340,6 +418,8 @@ pub async fn handle_post(token: &str, body: String, state: &McpProxy) -> PostOut
             );
             PostOutcome::Accepted
         }
+        // 无 client 在线:通知本地吞掉(202),不投递。
+        (None, Some(session_id)) if !state.is_attached(session_id) => PostOutcome::Accepted,
         // 已知会话的通知:转发,无响应可等。
         (None, Some(session_id)) => {
             state
@@ -459,6 +539,7 @@ mod tests {
         let state = McpProxy::new();
         let sid = Uuid::new_v4();
         state.register("t".into(), sid);
+        state.set_attached(sid);
         let (hub_tx, mut hub_rx) = mpsc::channel(4);
         state.set_hub_sender(hub_tx).await;
         let out = handle_post(
@@ -483,6 +564,7 @@ mod tests {
         let state = McpProxy::new();
         let sid = Uuid::new_v4();
         state.register("t".into(), sid);
+        state.set_attached(sid);
         let (hub_tx, mut hub_rx) = mpsc::channel(4);
         state.set_hub_sender(hub_tx).await;
 
@@ -684,6 +766,7 @@ mod tests {
         let sid = Uuid::new_v4();
         let token = "tok-e2e";
         state.register(token.into(), sid);
+        state.set_attached(sid);
 
         let (hub_tx, mut hub_rx) = mpsc::channel(4);
         state.set_hub_sender(hub_tx).await;
@@ -764,6 +847,7 @@ mod tests {
         let sid = Uuid::new_v4();
         let token = "tok-loopback";
         state.register(token.into(), sid);
+        state.set_attached(sid);
         let (hub_tx, mut hub_rx) = mpsc::channel(4);
         state.set_hub_sender(hub_tx).await;
 
@@ -856,5 +940,129 @@ mod tests {
         assert!(body.contains("-32002"), "fail_pending error code: {body}");
         assert!(body.contains("client detached"), "reason: {body}");
         assert!(!state.is_attached(sid));
+    }
+
+    #[tokio::test]
+    async fn detached_initialize_is_answered_authoritatively() {
+        // 冷启动(注册了路由、无 client 在线):initialize 由 proxy 权威
+        // 应答 —— 回显请求的 protocolVersion、声明 tools.listChanged,
+        // claude 才能完成握手并在之后消费 list_changed(决策 D16)。
+        let state = McpProxy::with_static_tools(
+            r#"[{"name":"echo","description":"d","inputSchema":{"type":"object"}}]"#.to_string(),
+        );
+        let sid = Uuid::new_v4();
+        state.register("t".into(), sid);
+        let out = handle_post(
+            "t",
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"claude","version":"1"}}}"#
+                .to_string(),
+            &state,
+        )
+        .await;
+        match out {
+            PostOutcome::Response(b) => {
+                let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+                assert_eq!(v["id"], 1);
+                assert_eq!(
+                    v["result"]["protocolVersion"], "2024-11-05",
+                    "echoes the requested protocolVersion"
+                );
+                assert_eq!(v["result"]["capabilities"]["tools"]["listChanged"], true);
+                assert_eq!(v["result"]["serverInfo"]["name"], "cc-browser");
+            }
+            _ => panic!("expected an authoritative response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_tools_list_serves_static_manifest_or_empty() {
+        let state = McpProxy::with_static_tools(r#"[{"name":"echo"}]"#.to_string());
+        let sid = Uuid::new_v4();
+        state.register("t".into(), sid);
+        match handle_post(
+            "t",
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#.to_string(),
+            &state,
+        )
+        .await
+        {
+            PostOutcome::Response(b) => {
+                let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+                assert_eq!(v["result"]["tools"][0]["name"], "echo");
+            }
+            _ => panic!("expected a Response"),
+        }
+        // 缺省构造 = 空表(始终广告:server 健在、工具暂无),不是错误。
+        let bare = McpProxy::new();
+        bare.register("t".into(), Uuid::new_v4());
+        match handle_post(
+            "t",
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#.to_string(),
+            &bare,
+        )
+        .await
+        {
+            PostOutcome::Response(b) => {
+                let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+                assert_eq!(v["result"]["tools"], serde_json::json!([]));
+            }
+            _ => panic!("expected a Response"),
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_tools_call_gets_actionable_error() {
+        // spec 降级②:无 client 调用 → JSON-RPC 错误(非传输失败),
+        // 文案可执行 —— claude 把"打开 cloudcode CLI"转达给用户;
+        // webterm-only 接入恒走此路径。
+        let state = McpProxy::new();
+        let sid = Uuid::new_v4();
+        state.register("t".into(), sid);
+        let out = handle_post(
+            "t",
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"echo","arguments":{}}}"#
+                .to_string(),
+            &state,
+        )
+        .await;
+        match out {
+            PostOutcome::Response(b) => {
+                let v: serde_json::Value = serde_json::from_str(&b).unwrap();
+                assert_eq!(v["error"]["code"], -32004);
+                let msg = v["error"]["message"].as_str().unwrap();
+                assert!(msg.contains("cloudcode CLI"), "actionable wording: {msg}");
+            }
+            _ => panic!("expected a JSON-RPC error, not a transport failure"),
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_notification_is_swallowed_not_forwarded() {
+        let state = McpProxy::new();
+        let sid = Uuid::new_v4();
+        state.register("t".into(), sid);
+        let (hub_tx, mut hub_rx) = mpsc::channel(4);
+        state.set_hub_sender(hub_tx).await;
+        let out = handle_post(
+            "t",
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string(),
+            &state,
+        )
+        .await;
+        assert!(matches!(out, PostOutcome::Accepted));
+        assert!(hub_rx.try_recv().is_err(), "nothing may be forwarded while detached");
+    }
+
+    #[test]
+    fn tools_manifest_loading_tolerates_garbage() {
+        assert_eq!(load_tools_manifest(None), "[]");
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.json");
+        std::fs::write(&good, r#"[{"name":"t"}]"#).unwrap();
+        assert_eq!(load_tools_manifest(Some(&good)), r#"[{"name":"t"}]"#);
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, r#"{"not":"array"}"#).unwrap();
+        assert_eq!(load_tools_manifest(Some(&bad)), "[]");
+        assert_eq!(load_tools_manifest(Some(&dir.path().join("missing.json"))), "[]");
     }
 }

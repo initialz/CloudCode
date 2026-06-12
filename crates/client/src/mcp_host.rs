@@ -101,6 +101,18 @@ fn json_method(frame: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// 宿主自有的合成握手(决策 D16)。id 用字符串 "cc-host-init":
+/// start_replayed 的吞响应按 id 匹配,不会与 claude 的 id 冲突。
+/// 只在「缓存为空且首帧不是 initialize」的冷启动缝隙调用;一经合成
+/// 即入缓存,之后的重生走同一条重放路径。
+fn synthesize_handshake(cache: &mut Vec<String>) {
+    cache.push(format!(
+        r#"{{"jsonrpc":"2.0","id":"cc-host-init","method":"initialize","params":{{"protocolVersion":"2025-06-18","capabilities":{{}},"clientInfo":{{"name":"cloudcode","version":"{}"}}}}}}"#,
+        env!("CARGO_PKG_VERSION")
+    ));
+    cache.push(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string());
+}
+
 /// 一条在跑的后端 MCP 通道:pump 任务独占子进程,把子进程每帧输出
 /// 转发到 `out_tx`;`feed` 把入站帧排队写给子进程。
 ///
@@ -277,6 +289,16 @@ impl McpHost {
     /// Err = 后端不可用,调用方应回发 RemoteMcpClosed 快速失败。
     pub async fn deliver(&mut self, payload: String) -> Result<(), McpHostError> {
         if self.chan.is_none() {
+            // 冷启动缝合(决策 D16):缓存为空而首帧不是 initialize ——
+            // claude 的真握手被 agent fallback 吃掉了。合成宿主自有握手
+            // 入缓存;spawn_channel 据此走 start_replayed(重放 + 按 id
+            // 吞掉合成 initialize 的响应)。
+            {
+                let mut cache = self.handshake.lock().expect("handshake mutex");
+                if cache.is_empty() && json_method(&payload).as_deref() != Some("initialize") {
+                    synthesize_handshake(&mut cache);
+                }
+            }
             self.spawn_channel().await?;
         }
         let Some(chan) = self.chan.as_ref() else {
@@ -639,6 +661,40 @@ mod tests {
         assert!(
             saw_cooldown,
             "spawn-ok-but-pump-dies backend must hit the cooldown within 30 delivers, not storm forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_synthesizes_handshake_when_cold_started_mid_session() {
+        if !node_available() {
+            return;
+        }
+        // 决策 D16 的缝:claude 冷启动时 initialize 被 agent 侧 fallback
+        // 权威应答(client 不在线),宿主缓存里没有真握手;client 上线后
+        // 第一帧直接是 tools/list —— 宿主必须自己合成握手喂后端,并吞掉
+        // 合成 initialize 的响应,否则后端报「未初始化」。
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/echo-mcp.mjs");
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let mut host = McpHost::new(("node".to_string(), vec![fixture.to_string()]), out_tx);
+        host.deliver(r#"{"jsonrpc":"2.0","id":9,"method":"tools/list"}"#.to_string())
+            .await
+            .expect("deliver");
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), out_rx.recv())
+            .await
+            .expect("frame within 10s")
+            .expect("alive");
+        assert!(
+            resp.contains(r#""id":9"#),
+            "first visible frame is the tools/list response: {resp}"
+        );
+        assert!(
+            !resp.contains("serverInfo"),
+            "synthesized initialize response must be swallowed: {resp}"
+        );
+        assert_eq!(
+            host.handshake.lock().unwrap().len(),
+            2,
+            "synthesized handshake cached for future respawns"
         );
     }
 }
