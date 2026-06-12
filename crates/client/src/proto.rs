@@ -108,7 +108,7 @@ pub enum ClientToHub {
     /// 死亡 / 收摊)。agent 据此立刻 fail 该会话在飞请求。
     RemoteMcpClosed {
         server: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
     /// Voluntary client-initiated close (ends the whole connection).
@@ -184,7 +184,7 @@ pub enum HubToClient {
     ///(保留握手缓存,见 Phase C)。
     RemoteMcpClosed {
         server: String,
-        #[serde(default)]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
     Ping,
@@ -271,6 +271,15 @@ mod remote_mcp_tests {
             serde_json::from_str(r#"{"type":"remote_mcp_closed","server":"cc-browser"}"#).unwrap();
         match from_wire {
             HubToClient::RemoteMcpClosed { server, reason } => {
+                assert_eq!(server, "cc-browser");
+                assert_eq!(reason, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+        let from_wire_c: ClientToHub =
+            serde_json::from_str(r#"{"type":"remote_mcp_closed","server":"cc-browser"}"#).unwrap();
+        match from_wire_c {
+            ClientToHub::RemoteMcpClosed { server, reason } => {
                 assert_eq!(server, "cc-browser");
                 assert_eq!(reason, None);
             }
