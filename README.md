@@ -35,6 +35,8 @@ curl -fsSL https://raw.githubusercontent.com/initialz/cloudcode/main/install.sh 
 cloudcode --init && $EDITOR ~/.config/cloudcode/config.toml && cloudcode
 ```
 
+> **Browser preset:** the default web-browsing backends on both the agent (headless) and the client (visible window) run `@playwright/mcp` via `npx` — install **node >= 18** on both machines to use them. Without node, everything else works; browser tool calls return an actionable error instead.
+
 Open the admin UI at `http://<hub>:7101/admin/`, paste the admin token, grant your account access to the agent, and you're done. The user-facing browser client lives at `http://<hub>:7100/`.
 
 ### Windows (WSL2)
