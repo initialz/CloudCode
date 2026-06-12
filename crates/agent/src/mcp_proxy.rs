@@ -55,6 +55,9 @@ pub struct McpProxy {
     pending: Arc<DashMap<PendingKey, oneshot::Sender<String>>>,
     /// agent ws 起来后注入:让 proxy 能向 hub 发帧。
     to_hub: Arc<RwLock<Option<mpsc::Sender<OutFrame>>>>,
+    /// 当前有 capable client 在线的会话集合(PtyOpen 标记 / PtyClose
+    /// 摘除)。在线 → 帧转发;离线 → 权威 fallback(Task 14)。
+    attached: Arc<DashMap<Uuid, ()>>,
 }
 
 impl Default for McpProxy {
@@ -69,6 +72,7 @@ impl McpProxy {
             routes: Arc::new(DashMap::new()),
             pending: Arc::new(DashMap::new()),
             to_hub: Arc::new(RwLock::new(None)),
+            attached: Arc::new(DashMap::new()),
         }
     }
 
@@ -97,6 +101,25 @@ impl McpProxy {
         if let Some(tx) = tx {
             let _ = tx.send(frame).await;
         }
+    }
+
+    /// capable client 已 attach 到该会话(来自 PtyOpen.remote_mcp_capable)。
+    pub fn set_attached(&self, session_id: Uuid) {
+        self.attached.insert(session_id, ());
+    }
+
+    /// 该会话此刻是否有 capable client 在线(转发 vs fallback 的开关)。
+    pub fn is_attached(&self, session_id: Uuid) -> bool {
+        self.attached.contains_key(&session_id)
+    }
+
+    /// client 离线(hub 在每次 client detach——含合盖——都发 PtyClose):
+    /// 摘除在线标记并立刻 fail 该会话全部在飞请求(spec 降级④)。
+    /// 注意与 RemoteMcpClosed 的分工:那个只 fail_pending、不摘标记
+    /// (client 还在线,后端下一帧惰性重生);这个两者都做。
+    pub fn detach(&self, session_id: Uuid) {
+        self.attached.remove(&session_id);
+        self.fail_pending(session_id, "client detached");
     }
 
     /// 把 `session_id` 的所有在飞请求以 JSON-RPC 错误(-32002)收尾
@@ -804,5 +827,34 @@ mod tests {
         let text = resp.text().await.unwrap();
         assert!(text.contains(r#""id":11"#), "response keeps id: {text}");
         assert!(text.contains("echo: pipe"), "echo result came back: {text}");
+    }
+
+    #[test]
+    fn attach_detach_lifecycle() {
+        let state = McpProxy::new();
+        let sid = Uuid::new_v4();
+        assert!(!state.is_attached(sid));
+        state.set_attached(sid);
+        assert!(state.is_attached(sid));
+        state.detach(sid);
+        assert!(!state.is_attached(sid));
+    }
+
+    #[tokio::test]
+    async fn detach_fails_pending_requests() {
+        // spec 降级④:client 掉线瞬间,在飞请求立刻以 JSON-RPC 错误
+        // 收尾,绝不等满超时档。
+        let state = McpProxy::new();
+        let sid = Uuid::new_v4();
+        state.set_attached(sid);
+        let (tx, rx) = oneshot::channel::<String>();
+        state
+            .pending
+            .insert((sid, CC_BROWSER_SERVER.to_string(), "7".to_string()), tx);
+        state.detach(sid);
+        let body = rx.await.expect("failed fast");
+        assert!(body.contains("-32002"), "fail_pending error code: {body}");
+        assert!(body.contains("client detached"), "reason: {body}");
+        assert!(!state.is_attached(sid));
     }
 }

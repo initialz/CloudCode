@@ -655,6 +655,13 @@ impl PtyManager {
             }
         }
 
+        // attach 跟踪(Phase E):capable client 上线 → 本会话进入
+        // 「转发」模式;非 capable(webterm 等)开的会话保持「权威
+        // fallback」模式。Task 15 在此补发 list_changed。
+        if remote_mcp_capable {
+            self.mcp.set_attached(session_id);
+        }
+
         // Open the PTY.
         let size = PtySize {
             rows: rows.max(1),
@@ -993,6 +1000,9 @@ impl PtyManager {
     }
 
     async fn close(&self, session_id: Uuid, tx: mpsc::Sender<OutFrame>) {
+        // client 离线:摘在线标记 + 秒杀在飞请求(永不让 claude 干等)。
+        // 工作区稳定 token 刻意不在这儿注销 —— claude 还活在 tmux 里。
+        self.mcp.detach(session_id);
         // Drop the handle; the reader thread will see read=0 and exit; tmux
         // session stays alive on the OS.
         self.sessions.remove(&session_id);
