@@ -105,6 +105,123 @@ fn json_method(frame: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// 一条在跑的后端 MCP 通道:pump 任务独占子进程,把子进程每帧输出
+/// 转发到 `out_tx`;`feed` 把入站帧排队写给子进程。
+///
+/// 通道同时缓存途经 `feed` 的 MCP 握手帧(`initialize` 请求 +
+/// `notifications/initialized`):claude 在一条活连接上绝不重发握手,
+/// 后端(重)拉起时必须先重放缓存,在跑的 claude 会话才能无感续接。
+/// 缓存由 `McpHost` 拥有、仅共享进每条通道(通道收摊不丢缓存)。
+///
+/// 与 M1-M3 `BrowserChannel` 的差异:去掉 `done_rx`(它只服务于 M3
+/// headed/headless 切换时的有界等待,计划①无该路径;②如需再引入)。
+pub struct McpChannel {
+    in_tx: mpsc::Sender<String>,
+    handshake: Arc<Mutex<Vec<String>>>,
+}
+
+impl McpChannel {
+    /// 冷启动:直接 spawn 并接泵。缓存为空时用这个(真正首启,握手帧
+    /// 正在路上,会经 `feed` 自然入缓存)。
+    pub fn start(
+        program: &str,
+        args: &[String],
+        out_tx: mpsc::Sender<String>,
+        handshake: Arc<Mutex<Vec<String>>>,
+    ) -> std::io::Result<Self> {
+        tracing::info!(program, ?args, "starting MCP backend subprocess");
+        let proc = McpProcess::spawn(program, args)?;
+        Ok(Self::from_process(proc, out_tx, handshake))
+    }
+
+    /// 重生:spawn 新子进程,先把缓存握手帧重放进去(重放出的
+    /// initialize 响应按 id 吞掉 —— claude 手里已有一份),再接泵。
+    /// 重放期间冒出的无关帧(如 server 主动通知)照常转发 out_tx。
+    pub async fn start_replayed(
+        program: &str,
+        args: &[String],
+        out_tx: mpsc::Sender<String>,
+        handshake: Arc<Mutex<Vec<String>>>,
+    ) -> std::io::Result<Self> {
+        tracing::info!(program, ?args, "restarting MCP backend subprocess (handshake replay)");
+        let mut proc = McpProcess::spawn(program, args)?;
+        let frames: Vec<String> = handshake.lock().expect("handshake mutex").clone();
+        for frame in &frames {
+            let init_id = if json_method(frame).as_deref() == Some("initialize") {
+                json_id(frame)
+            } else {
+                None // notifications/initialized:无响应可等
+            };
+            proc.feed(frame).await?;
+            if let Some(want) = init_id {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+                for _ in 0..10 {
+                    let Ok(maybe) = tokio::time::timeout_at(deadline, proc.next_frame()).await
+                    else {
+                        tracing::warn!("timed out waiting for replayed initialize response");
+                        break;
+                    };
+                    let Some(resp) = maybe else { break }; // EOF
+                    if json_id(&resp).as_ref() == Some(&want) {
+                        break; // 吞掉:claude 已有自己的 initialize 响应
+                    }
+                    let _ = out_tx.send(resp).await;
+                }
+            }
+        }
+        Ok(Self::from_process(proc, out_tx, handshake))
+    }
+
+    fn from_process(
+        mut proc: McpProcess,
+        out_tx: mpsc::Sender<String>,
+        handshake: Arc<Mutex<Vec<String>>>,
+    ) -> Self {
+        let (in_tx, mut in_rx) = mpsc::channel::<String>(32);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    inbound = in_rx.recv() => {
+                        let Some(frame) = inbound else { break; };
+                        if proc.feed(&frame).await.is_err() { break; }
+                    }
+                    outbound = proc.next_frame() => {
+                        match outbound {
+                            Some(frame) => { if out_tx.send(frame).await.is_err() { break; } }
+                            None => break, // 子进程 EOF
+                        }
+                    }
+                }
+            }
+            // 收尸 + 掉 stdin 管道;真正的后端按 stdin-close 约定异步退出。
+            proc.shutdown().await;
+        });
+        Self { in_tx, handshake }
+    }
+
+    /// 非阻塞投递一帧。Err = 队列满或泵已死 —— 调用方应视为「通道死亡」
+    /// 收摊(置 None),下一帧走惰性重生。
+    pub fn feed(&self, frame: String) -> Result<(), ()> {
+        self.maybe_cache_handshake(&frame);
+        self.in_tx.try_send(frame).map_err(|_| ())
+    }
+
+    /// 缓存握手帧供重放。两帧齐(len>=2)后零解析开销;按帧等值去重
+    /// (重放路径会把缓存帧再喂回 feed,不得增长缓存)。
+    fn maybe_cache_handshake(&self, frame: &str) {
+        let mut cache = self.handshake.lock().expect("handshake mutex");
+        if cache.len() >= 2 || cache.iter().any(|f| f == frame) {
+            return;
+        }
+        match json_method(frame).as_deref() {
+            Some("initialize") | Some("notifications/initialized") => {
+                cache.push(frame.to_string());
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +264,92 @@ mod tests {
         let resp = proc.next_frame().await.expect("got a frame");
         assert!(resp.contains("echo"));
         proc.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn channel_pumps_frames_both_ways() {
+        if !node_available() {
+            return;
+        }
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/echo-mcp.mjs");
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let chan = McpChannel::start(
+            "node",
+            &[fixture.to_string()],
+            out_tx,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .expect("start channel");
+        chan.feed(r#"{"jsonrpc":"2.0","id":7,"method":"tools/list"}"#.to_string())
+            .unwrap();
+        let got = out_rx.recv().await.expect("a response frame");
+        assert!(got.contains("echo"));
+    }
+
+    /// 重生必须:(1) 重放缓存握手进新子进程,(2) 把重放出的 initialize
+    /// 响应按 id 吞掉(claude 手里已有一份,重复帧会污染配对)。echo 桩
+    /// 对任何带 id 的请求按 id 应答、忽略无 id 帧,恰好压测重放管线。
+    #[tokio::test]
+    async fn start_replayed_replays_handshake_and_swallows_response() {
+        if !node_available() {
+            return;
+        }
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/echo-mcp.mjs");
+        let args = vec![fixture.to_string()];
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let cache = Arc::new(Mutex::new(Vec::new()));
+        let chan = McpChannel::start("node", &args, out_tx.clone(), cache.clone()).expect("start");
+
+        // 正常握手:initialize 响应到 out_rx,两帧入缓存。
+        chan.feed(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#
+                .to_string(),
+        )
+        .unwrap();
+        let init_resp = out_rx.recv().await.expect("initialize response");
+        assert!(init_resp.contains("serverInfo"));
+        chan.feed(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string())
+            .unwrap();
+        assert_eq!(cache.lock().unwrap().len(), 2);
+
+        // 收摊后重生:握手重放,重放出的 initialize 响应(id 1)必须被吞。
+        drop(chan);
+        let chan = McpChannel::start_replayed("node", &args, out_tx.clone(), cache.clone())
+            .await
+            .expect("start_replayed");
+
+        chan.feed(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#.to_string())
+            .unwrap();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(10), out_rx.recv())
+            .await
+            .expect("a frame within 10s")
+            .expect("channel alive");
+        // 重生后的第一帧必须是 tools/list 响应,不是重复的 initialize 响应。
+        assert!(next.contains(r#""id":2"#), "expected tools/list response, got: {next}");
+        assert!(!next.contains("serverInfo"), "duplicate initialize response leaked: {next}");
+        assert!(next.contains("echo"));
+        assert!(out_rx.try_recv().is_err(), "nothing else may be queued in between");
+    }
+
+    /// 握手缓存由宿主拥有、仅共享进通道:通道收摊(RemoteMcpClosed /
+    /// 后端崩溃)不得丢缓存;重放路径把同一帧再喂回 feed 不得增长缓存。
+    #[tokio::test]
+    async fn shared_cache_survives_channel_drop_and_dedups() {
+        if !node_available() {
+            return;
+        }
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/echo-mcp.mjs");
+        let (out_tx, mut out_rx) = mpsc::channel(8);
+        let cache = Arc::new(Mutex::new(Vec::new()));
+        let chan = McpChannel::start("node", &[fixture.to_string()], out_tx, cache.clone())
+            .expect("start channel");
+        let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
+        chan.feed(init.to_string()).unwrap();
+        let _ = out_rx.recv().await.expect("initialize response");
+        assert_eq!(cache.lock().unwrap().len(), 1);
+        chan.feed(init.to_string()).unwrap();
+        assert_eq!(cache.lock().unwrap().len(), 1, "replayed frame must not grow cache");
+        drop(chan);
+        assert_eq!(cache.lock().unwrap().len(), 1, "cache outlives the channel");
     }
 }
