@@ -536,7 +536,7 @@ impl PtyManager {
         workspace: String,
         cols: u16,
         rows: u16,
-        claude_args: Vec<String>,
+        mut claude_args: Vec<String>,
         sandbox: bool,
         sandbox_mode: Option<String>,
         tool: Option<String>,
@@ -605,6 +605,69 @@ impl PtyManager {
         // capability 在 Phase D 用于 MCP 注入、Phase E 用于 attach 标记;
         // 此处先行记录,排障时可直接看到协商结果。
         tracing::debug!(%session_id, remote_mcp_capable, "open_session: client capability");
+
+        // 注入本会话的远程-MCP 端点配置。token 是工作区稳定 token
+        // (决策 D12):hub 每次 OpenSession(含 reattach)都铸新
+        // session_id,这里把同一 token 对新 session_id 重注册(覆盖式)
+        // —— tmux 里活着的 claude(内存持 token)与重启的 claude(从
+        // 字节稳定的 mcp-remote.json 重读)都路由到活会话。
+        if should_inject_mcp(self.remote_mcp.enabled, remote_mcp_capable, &tool_name) {
+            let token = self
+                .workspace_tokens
+                .entry((account.clone(), workspace.clone()))
+                .or_insert_with(|| {
+                    // agent 重启自愈:优先采用本工作区 mcp-remote.json
+                    // 已持久化的 token。只接受我们铸造的格式(32 ascii
+                    // hex):被篡改/损坏的配置必须铸新,不得把任意
+                    // (可猜)token 走私进路由表。
+                    std::fs::read_to_string(cwd.join(".cloudcode").join("mcp-remote.json"))
+                        .ok()
+                        .and_then(|s| crate::mcp_proxy::extract_token_from_config(&s))
+                        .filter(|t| crate::mcp_proxy::is_valid_token(t))
+                        .unwrap_or_else(|| Uuid::new_v4().simple().to_string())
+                })
+                .clone();
+            self.mcp.register(token.clone(), session_id);
+            let mcp_cfg = crate::mcp_proxy::mcp_config_json(self.remote_mcp.port, &token);
+            let mcp_cfg_path = cwd.join(".cloudcode").join("mcp-remote.json");
+            if let Some(parent) = mcp_cfg_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            // 配置内含 bearer token:从创建那一刻就是 0600(不留
+            // 「先写后 chmod」的全局可读窗口)。
+            #[cfg(unix)]
+            let write_res = {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(&mcp_cfg_path)
+                    .and_then(|mut f| f.write_all(mcp_cfg.as_bytes()))
+            };
+            #[cfg(not(unix))]
+            let write_res = std::fs::write(&mcp_cfg_path, &mcp_cfg);
+            if let Err(e) = write_res {
+                tracing::warn!(error = %e, "failed to write remote MCP config");
+            }
+            // `.mode(0o600)` 只在创建时生效;老文件穿过 truncate 仍保
+            // 留原 mode(可能 0644),显式修一遍。
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &mcp_cfg_path,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
+            // 进程级注入:--mcp-config + --strict-mcp-config + 通用
+            // 引导 prompt。绝不写全局 ~/.claude.json,绝不 `claude mcp
+            // add`(D11 铁律)。strict 保证 claude 只看到这份配置 ——
+            // 同机其他 claude 进程(没带这些 flag)零影响。
+            claude_args.extend(crate::mcp_proxy::claude_mcp_args(&mcp_cfg_path));
+        }
 
         // Open the PTY.
         let size = PtySize {
@@ -1254,6 +1317,14 @@ impl PtyManager {
                     let _ = std::process::Command::new(&self.tmux.executable)
                         .args(["-L", &format!("cc-{}-{}", account, name), "kill-server"])
                         .output();
+                    // 工作区真死:移除其稳定 token 并注销端点路由。
+                    // 同名重建的工作区会铸全新 token。
+                    if let Some((_, tok)) = self
+                        .workspace_tokens
+                        .remove(&(account.clone(), name.clone()))
+                    {
+                        self.mcp.unregister(&tok);
+                    }
                     // Wipe claude's per-project conversation history so
                     // a recreated workspace with the same name doesn't
                     // silently `--continue` into the old chat. The
@@ -1306,6 +1377,14 @@ impl PtyManager {
                     let _ = std::process::Command::new(&self.tmux.executable)
                         .args(["-L", &format!("cc-{}-{}", account, name), "kill-server"])
                         .output();
+                    // reset = 旧 claude(及一切持旧 token 者)永久消失:
+                    // 退役稳定 token,下次 open 从全新 token 开始。
+                    if let Some((_, tok)) = self
+                        .workspace_tokens
+                        .remove(&(account.clone(), name.clone()))
+                    {
+                        self.mcp.unregister(&tok);
+                    }
                     // Keep ~/.claude/projects/<encoded-cwd>/ intact so
                     // claude's conversation history and project memory
                     // survive the reset. The next --continue will resume
@@ -1713,6 +1792,15 @@ impl Recorder {
 
 /// Common name rules for accounts and workspaces (must be safe to drop into
 /// a path component and a tmux session name).
+/// 注入决策(纯函数,单测):Phase D = enabled && capable && claude。
+/// Phase E(Task 14)翻转为 enabled && claude(始终广告,决策 D7)。
+/// tool 门是硬条件:--mcp-config/--strict-mcp-config/
+/// --append-system-prompt 是 claude 专属 flag,喂给 codex 等其他工具
+/// 会直接启动失败(决策 D11;M1-M3 未做此门控,本计划修正)。
+fn should_inject_mcp(enabled: bool, remote_mcp_capable: bool, tool_name: &str) -> bool {
+    enabled && remote_mcp_capable && tool_name == "claude"
+}
+
 fn validate_name(name: &str, kind: &str) -> std::result::Result<(), String> {
     if name.is_empty() || name.len() > 63 {
         return Err(format!("{} name must be 1..=63 chars", kind));
@@ -1959,4 +2047,22 @@ fn is_claude_idle(claude_proj_dir: &Path) -> bool {
     }
 
     last_stop_reason.as_deref() == Some("end_turn")
+}
+
+#[cfg(test)]
+mod remote_mcp_inject_tests {
+    use super::*;
+
+    #[test]
+    fn inject_gates_on_enabled_capability_and_claude() {
+        // Phase D 语义:三个条件齐才注入。Phase E(Task 14)翻转为
+        // 始终广告(去掉 capability 条件),届时本测试同步更新。
+        assert!(should_inject_mcp(true, true, "claude"));
+        assert!(!should_inject_mcp(false, true, "claude"), "disabled kills injection");
+        assert!(!should_inject_mcp(true, false, "claude"), "incapable client: no injection");
+        assert!(
+            !should_inject_mcp(true, true, "codex"),
+            "claude-only flags must never reach other tools"
+        );
+    }
 }
