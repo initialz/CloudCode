@@ -34,7 +34,11 @@ pub struct Wire {
     pub in_bin_rx: mpsc::Receiver<Bytes>,
 }
 
-pub async fn connect(hub_url: &str, token: &str) -> Result<Wire> {
+pub async fn connect(
+    hub_url: &str,
+    token: &str,
+    browser: &crate::mcp_host::BrowserConfig,
+) -> Result<Wire> {
     let url = build_ws_url(hub_url)?;
     let (ws, _resp) = tokio_tungstenite::connect_async(&url)
         .await
@@ -44,8 +48,9 @@ pub async fn connect(hub_url: &str, token: &str) -> Result<Wire> {
     let hello = ClientToHub::Hello {
         token: token.to_string(),
         version: PTY_PROTOCOL_VERSION.into(),
-        // 配置了后端命令 = 本机能承载远程-MCP 后端(决策 D9)。
-        remote_mcp_capable: crate::mcp_host::backend_command().is_some(),
+        // 解析得出后端命令 = 本机能承载远程-MCP 后端(决策 D9→P1:
+        // 内置默认存在后,[browser].enabled=true 时恒为 true)。
+        remote_mcp_capable: crate::mcp_host::backend_command(browser).is_some(),
     };
     sink.send(Message::Text(serde_json::to_string(&hello)?))
         .await

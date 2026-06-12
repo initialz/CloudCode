@@ -112,8 +112,9 @@ pub async fn run(
     bytes: &mut ByteRx,
     agent: &str,
     workspace: &str,
+    browser: &crate::mcp_host::BrowserConfig,
 ) -> Result<RelayOutcome> {
-    relay_loop(wire, bytes, agent, workspace).await
+    relay_loop(wire, bytes, agent, workspace, browser).await
 }
 
 async fn relay_loop(
@@ -121,6 +122,7 @@ async fn relay_loop(
     bytes: &mut ByteRx,
     agent: &str,
     workspace: &str,
+    browser: &crate::mcp_host::BrowserConfig,
 ) -> Result<RelayOutcome> {
     // Strip mouse-mode CSI escapes from the agent → terminal stream
     // so the local emulator keeps doing its native drag-to-select /
@@ -150,13 +152,14 @@ async fn relay_loop(
     let mut pending_uploads: HashMap<Uuid, mpsc::Sender<HubToClient>> = HashMap::new();
     let (inject_tx, mut inject_rx) = mpsc::channel::<Vec<u8>>(16);
 
-    // 远程-MCP 宿主(Phase C)。后端命令来自 CC_REMOTE_MCP_BACKEND
-    // (决策 D9);未配置 → None,Hello 能力位为 false,hub/agent 不会
-    // 给我们发 RemoteMcp 帧 —— 万一异常发来,走下方防御性快速失败臂。
+    // 远程-MCP 宿主(Phase C)。后端命令:env CC_REMOTE_MCP_BACKEND >
+    // [browser].backend > 内置 playwright-mcp 默认(决策 P1);None →
+    // Hello 能力位为 false,hub/agent 不会给我们发 RemoteMcp 帧 ——
+    // 万一异常发来,走下方防御性快速失败臂。
     // 注意:host_out_tx 在本作用域常驻(host 内只持 clone),保证
     // host_out_rx.recv() 永不返回 None 而空转。
     let (host_out_tx, mut host_out_rx) = tokio::sync::mpsc::channel::<String>(64);
-    let mut mcp_host: Option<crate::mcp_host::McpHost> = crate::mcp_host::backend_command()
+    let mut mcp_host: Option<crate::mcp_host::McpHost> = crate::mcp_host::backend_command(browser)
         .map(|b| crate::mcp_host::McpHost::new(b, host_out_tx.clone()));
 
     loop {
@@ -267,7 +270,8 @@ async fn relay_loop(
                                 .send(OutFrame::Text(ClientToHub::RemoteMcpClosed {
                                     server,
                                     reason: Some(
-                                        "no MCP backend configured (set CC_REMOTE_MCP_BACKEND)"
+                                        "no MCP backend configured (check [browser] in \
+                                         config.toml or CC_REMOTE_MCP_BACKEND)"
                                             .to_string(),
                                     ),
                                 }))

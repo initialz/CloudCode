@@ -92,6 +92,9 @@ enum Cmd {
 struct ClientConfig {
     hub_url: String,
     token: String,
+    /// `[browser]` 段:本地 cc-browser 后端(计划②)。缺省 = 全默认。
+    #[serde(default)]
+    browser: crate::mcp_host::BrowserConfig,
 }
 
 fn default_config_path() -> Result<PathBuf> {
@@ -141,10 +144,15 @@ fn resolve_config(
     let token = cli_token
         .or_else(|| file.as_ref().map(|c| c.token.clone()))
         .ok_or_else(|| anyhow!("token missing — set in config or pass --token"))?;
-    Ok(ClientConfig { hub_url, token })
+    let browser = file.map(|c| c.browser).unwrap_or_default();
+    Ok(ClientConfig {
+        hub_url,
+        token,
+        browser,
+    })
 }
 
-fn state_dir() -> Result<PathBuf> {
+pub(crate) fn state_dir() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("CLOUDCODE_STATE_DIR") {
         return Ok(PathBuf::from(p));
     }
@@ -296,6 +304,16 @@ fn init_config(override_path: Option<&PathBuf>) -> Result<()> {
 
 hub_url = "http://localhost:7100"
 token   = "cc_PASTE_TOKEN_HERE"
+
+# [browser] controls the local cc-browser backend: a VISIBLE browser
+# window on this machine that the remote claude can drive when you
+# explicitly ask for it. Defaults: enabled, pinned playwright-mcp via
+# npx (requires node >= 18 here), persistent login profile under the
+# cloudcode state dir. Uncomment to override.
+# [browser]
+# enabled     = true
+# backend     = "npx -y @playwright/mcp@0.0.76 --user-data-dir=/custom/profile --browser=firefox"
+# profile_dir = "/custom/profile"
 "#;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -317,7 +335,7 @@ async fn run_chat(
     cli_token: Option<String>,
 ) -> Result<()> {
     let cfg = resolve_config(cli_hub_url, cli_token, config_override)?;
-    let mut wire = wire::connect(&cfg.hub_url, &cfg.token).await?;
+    let mut wire = wire::connect(&cfg.hub_url, &cfg.token, &cfg.browser).await?;
 
     let account_name = match wire.in_text_rx.recv().await {
         Some(HubToClient::Welcome { account }) => account,
@@ -430,7 +448,7 @@ async fn session_loop(
         // (2) Run the PTY relay until either claude exits cleanly
         //     (Closed → return to menu) or the wire dies (HubLost →
         //     reconnect + re-open the same workspace).
-        match relay::run(wire, bytes, agent, workspace).await? {
+        match relay::run(wire, bytes, agent, workspace, &cfg.browser).await? {
             RelayOutcome::Closed => return Ok(()),
             RelayOutcome::HubLost => {
                 if !reconnect_wire(cfg, wire, &mut backoff).await? {
@@ -499,7 +517,7 @@ async fn reconnect_wire(
         show_pill(&format!("Reconnecting ({})", attempt));
         tokio::time::sleep(*backoff).await;
         *backoff = bump(*backoff);
-        let new_wire = match wire::connect(&cfg.hub_url, &cfg.token).await {
+        let new_wire = match wire::connect(&cfg.hub_url, &cfg.token, &cfg.browser).await {
             Ok(w) => w,
             Err(_) => continue,
         };
@@ -591,4 +609,27 @@ fn clear_pill() {
     // Show cursor again + clear.
     let _ = stdout.write_all(b"\x1b[?25h\x1b[H\x1b[2J");
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod client_config_tests {
+    use super::*;
+
+    #[test]
+    fn client_config_browser_section_defaults_and_overrides() {
+        // 无 [browser] 段:serde default 给全默认。
+        let c: ClientConfig =
+            toml::from_str("hub_url = \"http://h\"\ntoken = \"t\"").unwrap();
+        assert!(c.browser.enabled);
+        assert_eq!(c.browser.backend, None);
+        assert_eq!(c.browser.profile_dir, None);
+
+        // 显式 [browser] 段。
+        let c: ClientConfig = toml::from_str(
+            "hub_url = \"http://h\"\ntoken = \"t\"\n\n[browser]\nenabled = false\nprofile_dir = \"/p\"",
+        )
+        .unwrap();
+        assert!(!c.browser.enabled);
+        assert_eq!(c.browser.profile_dir, Some(PathBuf::from("/p")));
+    }
 }

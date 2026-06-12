@@ -21,31 +21,100 @@ fn parse_backend(cmd: &str) -> Option<(String, Vec<String>)> {
     Some((prog, parts.collect()))
 }
 
-/// 验证脚手架(计划①):把 echo 桩源码编进二进制,这样 `cloudcode`
-/// 不设任何环境变量、不依赖仓库路径就能跑通管道冒烟。**仅用于验证**
-/// —— 计划②会用随包内置的真实默认后端(dev-browser)替换它。
-const EMBEDDED_ECHO_MCP: &str = include_str!("../../../test-fixtures/echo-mcp.mjs");
+/// 两后端共用的 playwright-mcp pin 版本(spec 组件 6:pin 死保证两台
+/// 机器、多次 npx 拉取行为一致)。与 agent 侧
+/// `crates/agent/src/mcp_proxy.rs::PLAYWRIGHT_MCP_PKG` 手工 lockstep;
+/// 升级须两处同改并重跑双后端冒烟。
+pub const PLAYWRIGHT_MCP_PKG: &str = "@playwright/mcp@0.0.76";
 
-/// 把内置 echo 桩源码落到一个稳定的临时文件(每次启动覆盖写),返回
-/// `node <临时文件>` 命令。需要本机有 `node`(spawn 失败会走 McpHost
-/// 的退避/冷却路径)。写盘失败 → None(回落到「无后端」)。
-fn embedded_echo_backend() -> Option<(String, Vec<String>)> {
-    let path = std::env::temp_dir().join("cloudcode-cc-browser-echo.mjs");
-    std::fs::write(&path, EMBEDDED_ECHO_MCP).ok()?;
-    Some(("node".to_string(), vec![path.to_string_lossy().into_owned()]))
+/// client 侧 `[browser]` 配置段(计划②,spec 组件 5)。整段缺省 =
+/// 全默认零配置:enabled + 内置 playwright-mcp headed 命令 + 持久
+/// profile 在 state 目录下。
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct BrowserConfig {
+    /// 本机是否提供 cc-browser 能力。false ⇒ backend_command() 返回
+    /// None ⇒ Hello 能力位 false(env 覆盖除外)。
+    #[serde(default = "default_browser_enabled")]
+    pub enabled: bool,
+    /// 整条后端命令覆盖(空白分隔)。缺省 = 内置默认
+    /// `npx -y @playwright/mcp@<pin> --user-data-dir=<profile_dir>`。
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// 持久 profile 路径(拼进默认命令的 --user-data-dir)。缺省 =
+    /// state 目录下 browser-profile 子目录。仅 backend 缺省时生效
+    /// (显式 backend 全权自带参数)。
+    #[serde(default)]
+    pub profile_dir: Option<std::path::PathBuf>,
 }
 
-/// 解析后端命令(计划①,决策 D9):优先环境变量 `CC_REMOTE_MCP_BACKEND`
-/// (空白分隔,首段为程序、其余为 argv);未设置时回落到**内置 echo
-/// 桩**(验证脚手架,见 `embedded_echo_backend`)。两者都不可用 → None
-/// (本机不提供远程-MCP 能力,Hello 能力位为 false)。计划②在此之上叠加
-/// `[browser]` 配置段与随包内置的真实默认后端。
-pub fn backend_command() -> Option<(String, Vec<String>)> {
-    match std::env::var("CC_REMOTE_MCP_BACKEND") {
-        Ok(cmd) => parse_backend(&cmd),
-        // 未配置:回落到内置 echo 桩,让验证零配置可跑。
-        Err(_) => embedded_echo_backend(),
+fn default_browser_enabled() -> bool {
+    true
+}
+
+impl Default for BrowserConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            backend: None,
+            profile_dir: None,
+        }
     }
+}
+
+/// 缺省持久 profile 路径:state 目录(尊重 CLOUDCODE_STATE_DIR /
+/// XDG_STATE_HOME,通常 ~/.local/state/cloudcode)下的 browser-profile。
+/// 定不出 state 目录(无 home)→ None,调用方按「无后端」处理。
+fn default_profile_dir() -> Option<std::path::PathBuf> {
+    crate::state_dir().ok().map(|d| d.join("browser-profile"))
+}
+
+/// 创建 profile 目录并(unix)收紧 0700:登录态(cookie/会话)落在
+/// 这里,不给同机其他用户可读窗口。best-effort —— 失败不阻断命令
+/// 构造,playwright-mcp 自己也会建目录。
+fn ensure_profile_dir(dir: &std::path::Path) {
+    let _ = std::fs::create_dir_all(dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+}
+
+/// 解析后端命令(计划②,决策 P1):优先级 env `CC_REMOTE_MCP_BACKEND`
+/// (操作员显式覆盖,优先于一切、含 enabled=false)→ `[browser].backend`
+/// → 内置默认(pin 的 playwright-mcp,headed,持久 profile)。
+/// None = 本机不提供远程-MCP 能力(Hello 能力位 false)。
+pub fn backend_command(cfg: &BrowserConfig) -> Option<(String, Vec<String>)> {
+    backend_command_from(
+        std::env::var("CC_REMOTE_MCP_BACKEND").ok().as_deref(),
+        cfg,
+    )
+}
+
+/// `backend_command` 的纯函数内核(env 注入为形参,单测不碰进程环境)。
+fn backend_command_from(
+    env_backend: Option<&str>,
+    cfg: &BrowserConfig,
+) -> Option<(String, Vec<String>)> {
+    if let Some(cmd) = env_backend {
+        return parse_backend(cmd);
+    }
+    if !cfg.enabled {
+        return None;
+    }
+    if let Some(cmd) = &cfg.backend {
+        return parse_backend(cmd);
+    }
+    let profile = cfg.profile_dir.clone().or_else(default_profile_dir)?;
+    ensure_profile_dir(&profile);
+    Some((
+        "npx".to_string(),
+        vec![
+            "-y".to_string(),
+            PLAYWRIGHT_MCP_PKG.to_string(),
+            format!("--user-data-dir={}", profile.display()),
+        ],
+    ))
 }
 
 /// 已 spawn 的 MCP 子进程,说「按行分隔的 JSON-RPC over stdio」。
@@ -416,6 +485,101 @@ mod tests {
         assert_eq!(parse_backend("node"), Some(("node".to_string(), vec![])));
         assert_eq!(parse_backend(""), None);
         assert_eq!(parse_backend("   "), None);
+    }
+
+    #[test]
+    fn browser_config_defaults_from_empty_toml() {
+        // 整段缺省 = 全默认零配置(spec 组件 5)。
+        let c: BrowserConfig = toml::from_str("").unwrap();
+        assert!(c.enabled);
+        assert_eq!(c.backend, None);
+        assert_eq!(c.profile_dir, None);
+        let d = BrowserConfig::default();
+        assert!(d.enabled);
+        assert_eq!(d.backend, None);
+        assert_eq!(d.profile_dir, None);
+    }
+
+    #[test]
+    fn browser_config_explicit_overrides_parse() {
+        let c: BrowserConfig = toml::from_str(
+            "enabled = false\nbackend = \"node /tmp/x.mjs\"\nprofile_dir = \"/custom/profile\"",
+        )
+        .unwrap();
+        assert!(!c.enabled);
+        assert_eq!(c.backend.as_deref(), Some("node /tmp/x.mjs"));
+        assert_eq!(c.profile_dir, Some(std::path::PathBuf::from("/custom/profile")));
+    }
+
+    #[test]
+    fn backend_env_var_wins_over_everything() {
+        // env 是操作员显式覆盖:优先于 [browser].backend,甚至优先于
+        // enabled=false(测试/排障时用 env 强行指后端)。纯函数测试,
+        // 不碰真实进程环境(并行测试安全)。
+        let cfg = BrowserConfig {
+            enabled: false,
+            backend: Some("node /tmp/other.mjs".to_string()),
+            profile_dir: None,
+        };
+        assert_eq!(
+            backend_command_from(Some("node /tmp/echo.mjs"), &cfg),
+            Some(("node".to_string(), vec!["/tmp/echo.mjs".to_string()]))
+        );
+        // env 是空白串 → parse_backend 给 None(显式配置成"没有后端")。
+        assert_eq!(backend_command_from(Some("   "), &cfg), None);
+    }
+
+    #[test]
+    fn backend_config_wins_over_builtin_default() {
+        let cfg = BrowserConfig {
+            enabled: true,
+            backend: Some("npx -y @playwright/mcp@0.0.76 --user-data-dir=/p --browser=firefox".to_string()),
+            profile_dir: None,
+        };
+        let (prog, args) = backend_command_from(None, &cfg).expect("explicit backend");
+        assert_eq!(prog, "npx");
+        assert!(args.contains(&"--browser=firefox".to_string()));
+    }
+
+    #[test]
+    fn backend_default_is_pinned_playwright_with_user_data_dir() {
+        // 内置默认:npx -y @playwright/mcp@<pin> --user-data-dir=<profile>。
+        // 用显式 profile_dir 保持纯函数(default_profile_dir 依赖 HOME)。
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = BrowserConfig {
+            enabled: true,
+            backend: None,
+            profile_dir: Some(dir.path().join("prof")),
+        };
+        let (prog, args) = backend_command_from(None, &cfg).expect("builtin default");
+        assert_eq!(prog, "npx");
+        assert_eq!(args[0], "-y");
+        assert_eq!(args[1], PLAYWRIGHT_MCP_PKG);
+        assert_eq!(PLAYWRIGHT_MCP_PKG, "@playwright/mcp@0.0.76", "pin 版本单点");
+        let uddir = format!("--user-data-dir={}", dir.path().join("prof").display());
+        assert_eq!(args[2], uddir);
+        assert_eq!(args.len(), 3, "默认命令不得夹带其他参数");
+        // 不再回落 echo 桩(撤销 ee92506 生产路径)。
+        assert!(!args.iter().any(|a| a.contains("echo")), "echo stub must be gone: {args:?}");
+        // profile 目录被创建且(unix)收紧 0700。
+        assert!(dir.path().join("prof").is_dir(), "profile dir must be created");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join("prof")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "profile dir must be 0700");
+        }
+    }
+
+    #[test]
+    fn backend_disabled_yields_none() {
+        // enabled=false ⇒ None ⇒ Hello 能力位 false,本机不提供 cc-browser。
+        let cfg = BrowserConfig {
+            enabled: false,
+            backend: None,
+            profile_dir: Some(std::path::PathBuf::from("/unused")),
+        };
+        assert_eq!(backend_command_from(None, &cfg), None);
     }
 
     #[tokio::test]
