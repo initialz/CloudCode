@@ -1140,9 +1140,29 @@ where
             }
             true
         }
-        // 临时哑臂:Task 5(Phase B)替换为按会话绑定的真实转发。
-        // client 侧要到 Phase C 才会发出这两类帧,此前丢弃无影响。
-        ClientToHub::RemoteMcp { .. } | ClientToHub::RemoteMcpClosed { .. } => true,
+        ClientToHub::RemoteMcp { server, payload } => {
+            // 仅在「已绑定 agent + 有活动会话」时转发;否则静默丢弃
+            // (会话都没开,agent 侧不可能有在飞请求等这帧)。
+            if let (Some(conn), Some(active)) =
+                (ctx.selected_agent.as_ref(), ctx.active.as_ref())
+            {
+                let _ = conn
+                    .send(remote_mcp_to_agent(active.session_id, server, payload))
+                    .await;
+            }
+            true
+        }
+        ClientToHub::RemoteMcpClosed { server, reason } => {
+            tracing::debug!(%server, ?reason, "client closed remote-MCP channel; forwarding to agent");
+            if let (Some(conn), Some(active)) =
+                (ctx.selected_agent.as_ref(), ctx.active.as_ref())
+            {
+                let _ = conn
+                    .send(remote_mcp_closed_to_agent(active.session_id, server, reason))
+                    .await;
+            }
+            true
+        }
         ClientToHub::Close => false,
         ClientToHub::Hello { .. } | ClientToHub::Pong => true,
     }
@@ -1477,6 +1497,25 @@ fn valid_tool_name(s: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
 }
 
+/// 远程-MCP 中继的纯映射(单测钉死不变量):hub 是哑管道,`server` 与
+/// `payload` 必须字节不动地穿过 —— 任何改写都会破坏 claude⇄后端的
+/// 端到端 MCP 握手与 id 配对。
+fn remote_mcp_to_agent(session_id: Uuid, server: String, payload: String) -> ServerMsg {
+    ServerMsg::RemoteMcp { session_id, server, payload }
+}
+
+fn remote_mcp_closed_to_agent(
+    session_id: Uuid,
+    server: String,
+    reason: Option<String>,
+) -> ServerMsg {
+    ServerMsg::RemoteMcpClosed { session_id, server, reason }
+}
+
+fn remote_mcp_to_client(server: String, payload: String) -> HubToClient {
+    HubToClient::RemoteMcp { server, payload }
+}
+
 async fn handle_agent_event<S>(ctx: &mut ConnCtx, evt: PtyEventOut, sink: &mut S) -> bool
 where
     S: SinkExt<Message, Error = axum::Error> + Unpin,
@@ -1528,6 +1567,12 @@ where
             }
             // Success: the agent already spawned the pane; its bytes
             // arrive through the existing PTY tap. Nothing else to do.
+            true
+        }
+        PtyEventOut::Frame(ClientMsg::RemoteMcp { server, payload, .. }) => {
+            // session_id 在出 registry 路由时已消费(classify→Session),
+            // client 连接本身就等价于会话身份,故只下发 server+payload。
+            let _ = send_client(sink, &remote_mcp_to_client(server, payload)).await;
             true
         }
         PtyEventOut::Frame(_) => true,
@@ -1666,5 +1711,51 @@ mod tests {
         }"#;
         let (env, _) = resolve_effective_config(blob, "ag", "ws", "claude");
         assert!(env.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod remote_mcp_relay_tests {
+    use super::*;
+
+    // 故意包含:乱序键、unicode、转义引号、内嵌换行 —— 任何"解析后重组"
+    // 的实现都会在至少一处露馅。
+    const TRICKY: &str = r#"{"jsonrpc":"2.0","id":"αβ\"esc\"","method":"tools/call","params":{"zebra":1,"alpha":{"text":"line1\nline2"}}}"#;
+
+    #[test]
+    fn to_agent_mapping_is_byte_identical() {
+        let sid = Uuid::new_v4();
+        match remote_mcp_to_agent(sid, "cc-browser".to_string(), TRICKY.to_string()) {
+            ServerMsg::RemoteMcp { session_id, server, payload } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(server, "cc-browser");
+                assert_eq!(payload, TRICKY, "hub must not rewrite the payload");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn closed_to_agent_keeps_server_and_reason() {
+        let sid = Uuid::new_v4();
+        match remote_mcp_closed_to_agent(sid, "cc-browser".to_string(), Some("bye".to_string())) {
+            ServerMsg::RemoteMcpClosed { session_id, server, reason } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(server, "cc-browser");
+                assert_eq!(reason.as_deref(), Some("bye"));
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn to_client_mapping_is_byte_identical() {
+        match remote_mcp_to_client("cc-browser".to_string(), TRICKY.to_string()) {
+            HubToClient::RemoteMcp { server, payload } => {
+                assert_eq!(server, "cc-browser");
+                assert_eq!(payload, TRICKY, "hub must not rewrite the payload");
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }
