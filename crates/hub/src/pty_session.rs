@@ -1149,6 +1149,8 @@ where
                 let _ = conn
                     .send(remote_mcp_to_agent(active.session_id, server, payload))
                     .await;
+            } else {
+                tracing::debug!(%server, "RemoteMcp dropped: no bound agent or active session");
             }
             true
         }
@@ -1569,6 +1571,11 @@ where
             // arrive through the existing PTY tap. Nothing else to do.
             true
         }
+        // 注:agent→client 方向没有 RemoteMcpClosed 转发臂 —— `ClientMsg`
+        // (agent→hub)只定义了 `RemoteMcp`,没有 `RemoteMcpClosed`(Plan ① 设计)。
+        // Plan ① 里 client 的后端生命周期由 client 自管,agent 不主动命令拆除。
+        // `HubToClient::RemoteMcpClosed` 的消费者(client host.shutdown)在 Task 8
+        // 接入;若将来需要 hub 驱动的拆除(如 agent 掉线),应在彼处由 hub 生成该帧。
         PtyEventOut::Frame(ClientMsg::RemoteMcp { server, payload, .. }) => {
             // session_id 在出 registry 路由时已消费(classify→Session),
             // client 连接本身就等价于会话身份,故只下发 server+payload。
