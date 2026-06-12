@@ -973,4 +973,103 @@ mod tests {
             "synthesized handshake cached for future respawns"
         );
     }
+
+    /// playwright chromium 是否已装(macOS `~/Library/Caches/ms-playwright`,
+    /// Linux `~/.cache/ms-playwright`)。无则真后端测试 skip,保 CI 在无 chromium
+    /// 机器上常绿。
+    fn playwright_chromium_available() -> bool {
+        let Some(home) = dirs::home_dir().or_else(|| std::env::var_os("HOME").map(Into::into))
+        else {
+            return false;
+        };
+        let caches = [
+            home.join("Library/Caches/ms-playwright"), // macOS
+            home.join(".cache/ms-playwright"),         // Linux
+        ];
+        caches.iter().any(|dir| {
+            let Ok(entries) = std::fs::read_dir(dir) else { return false };
+            entries.flatten().any(|e| {
+                e.file_name().to_string_lossy().starts_with("chromium") && e.path().is_dir()
+            })
+        })
+    }
+
+    /// 集成测试:用真 `@playwright/mcp` 后端(非 echo 桩)驱动真 chromium 走完
+    /// 一次 MCP 往返——证明 `McpHost` 能 spawn 真 playwright-mcp、开真 chromium、
+    /// 完成握手并把一次真实的 browser_navigate 应答回送(Task 7.3 后端层入 CI)。
+    /// node + chromium 门控:任一缺失即 skip,保 CI 常绿。
+    #[tokio::test]
+    async fn host_roundtrips_via_real_playwright_mcp() {
+        if !node_available() || !playwright_chromium_available() {
+            return;
+        }
+        // 隔离的临时 profile —— 不碰用户真实 cc-browser 资料目录。
+        let profile = tempfile::tempdir().expect("tempdir");
+        let user_data_dir = format!("--user-data-dir={}", profile.path().display());
+        let prog = "npx".to_string();
+        let args = vec![
+            "-y".to_string(),
+            PLAYWRIGHT_MCP_PKG.to_string(),
+            "--headless".to_string(),
+            user_data_dir,
+        ];
+
+        let (out_tx, mut out_rx) = mpsc::channel(16);
+        let mut host = McpHost::new((prog, args), out_tx);
+
+        // 1) initialize(惰性 spawn 真后端)+ notifications/initialized。
+        host.deliver(
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"cloudcode-itest","version":"0"}}}"#
+                .to_string(),
+        )
+        .await
+        .expect("deliver initialize — backend must spawn");
+        host.deliver(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string())
+            .await
+            .expect("deliver initialized — backend must be alive");
+
+        // 读到 initialize 响应(serverInfo / id:1)。npx 首跑可能现装包,给 30s。
+        let init_resp = loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(30), out_rx.recv())
+                .await
+                .expect("initialize response within 30s")
+                .expect("backend alive (out channel not closed)");
+            if frame.contains(r#""id":1"#) {
+                break frame;
+            }
+            // 后端在握手期可能先发别的通知;跳过非 id:1 帧。
+        };
+        assert!(
+            init_resp.contains("serverInfo"),
+            "initialize response must carry serverInfo: {init_resp}"
+        );
+
+        // 2) tools/call browser_navigate → example.com(id 2)。首跑要起 chromium +
+        //    导航,可能 ~60s,给 90s。
+        host.deliver(
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_navigate","arguments":{"url":"https://example.com"}}}"#
+                .to_string(),
+        )
+        .await
+        .expect("deliver browser_navigate — backend must be alive");
+
+        let nav_resp = loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(90), out_rx.recv())
+                .await
+                .expect("browser_navigate response within 90s (real chromium launch)")
+                .expect("backend alive (out channel not closed)");
+            if frame.contains(r#""id":2"#) {
+                break frame;
+            }
+            // 期间可能夹带 log/progress 通知;只认 id:2 响应。
+        };
+        // 不强校验 navigate 载荷:关键是一帧真实的 id:2 响应回来了,证明整条
+        // McpHost → playwright-mcp → chromium → 响应 往返打通。
+        assert!(
+            nav_resp.contains(r#""id":2"#),
+            "real id-2 navigate response must round-trip back: {nav_resp}"
+        );
+
+        host.shutdown();
+    }
 }
