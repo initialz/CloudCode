@@ -36,15 +36,41 @@ pub const CC_BROWSER_SERVER: &str = "cc-browser";
 /// 条目由 claude 直接 spawn,不走帧、不进 client,无需跨端 lockstep。
 pub const WEB_SERVER: &str = "web";
 
-/// 注入给 claude 的通用引导(决策 D11):说明 cc-browser 的工具在用户
-/// 本地机器执行、收到「未连接」错误时如何转告用户。不写死任何工具名
-/// —— 工具表由后端运行时决定。
-pub const GUIDANCE_PROMPT: &str = "The `cc-browser` MCP server provides tools (such as web \
-browsing) that run on the USER'S LOCAL machine through the cloudcode CLI — not on this host. \
-Prefer these tools when the user asks for anything involving their local browser or web pages. \
-If a cc-browser tool call returns a 'not connected' style error, relay its instructions to the \
-user (they need to open the cloudcode CLI on their local machine), then retry after they \
-confirm.";
+/// 注入给 claude 的双后端选择引导(计划②,经 --append-system-prompt):
+/// 默认恒 `web`(agent 本机无头)、用户明示才 `cc-browser`(client 本地
+/// 有头)、撞登录墙不自切先问、任务级粘住一个后端、两后端状态不互通。
+/// 仍不写死任何工具名 —— 工具表由后端运行时决定(D11 通用化不变)。
+pub const GUIDANCE_PROMPT: &str = r#"Two browser MCP servers are available:
+
+- `web`: a HEADLESS browser running here on this host. Fast, invisible
+  to the user, no setup needed.
+- `cc-browser`: a VISIBLE browser window on the USER'S LOCAL machine,
+  connected through the cloudcode CLI. The user can see it, log into
+  sites in it, and operate it by hand. Its logins persist across
+  sessions.
+
+Rules:
+
+1. For any web browsing — research, reading public pages, fetching
+   data — ALWAYS use `web`. This is the default; do not ask.
+2. Use `cc-browser` ONLY when the user explicitly asks for their local
+   browser / cc-browser, or explicitly wants to log in or operate the
+   page themselves.
+3. If `web` hits a login wall, captcha, or anti-bot check, do NOT
+   switch to `cc-browser` on your own. Stop and tell the user that the
+   page needs them to log in or act in their local browser, and ask
+   whether you should open it with `cc-browser`. Proceed only after
+   they confirm.
+4. Pick one server per task and stick with it. Browser state (cookies,
+   logins, open pages) is NOT shared between `web` and `cc-browser` —
+   they are separate browsers on separate machines, and state cannot
+   be migrated mid-task.
+5. When the user needs to do something by hand in `cc-browser` (e.g.
+   log in or solve a captcha), pause and ask them to tell you when
+   they are done, then continue from where you left off.
+6. If a `cc-browser` tool call returns a 'not connected' style error,
+   relay its instructions to the user (they need to open the cloudcode
+   CLI on their local machine), then retry after they confirm."#;
 
 /// 在飞请求的配对键:(session_id, server 名, 规范化 JSON-RPC id)。
 /// server 进键位是为计划②同会话多 server 时 id 互不冲突。
@@ -827,6 +853,26 @@ mod tests {
         // 引导文案通用化:点名 server,不写死任何工具名(决策 D11)。
         assert!(GUIDANCE_PROMPT.contains("cc-browser"));
         assert!(!GUIDANCE_PROMPT.contains("browser_navigate"));
+    }
+
+    #[test]
+    fn guidance_prompt_covers_dual_backend_selection_rules() {
+        // 双后端文案(spec「选择机制与引导 prompt」):两 server 点名 +
+        // 五条规则的关键措辞。仍不写死任何工具名(D11 通用化不变)。
+        assert!(GUIDANCE_PROMPT.contains("`web`"));
+        assert!(GUIDANCE_PROMPT.contains("`cc-browser`"));
+        // 规则 1:默认恒 web,不问。
+        assert!(GUIDANCE_PROMPT.contains("ALWAYS use `web`"));
+        // 规则 2:明示才本地。
+        assert!(GUIDANCE_PROMPT.contains("ONLY when the user explicitly"));
+        // 规则 3:撞墙不自切、先问用户。
+        assert!(GUIDANCE_PROMPT.contains("do NOT\n   switch to `cc-browser` on your own"));
+        // 规则 4:任务级粘住一个、状态不互通(两条硬约束的注入面)。
+        assert!(GUIDANCE_PROMPT.contains("Pick one server per task"));
+        assert!(GUIDANCE_PROMPT.contains("NOT shared between `web` and `cc-browser`"));
+        // 规则 6:not-connected 转达(①的降级文案沿用)。
+        assert!(GUIDANCE_PROMPT.contains("not connected"));
+        assert!(GUIDANCE_PROMPT.contains("cloudcode\n   CLI"));
     }
 
     #[test]
