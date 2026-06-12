@@ -63,6 +63,10 @@ pub struct McpProxy {
     /// 不破坏 proxy 的 backend 无关性;dev-browser 的 manifest 内容
     /// 属计划②(决策 D17)。
     static_tools: Arc<String>,
+    /// 每 token 一条服务端通知流(claude 的 GET SSE 订阅)。键是
+    /// token 而非 session_id:claude 的 GET 长连横跨多次 reattach
+    /// (session_id 会换),token 才与 claude 进程同寿。
+    notify: Arc<DashMap<String, mpsc::Sender<String>>>,
 }
 
 impl Default for McpProxy {
@@ -84,6 +88,7 @@ impl McpProxy {
             to_hub: Arc::new(RwLock::new(None)),
             attached: Arc::new(DashMap::new()),
             static_tools: Arc::new(static_tools),
+            notify: Arc::new(DashMap::new()),
         }
     }
 
@@ -131,6 +136,29 @@ impl McpProxy {
     pub fn detach(&self, session_id: Uuid) {
         self.attached.remove(&session_id);
         self.fail_pending(session_id, "client detached");
+        // 工具真实可用性变了:促使 claude 重拉 tools/list(spec 降级③)。
+        self.notify_list_changed(session_id);
+    }
+
+    /// 订阅某 token 的服务端通知流(GET SSE handler 调用)。同 token
+    /// 重订 = 覆盖旧 sender(旧流随之收尾),与 claude 重连语义一致。
+    pub fn subscribe(&self, token: &str) -> mpsc::Receiver<String> {
+        let (tx, rx) = mpsc::channel(8);
+        self.notify.insert(token.to_string(), tx);
+        rx
+    }
+
+    /// 向路由到 `session_id` 的所有 token 的订阅流推一条
+    /// list_changed(attach/detach 时机)。没有订阅流(claude 未开
+    /// GET,见 D8 验证项)→ 静默丢弃。
+    pub fn notify_list_changed(&self, session_id: Uuid) {
+        for e in self.routes.iter() {
+            if *e.value() == session_id {
+                if let Some(tx) = self.notify.get(e.key()) {
+                    let _ = tx.try_send(LIST_CHANGED_FRAME.to_string());
+                }
+            }
+        }
     }
 
     /// 把 `session_id` 的所有在飞请求以 JSON-RPC 错误(-32002)收尾
@@ -209,6 +237,10 @@ fn jsonrpc_error(id_raw: &str, code: i64, message: &str) -> String {
         msg = serde_json::to_string(message).unwrap_or_else(|_| "\"error\"".to_string())
     )
 }
+
+/// 服务端通知:工具集(真实可用性)变了,请重拉 tools/list。
+const LIST_CHANGED_FRAME: &str =
+    r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
 
 /// 调用时无可用 client/后端的可执行文案(-32004,决策 D13)。claude
 /// 会把它转达给用户;webterm-only 接入恒走此路径。
@@ -460,7 +492,29 @@ fn router(state: McpProxy) -> axum::Router {
                     }
                 },
             )
-            .get(|| async { StatusCode::METHOD_NOT_ALLOWED }),
+            .get(
+                |Path(token): Path<String>, State(st): State<McpProxy>| async move {
+                    if st.session_for(&token).is_none() {
+                        return StatusCode::METHOD_NOT_ALLOWED.into_response();
+                    }
+                    let rx = st.subscribe(&token);
+                    let stream = futures::stream::unfold(rx, |mut rx| async move {
+                        rx.recv().await.map(|m| {
+                            (
+                                Ok::<_, std::convert::Infallible>(
+                                    axum::response::sse::Event::default()
+                                        .event("message")
+                                        .data(m),
+                                ),
+                                rx,
+                            )
+                        })
+                    });
+                    axum::response::sse::Sse::new(stream)
+                        .keep_alive(axum::response::sse::KeepAlive::default())
+                        .into_response()
+                },
+            ),
         )
         .with_state(state)
 }
@@ -1051,6 +1105,98 @@ mod tests {
         .await;
         assert!(matches!(out, PostOutcome::Accepted));
         assert!(hub_rx.try_recv().is_err(), "nothing may be forwarded while detached");
+    }
+
+    #[tokio::test]
+    async fn attach_detach_pushes_list_changed_to_subscribed_stream() {
+        let state = McpProxy::new();
+        let sid = Uuid::new_v4();
+        state.register("tok-n".into(), sid);
+        let mut rx = state.subscribe("tok-n");
+
+        // 模拟 client 上线(pty.rs 在 PtyOpen 时:set_attached + notify)。
+        state.set_attached(sid);
+        state.notify_list_changed(sid);
+        let frame = rx.recv().await.expect("notification pushed");
+        assert_eq!(frame, LIST_CHANGED_FRAME);
+        let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["method"], "notifications/tools/list_changed");
+
+        // 模拟 client 掉线:detach 自带 list_changed。
+        state.detach(sid);
+        let frame = rx.recv().await.expect("notification on detach");
+        assert_eq!(frame, LIST_CHANGED_FRAME);
+    }
+
+    #[tokio::test]
+    async fn notify_without_subscriber_is_noop() {
+        // claude 不开 GET 流(D8 的未验证假设不成立时)→ 通知静默丢弃,
+        // 不 panic、不阻塞、无副作用。
+        let state = McpProxy::new();
+        let sid = Uuid::new_v4();
+        state.register("tok-x".into(), sid);
+        state.notify_list_changed(sid);
+    }
+
+    #[tokio::test]
+    async fn sse_get_stream_delivers_notification_over_real_http() {
+        let state = McpProxy::new();
+        let sid = Uuid::new_v4();
+        let token = "tok-sse";
+        state.register(token.into(), sid);
+        // 镜像本模块其余真 TCP 测试:先绑 127.0.0.1 监听器(Task 10 移除了
+        // serve(state, port),绑定上提给调用方),再喂 serve_on。
+        let port = free_port();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("bind 127.0.0.1 test listener");
+        let serve_state = state.clone();
+        tokio::spawn(async move {
+            let _ = serve_on(listener, serve_state).await;
+        });
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}");
+        assert_eq!(wait_healthz(&client, &base).await, "ok");
+
+        let resp = client
+            .get(format!("{base}/mcp/{token}"))
+            .send()
+            .await
+            .expect("GET sse");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        // GET handler 同步完成 subscribe,但经网络有传播窗:轮询直到
+        // 订阅出现再触发通知。
+        for _ in 0..50 {
+            if state.notify.contains_key(token) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(state.notify.contains_key(token), "GET must register a subscription");
+        state.notify_list_changed(sid);
+
+        let mut stream = resp;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let item = tokio::time::timeout_at(deadline, stream.chunk())
+                .await
+                .expect("sse chunk within 5s")
+                .expect("chunk read ok");
+            let Some(bytes) = item else { panic!("sse stream ended early") };
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            if text.contains("tools/list_changed") {
+                break; // SSE 事件携带通知帧,到达即过
+            }
+            // keepalive 注释行等:继续读。
+        }
+
+        // 未注册 token 的 GET:405。
+        let nope = client
+            .get(format!("{base}/mcp/unknown"))
+            .send()
+            .await
+            .expect("GET unknown");
+        assert_eq!(nope.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
     }
 
     #[test]

@@ -655,12 +655,13 @@ impl PtyManager {
             }
         }
 
-        // attach 跟踪(Phase E):capable client 上线 → 本会话进入
-        // 「转发」模式;非 capable(webterm 等)开的会话保持「权威
-        // fallback」模式。Task 15 在此补发 list_changed。
+        // attach 跟踪 + 通知(Phase E):capable client 上线 → 转发模式;
+        // 任何一次 open 都把「工具真实可用性可能变了」翻译成
+        // list_changed(无 GET 订阅流时为无害 no-op)。
         if remote_mcp_capable {
             self.mcp.set_attached(session_id);
         }
+        self.mcp.notify_list_changed(session_id);
 
         // Open the PTY.
         let size = PtySize {
