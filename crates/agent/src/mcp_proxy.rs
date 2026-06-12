@@ -718,4 +718,91 @@ mod tests {
         assert!(body.contains("\"error\""), "JSON-RPC error body: {body}");
         assert!(body.contains("-32001"), "unknown-token code: {body}");
     }
+
+    /// 测试环境探测:PATH 上有无 node(echo 桩需要)。无则 skip。
+    fn node_available() -> bool {
+        let Some(path) = std::env::var_os("PATH") else {
+            return false;
+        };
+        std::env::split_paths(&path).any(|d| d.join("node").is_file())
+    }
+
+    /// 端到端 loopback:真 axum HTTP 端点 ← reqwest POST tools/call;
+    /// 「hub+client」由测试体内联扮演 —— 从 to_hub 通道取
+    /// ClientMsg::RemoteMcp 帧,**原文**喂给真 node echo 桩,把桩的
+    /// 应答经 resolve_response 配对回去。覆盖:HTTP 入口、id 配对、
+    /// 帧封装、与真实 MCP-over-stdio 后端的字节级互通。
+    #[tokio::test]
+    async fn loopback_tools_call_roundtrips_through_pipe_and_echo_backend() {
+        if !node_available() {
+            return; // 无 node → skip
+        }
+        let state = McpProxy::new();
+        let sid = Uuid::new_v4();
+        let token = "tok-loopback";
+        state.register(token.into(), sid);
+        let (hub_tx, mut hub_rx) = mpsc::channel(4);
+        state.set_hub_sender(hub_tx).await;
+
+        // 绑自己的 127.0.0.1 监听器再喂 serve_on(Task 10 移除了
+        // serve(state, port),绑定上提给调用方)。镜像
+        // real_http_post_roundtrips_via_endpoint 的端口发现 + serve 形状。
+        let port = free_port();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("bind 127.0.0.1 test listener");
+        let serve_state = state.clone();
+        tokio::spawn(async move {
+            let _ = serve_on(listener, serve_state).await;
+        });
+
+        // 内联 hub+client:隧道帧 → echo 桩 stdin;桩 stdout → 配对回包。
+        let resp_state = state.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let fixture =
+                concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/echo-mcp.mjs");
+            let mut child = tokio::process::Command::new("node")
+                .arg(fixture)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .expect("spawn echo backend");
+            let mut stdin = child.stdin.take().expect("stdin");
+            let stdout = child.stdout.take().expect("stdout");
+            let mut lines = tokio::io::BufReader::new(stdout).lines();
+            while let Some(OutFrame::Text(ClientMsg::RemoteMcp {
+                session_id,
+                server,
+                payload,
+            })) = hub_rx.recv().await
+            {
+                assert_eq!(server, CC_BROWSER_SERVER);
+                stdin.write_all(payload.as_bytes()).await.unwrap();
+                stdin.write_all(b"\n").await.unwrap();
+                stdin.flush().await.unwrap();
+                if let Ok(Some(line)) = lines.next_line().await {
+                    resp_state.resolve_response(session_id, &server, line);
+                }
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let base = format!("http://127.0.0.1:{port}");
+        assert_eq!(wait_healthz(&client, &base).await, "ok");
+
+        let resp = client
+            .post(format!("{base}/mcp/{token}"))
+            .body(
+                r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"echo","arguments":{"text":"pipe"}}}"#,
+            )
+            .send()
+            .await
+            .expect("POST tools/call");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let text = resp.text().await.unwrap();
+        assert!(text.contains(r#""id":11"#), "response keeps id: {text}");
+        assert!(text.contains("echo: pipe"), "echo result came back: {text}");
+    }
 }
