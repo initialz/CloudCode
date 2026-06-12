@@ -21,12 +21,31 @@ fn parse_backend(cmd: &str) -> Option<(String, Vec<String>)> {
     Some((prog, parts.collect()))
 }
 
-/// 解析后端命令(计划①唯一来源,决策 D9):环境变量
-/// `CC_REMOTE_MCP_BACKEND`,空白分隔,首段为程序、其余为 argv。
-/// 未设置 → None(本机不提供远程-MCP 能力,Hello 能力位为 false)。
-/// 计划②在此之上叠加 `[browser]` 配置段与内置默认后端。
+/// 验证脚手架(计划①):把 echo 桩源码编进二进制,这样 `cloudcode`
+/// 不设任何环境变量、不依赖仓库路径就能跑通管道冒烟。**仅用于验证**
+/// —— 计划②会用随包内置的真实默认后端(dev-browser)替换它。
+const EMBEDDED_ECHO_MCP: &str = include_str!("../../../test-fixtures/echo-mcp.mjs");
+
+/// 把内置 echo 桩源码落到一个稳定的临时文件(每次启动覆盖写),返回
+/// `node <临时文件>` 命令。需要本机有 `node`(spawn 失败会走 McpHost
+/// 的退避/冷却路径)。写盘失败 → None(回落到「无后端」)。
+fn embedded_echo_backend() -> Option<(String, Vec<String>)> {
+    let path = std::env::temp_dir().join("cloudcode-cc-browser-echo.mjs");
+    std::fs::write(&path, EMBEDDED_ECHO_MCP).ok()?;
+    Some(("node".to_string(), vec![path.to_string_lossy().into_owned()]))
+}
+
+/// 解析后端命令(计划①,决策 D9):优先环境变量 `CC_REMOTE_MCP_BACKEND`
+/// (空白分隔,首段为程序、其余为 argv);未设置时回落到**内置 echo
+/// 桩**(验证脚手架,见 `embedded_echo_backend`)。两者都不可用 → None
+/// (本机不提供远程-MCP 能力,Hello 能力位为 false)。计划②在此之上叠加
+/// `[browser]` 配置段与随包内置的真实默认后端。
 pub fn backend_command() -> Option<(String, Vec<String>)> {
-    parse_backend(&std::env::var("CC_REMOTE_MCP_BACKEND").ok()?)
+    match std::env::var("CC_REMOTE_MCP_BACKEND") {
+        Ok(cmd) => parse_backend(&cmd),
+        // 未配置:回落到内置 echo 桩,让验证零配置可跑。
+        Err(_) => embedded_echo_backend(),
+    }
 }
 
 /// 已 spawn 的 MCP 子进程,说「按行分隔的 JSON-RPC over stdio」。
