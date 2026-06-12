@@ -199,7 +199,7 @@ where
                 // 拿到干净的 JSON-RPC 错误而不是干等超时。
                 Ok(ServerMsg::RemoteMcpClosed {
                     session_id,
-                    server: _,
+                    server: _, // plan-1: one server per session; plan-2 needs server-scoped fail_pending
                     reason,
                 }) => {
                     state.mcp.fail_pending(

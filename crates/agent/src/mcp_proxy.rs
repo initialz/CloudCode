@@ -331,16 +331,17 @@ pub async fn handle_post(token: &str, body: String, state: &McpProxy) -> PostOut
     }
 }
 
-/// 绑 localhost MCP 监听。POST `/mcp/:token` 即阻塞式 JSON-RPC 中继;
-/// GET 同路径暂回 405(Phase E Task 15 换成 SSE 通知流);`/healthz`
-/// 供探活。仅 127.0.0.1,不开新公网监听面。
-pub async fn serve(state: McpProxy, port: u16) -> std::io::Result<()> {
+/// 构建 proxy 的 axum 路由(不绑监听)。POST `/mcp/:token` 即阻塞式
+/// JSON-RPC 中继;GET 同路径暂回 405(Phase E Task 15 换成 SSE 通知
+/// 流);`/healthz` 供探活。绑定与 serve loop 分开,便于调用方先绑
+/// (失败即崩启动)再喂监听器进 serve loop(见 `serve_on`)。
+fn router(state: McpProxy) -> axum::Router {
     use axum::extract::{Path, State};
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use axum::routing::{get, post};
 
-    let app = axum::Router::new()
+    axum::Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route(
             "/mcp/:token",
@@ -358,11 +359,15 @@ pub async fn serve(state: McpProxy, port: u16) -> std::io::Result<()> {
             )
             .get(|| async { StatusCode::METHOD_NOT_ALLOWED }),
         )
-        .with_state(state);
+        .with_state(state)
+}
 
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    tracing::info!(port, "remote MCP proxy endpoint listening on 127.0.0.1");
-    axum::serve(listener, app)
+/// 在一个**已绑好**的监听器上跑 serve loop。绑定与 serve loop 分开:
+/// 端口冲突是致命且可操作的,要在调用方(agent serve())绑定时以 `?`
+/// 崩掉启动,而不是埋在 spawn 里只打一行日志后让 MCP 面永久失活。
+/// 这里只剩(罕见的)绑定后 serve-loop 错误,留给调用方 log-and-exit。
+pub async fn serve_on(listener: tokio::net::TcpListener, state: McpProxy) -> std::io::Result<()> {
+    axum::serve(listener, router(state))
         .await
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
 }
@@ -660,10 +665,15 @@ mod tests {
         let (hub_tx, mut hub_rx) = mpsc::channel(4);
         state.set_hub_sender(hub_tx).await;
 
+        // 绑自己的 127.0.0.1 监听器再喂 serve_on —— 镜像生产里 agent
+        // serve() 先绑(失败即崩启动)、再 spawn serve loop 的形状。
         let port = free_port();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("bind 127.0.0.1 test listener");
         let serve_state = state.clone();
         tokio::spawn(async move {
-            let _ = serve(serve_state, port).await;
+            let _ = serve_on(listener, serve_state).await;
         });
 
         // 模拟 client+hub:取走转发帧,按 id 喂回一条合成响应。

@@ -252,10 +252,19 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
     // agent<->hub ws 隧道到绑定 client。enabled=false 时整个监听面
     // 都不存在。
     if state.config.remote_mcp.enabled {
-        let mcp_state = state.mcp.clone();
         let port = state.config.remote_mcp.port;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+            .await
+            .with_context(|| {
+                format!(
+                    "remote MCP proxy failed to bind 127.0.0.1:{port}; \
+                     another agent instance may already be running (set [remote_mcp].enabled=false or change [remote_mcp].port)"
+                )
+            })?;
+        tracing::info!(port, "remote MCP proxy endpoint bound");
+        let mcp_state = state.mcp.clone();
         tokio::spawn(async move {
-            if let Err(e) = mcp_proxy::serve(mcp_state, port).await {
+            if let Err(e) = mcp_proxy::serve_on(listener, mcp_state).await {
                 tracing::error!(error = %e, "remote MCP proxy endpoint exited");
             }
         });
@@ -344,6 +353,12 @@ extra_args     = []
 # only so older agent.toml files keep parsing.
 # [sandbox]
 # enabled = false
+
+# [remote_mcp] controls the agent-side cc-browser MCP proxy endpoint
+# (localhost only). Defaults: enabled, port 7110. Uncomment to override.
+# [remote_mcp]
+# enabled = true
+# port    = 7110
 "#
     );
 
