@@ -150,6 +150,15 @@ async fn relay_loop(
     let mut pending_uploads: HashMap<Uuid, mpsc::Sender<HubToClient>> = HashMap::new();
     let (inject_tx, mut inject_rx) = mpsc::channel::<Vec<u8>>(16);
 
+    // 远程-MCP 宿主(Phase C)。后端命令来自 CC_REMOTE_MCP_BACKEND
+    // (决策 D9);未配置 → None,Hello 能力位为 false,hub/agent 不会
+    // 给我们发 RemoteMcp 帧 —— 万一异常发来,走下方防御性快速失败臂。
+    // 注意:host_out_tx 在本作用域常驻(host 内只持 clone),保证
+    // host_out_rx.recv() 永不返回 None 而空转。
+    let (host_out_tx, mut host_out_rx) = tokio::sync::mpsc::channel::<String>(64);
+    let mut mcp_host: Option<crate::mcp_host::McpHost> = crate::mcp_host::backend_command()
+        .map(|b| crate::mcp_host::McpHost::new(b, host_out_tx.clone()));
+
     loop {
         tokio::select! {
             chunk = bytes.recv() => {
@@ -230,7 +239,59 @@ async fn relay_loop(
                             let _ = tx.send(frame).await;
                         }
                     }
+                    HubToClient::RemoteMcp { server, payload } => {
+                        if server != crate::mcp_host::CC_BROWSER_SERVER {
+                            // 计划①只有一个插槽;未知 server 名立即回
+                            // Closed,agent 把该会话在飞请求快速失败。
+                            let _ = wire
+                                .out_tx
+                                .send(OutFrame::Text(ClientToHub::RemoteMcpClosed {
+                                    server,
+                                    reason: Some("unknown remote-MCP server".to_string()),
+                                }))
+                                .await;
+                        } else if let Some(host) = mcp_host.as_mut() {
+                            if let Err(e) = host.deliver(payload).await {
+                                let _ = wire
+                                    .out_tx
+                                    .send(OutFrame::Text(ClientToHub::RemoteMcpClosed {
+                                        server,
+                                        reason: Some(e.to_string()),
+                                    }))
+                                    .await;
+                            }
+                        } else {
+                            // 能力位为 false 仍收到帧:防御性快速失败。
+                            let _ = wire
+                                .out_tx
+                                .send(OutFrame::Text(ClientToHub::RemoteMcpClosed {
+                                    server,
+                                    reason: Some(
+                                        "no MCP backend configured (set CC_REMOTE_MCP_BACKEND)"
+                                            .to_string(),
+                                    ),
+                                }))
+                                .await;
+                        }
+                    }
+                    HubToClient::RemoteMcpClosed { .. } => {
+                        if let Some(host) = mcp_host.as_mut() {
+                            host.shutdown();
+                        }
+                    }
                     _ => {}
+                }
+            }
+            out = host_out_rx.recv() => {
+                // host_out_tx 常驻本作用域,recv 不会得 None;防御写法。
+                if let Some(payload) = out {
+                    let _ = wire
+                        .out_tx
+                        .send(OutFrame::Text(ClientToHub::RemoteMcp {
+                            server: crate::mcp_host::CC_BROWSER_SERVER.to_string(),
+                            payload,
+                        }))
+                        .await;
                 }
             }
             _ = winch_tick(&mut winch) => {

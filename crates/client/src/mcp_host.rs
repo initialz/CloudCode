@@ -12,7 +12,6 @@ use tokio::sync::mpsc;
 
 /// claude 眼里固定的 MCP server 名(计划①唯一插槽)。与 agent 侧
 /// `crates/agent/src/mcp_proxy.rs::CC_BROWSER_SERVER` 手工 lockstep。
-#[allow(dead_code)] // Task 8 接线后使用
 pub const CC_BROWSER_SERVER: &str = "cc-browser";
 
 /// 把空白分隔的命令串拆成 (程序, argv)。空串/全空白 → None。
@@ -26,20 +25,17 @@ fn parse_backend(cmd: &str) -> Option<(String, Vec<String>)> {
 /// `CC_REMOTE_MCP_BACKEND`,空白分隔,首段为程序、其余为 argv。
 /// 未设置 → None(本机不提供远程-MCP 能力,Hello 能力位为 false)。
 /// 计划②在此之上叠加 `[browser]` 配置段与内置默认后端。
-#[allow(dead_code)] // Task 8 接线后使用
 pub fn backend_command() -> Option<(String, Vec<String>)> {
     parse_backend(&std::env::var("CC_REMOTE_MCP_BACKEND").ok()?)
 }
 
 /// 已 spawn 的 MCP 子进程,说「按行分隔的 JSON-RPC over stdio」。
-#[allow(dead_code)] // Task 6+ 接线后使用
 pub struct McpProcess {
     child: Child,
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
 }
 
-#[allow(dead_code)] // Task 6+ 接线后使用
 impl McpProcess {
     pub fn spawn(program: &str, args: &[String]) -> std::io::Result<Self> {
         let mut child = Command::new(program)
