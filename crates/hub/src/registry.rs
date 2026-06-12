@@ -292,7 +292,8 @@ fn classify(frame: &ClientMsg) -> Routing {
         ClientMsg::PtyOpened { session_id, .. }
         | ClientMsg::PtyClosed { session_id, .. }
         | ClientMsg::PtyError { session_id, .. }
-        | ClientMsg::SplitPaneResult { session_id, .. } => Routing::Session(*session_id),
+        | ClientMsg::SplitPaneResult { session_id, .. }
+        | ClientMsg::RemoteMcp { session_id, .. } => Routing::Session(*session_id),
         ClientMsg::WorkspaceListResult { request_id, .. }
         | ClientMsg::WorkspaceCreateResult { request_id, .. }
         | ClientMsg::WorkspaceDeleteResult { request_id, .. }
@@ -390,5 +391,19 @@ mod tests {
             got,
             ClientMsg::FsReadChunk { error: Some(ref e), .. } if e == "boom"
         ));
+    }
+
+    #[test]
+    fn remote_mcp_classifies_as_session() {
+        let sid = Uuid::new_v4();
+        let frame = ClientMsg::RemoteMcp {
+            session_id: sid,
+            server: "cc-browser".to_string(),
+            payload: "{}".to_string(),
+        };
+        match classify(&frame) {
+            Routing::Session(got) => assert_eq!(got, sid),
+            _ => panic!("RemoteMcp must route by session"),
+        }
     }
 }

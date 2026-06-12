@@ -476,6 +476,10 @@ impl PtyManager {
                         .await;
                 }
             }
+            // Phase D 起这两类帧在 ws.rs 读循环里被拦截(resolve_response /
+            // fail_pending),永远到不了 PtyManager;空臂仅为 match 穷尽性。
+            ServerMsg::RemoteMcp { .. } => {}
+            ServerMsg::RemoteMcpClosed { .. } => {}
             ServerMsg::Welcome { .. } | ServerMsg::Rejected { .. } | ServerMsg::Ping => {}
         }
     }

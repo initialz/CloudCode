@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub const PROTOCOL_VERSION: &str = "12";
+pub const PROTOCOL_VERSION: &str = "13";
 
 // ---------------------------------------------------------------------------
 // Binary frame layout (Message::Binary on the WS tunnel):
@@ -220,6 +220,18 @@ pub enum ClientMsg {
         deleted: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+
+    /// One opaque MCP JSON-RPC frame from the agent-side remote-MCP
+    /// proxy (claude is the MCP client) toward the bound client's
+    /// backend MCP subprocess. Backend-agnostic: `server` is the MCP
+    /// server name claude sees (plan-1 always "cc-browser"), `payload`
+    /// is raw JSON-RPC text, never parsed in transit. `session_id` is
+    /// the hub routing key.
+    RemoteMcp {
+        session_id: Uuid,
+        server: String,
+        payload: String,
     },
 }
 
@@ -480,6 +492,27 @@ pub enum ServerMsg {
         workspace: String,
         paths: Vec<String>,
     },
+
+    /// One opaque MCP JSON-RPC frame from the client's backend MCP
+    /// subprocess back toward claude, routed by `session_id` (and
+    /// `server`) to the matching in-flight proxy request. Payload is
+    /// raw text, never parsed in transit.
+    RemoteMcp {
+        session_id: Uuid,
+        server: String,
+        payload: String,
+    },
+
+    /// The client's remote-MCP channel is gone (backend unavailable,
+    /// subprocess died, or client teardown). The agent-side proxy must
+    /// fail this session's in-flight MCP requests so claude gets a
+    /// clean JSON-RPC error instead of waiting out a timeout.
+    RemoteMcpClosed {
+        session_id: Uuid,
+        server: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -488,4 +521,83 @@ pub enum RejectReason {
     NameTaken,
     AuthFailed,
     VersionMismatch,
+}
+
+#[cfg(test)]
+mod remote_mcp_tests {
+    use super::*;
+
+    #[test]
+    fn remote_mcp_frames_roundtrip_byte_exact() {
+        let sid = Uuid::new_v4();
+        // 负载故意带乱序键:中继若做过任何反序列化-再序列化都可能重排,
+        // 字节等值断言钉死「原文透传」不变量。
+        let original = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"zebra":1,"alpha":2}}"#;
+
+        let c = ClientMsg::RemoteMcp {
+            session_id: sid,
+            server: "cc-browser".to_string(),
+            payload: original.to_string(),
+        };
+        let j = serde_json::to_string(&c).unwrap();
+        assert!(j.contains("\"type\":\"remote_mcp\""), "tag mismatch: {j}");
+        match serde_json::from_str::<ClientMsg>(&j).unwrap() {
+            ClientMsg::RemoteMcp { session_id, server, payload } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(server, "cc-browser");
+                assert_eq!(payload, original);
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let s = ServerMsg::RemoteMcp {
+            session_id: sid,
+            server: "cc-browser".to_string(),
+            payload: original.to_string(),
+        };
+        let j2 = serde_json::to_string(&s).unwrap();
+        assert!(j2.contains("\"type\":\"remote_mcp\""), "tag mismatch: {j2}");
+        match serde_json::from_str::<ServerMsg>(&j2).unwrap() {
+            ServerMsg::RemoteMcp { session_id, server, payload } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(server, "cc-browser");
+                assert_eq!(payload, original);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn remote_mcp_closed_roundtrips_and_reason_defaults() {
+        let sid = Uuid::new_v4();
+        let s = ServerMsg::RemoteMcpClosed {
+            session_id: sid,
+            server: "cc-browser".to_string(),
+            reason: Some("backend died".to_string()),
+        };
+        let j = serde_json::to_string(&s).unwrap();
+        assert!(j.contains("\"type\":\"remote_mcp_closed\""), "tag mismatch: {j}");
+        match serde_json::from_str::<ServerMsg>(&j).unwrap() {
+            ServerMsg::RemoteMcpClosed { session_id, server, reason } => {
+                assert_eq!(session_id, sid);
+                assert_eq!(server, "cc-browser");
+                assert_eq!(reason.as_deref(), Some("backend died"));
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        // 线上省略 reason → #[serde(default)] 解出 None(跨版本字节兼容)。
+        let wire = format!(
+            r#"{{"type":"remote_mcp_closed","session_id":"{sid}","server":"cc-browser"}}"#
+        );
+        match serde_json::from_str::<ServerMsg>(&wire).unwrap() {
+            ServerMsg::RemoteMcpClosed { reason, .. } => assert_eq!(reason, None),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn protocol_version_is_13() {
+        assert_eq!(PROTOCOL_VERSION, "13");
+    }
 }
