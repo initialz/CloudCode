@@ -657,7 +657,12 @@ impl PtyManager {
                     // 引导 prompt。绝不写全局 ~/.claude.json,绝不 `claude
                     // mcp add`(D11 铁律)。strict 保证 claude 只看到这份
                     // 配置 —— 同机其他 claude 进程零影响。
-                    claude_args.extend(crate::mcp_proxy::claude_mcp_args(&mcp_cfg_path));
+                    // 引导文案必须匹配实际注入的 server:web=None 时
+                    // 配置里没有 `web`,引导也不能让 claude 去用它。
+                    claude_args.extend(crate::mcp_proxy::claude_mcp_args(
+                        &mcp_cfg_path,
+                        web.is_some(),
+                    ));
                 }
                 Err(e) => {
                     tracing::warn!(

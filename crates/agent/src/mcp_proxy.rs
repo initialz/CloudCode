@@ -51,8 +51,11 @@ fn parse_command(cmd: &str) -> Option<(String, Vec<String>)> {
 }
 
 /// `[browser]` 段 → 注入配置里 web stdio 条目的命令(决策 P3)。
-/// web_enabled=false 或显式覆盖解析失败 → None(注入退回计划①单
-/// cc-browser);缺省 = 内置默认 `npx -y <pin> --headless`。
+/// web_enabled 先于 web_backend 检查:`web_enabled=false` 恒返回 None,
+/// 即便同时设了 web_backend(也不会解析它)。web_enabled=true 时显式
+/// 覆盖解析失败(空白串)→ None;两种 None 都让注入退回计划①单
+/// cc-browser。缺省(web_enabled=true 且无覆盖)= 内置默认
+/// `npx -y <pin> --headless`。
 pub fn web_backend_command(
     cfg: &crate::config::BrowserConfig,
 ) -> Option<(String, Vec<String>)> {
@@ -107,6 +110,31 @@ Rules:
 6. If a `cc-browser` tool call returns a 'not connected' style error,
    relay its instructions to the user (they need to open the cloudcode
    CLI on their local machine), then retry after they confirm."#;
+
+/// 单后端引导:web_enabled=false(或 web 命令解析失败)时,注入配置里
+/// 只有 `cc-browser`、没有 `web`。此时绝不能让 claude 去用一个不存在的
+/// `web` server(否则 unknown-server 报错 + 误导)。只描述 cc-browser。
+pub const GUIDANCE_PROMPT_CC_BROWSER_ONLY: &str = r#"A browser MCP server is available:
+
+- `cc-browser`: a VISIBLE browser window on the USER'S LOCAL machine,
+  connected through the cloudcode CLI. The user can see it, log into
+  sites in it, and operate it by hand. Its logins persist across
+  sessions.
+
+Use `cc-browser` for web browsing the user asks for. If a `cc-browser`
+tool call returns a 'not connected' style error, relay its instructions
+to the user (they need to open the cloudcode CLI on their local
+machine), then retry after they confirm."#;
+
+/// 按「web 是否真被注入」选引导文案:有 web ⇒ 双后端文案;无 ⇒ 单
+/// cc-browser 文案(不提 web,避免 unknown-server 陷阱)。
+pub fn guidance_prompt(has_web: bool) -> &'static str {
+    if has_web {
+        GUIDANCE_PROMPT
+    } else {
+        GUIDANCE_PROMPT_CC_BROWSER_ONLY
+    }
+}
 
 /// 在飞请求的配对键:(session_id, server 名, 规范化 JSON-RPC id)。
 /// server 进键位是为计划②同会话多 server 时 id 互不冲突。
@@ -442,13 +470,13 @@ pub fn is_valid_token(token: &str) -> bool {
 /// 拼装 claude 的每会话 MCP 注入参数(纯函数,单测)。铁律(D11):
 /// 进程级 --mcp-config + --strict-mcp-config,即用即弃;绝不写全局
 /// ~/.claude.json,绝不使用 `claude mcp add`。
-pub fn claude_mcp_args(cfg_path: &std::path::Path) -> Vec<String> {
+pub fn claude_mcp_args(cfg_path: &std::path::Path, has_web: bool) -> Vec<String> {
     vec![
         "--mcp-config".to_string(),
         cfg_path.to_string_lossy().to_string(),
         "--strict-mcp-config".to_string(),
         "--append-system-prompt".to_string(),
-        GUIDANCE_PROMPT.to_string(),
+        guidance_prompt(has_web).to_string(),
     ]
 }
 
@@ -943,7 +971,7 @@ mod tests {
 
     #[test]
     fn claude_args_carry_strict_flag_and_guidance() {
-        let args = claude_mcp_args(std::path::Path::new("/ws/.cloudcode/mcp-remote.json"));
+        let args = claude_mcp_args(std::path::Path::new("/ws/.cloudcode/mcp-remote.json"), true);
         assert_eq!(
             args,
             vec![
@@ -957,6 +985,54 @@ mod tests {
         // 引导文案通用化:点名 server,不写死任何工具名(决策 D11)。
         assert!(GUIDANCE_PROMPT.contains("cc-browser"));
         assert!(!GUIDANCE_PROMPT.contains("browser_navigate"));
+    }
+
+    #[test]
+    fn claude_args_without_web_embed_single_server_prompt() {
+        // has_web=false ⇒ 注入里只有 cc-browser,引导也必须只提 cc-browser,
+        // 绝不让 claude 去用不存在的 `web`(unknown-server 陷阱)。
+        let args = claude_mcp_args(std::path::Path::new("/ws/.cloudcode/mcp-remote.json"), false);
+        assert_eq!(
+            args,
+            vec![
+                "--mcp-config".to_string(),
+                "/ws/.cloudcode/mcp-remote.json".to_string(),
+                "--strict-mcp-config".to_string(),
+                "--append-system-prompt".to_string(),
+                GUIDANCE_PROMPT_CC_BROWSER_ONLY.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn guidance_prompt_selects_by_injected_servers() {
+        // 有 web:双后端文案(点名两 server)。
+        let dual = guidance_prompt(true);
+        assert!(dual.contains("Two browser"));
+        assert!(dual.contains("`web`"));
+        assert!(dual.contains("`cc-browser`"));
+        // 无 web:单 cc-browser 文案 —— 提 cc-browser,但绝不提 `web`/两 server。
+        let single = guidance_prompt(false);
+        assert!(single.contains("`cc-browser`"));
+        assert!(!single.contains("`web`"));
+        assert!(!single.contains("Two browser"));
+    }
+
+    #[test]
+    fn parse_command_splits_empty_single_and_multi() {
+        // 空串 / 全空白 → None。
+        assert_eq!(parse_command(""), None);
+        assert_eq!(parse_command("   "), None);
+        // 单 token → 程序名 + 空 argv。
+        assert_eq!(parse_command("npx"), Some(("npx".to_string(), vec![])));
+        // 多 token → 程序名 + 余下按空白拆分(含折叠多空白)。
+        assert_eq!(
+            parse_command("npx  -y  pkg --flag"),
+            Some((
+                "npx".to_string(),
+                vec!["-y".to_string(), "pkg".to_string(), "--flag".to_string()]
+            ))
+        );
     }
 
     #[test]
