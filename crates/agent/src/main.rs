@@ -2,6 +2,7 @@ mod audit;
 mod config;
 mod fs;
 mod jsonl;
+mod mcp_proxy;
 mod name;
 mod pty;
 mod sandbox;
