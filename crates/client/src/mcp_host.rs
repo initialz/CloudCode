@@ -154,18 +154,29 @@ impl McpChannel {
             };
             proc.feed(frame).await?;
             if let Some(want) = init_id {
+                // drain 到 initialize 响应被按 id 吞掉为止;唯一上限是 60s
+                // 超时(防后端挂死)。绝不能用固定计数提前放弃 —— 否则未吞的
+                // initialize 响应会被随后的 pump 转发给 claude,污染 id 配对。
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
-                for _ in 0..10 {
+                loop {
                     let Ok(maybe) = tokio::time::timeout_at(deadline, proc.next_frame()).await
                     else {
-                        tracing::warn!("timed out waiting for replayed initialize response");
+                        tracing::warn!(
+                            "timed out waiting for replayed initialize response; \
+                             backend may send a duplicate initialize id to claude"
+                        );
                         break;
                     };
-                    let Some(resp) = maybe else { break }; // EOF
+                    let Some(resp) = maybe else {
+                        tracing::warn!("backend EOF during handshake replay; channel will immediately die");
+                        break;
+                    };
                     if json_id(&resp).as_ref() == Some(&want) {
                         break; // 吞掉:claude 已有自己的 initialize 响应
                     }
-                    let _ = out_tx.send(resp).await;
+                    if out_tx.send(resp).await.is_err() {
+                        break; // 接收端已走,继续重放无意义
+                    }
                 }
             }
         }
@@ -329,6 +340,59 @@ mod tests {
         assert!(!next.contains("serverInfo"), "duplicate initialize response leaked: {next}");
         assert!(next.contains("echo"));
         assert!(out_rx.try_recv().is_err(), "nothing else may be queued in between");
+    }
+
+    /// 回归:重放期间后端在 initialize 响应前发出大量帧(> 旧的 0..10
+    /// 上限)时,initialize 响应仍必须被吞掉、绝不泄漏给 claude。
+    #[tokio::test]
+    async fn start_replayed_swallows_initialize_despite_many_interleaved_frames() {
+        if !node_available() {
+            return;
+        }
+        let fixture =
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/chatty-init-mcp.mjs");
+        let args = vec![fixture.to_string()];
+        let (out_tx, mut out_rx) = mpsc::channel(64);
+        let cache = Arc::new(Mutex::new(Vec::new()));
+
+        // 冷启动 + 握手:排空冷启动帧直到看到 initialize 响应(serverInfo)。
+        let chan = McpChannel::start("node", &args, out_tx.clone(), cache.clone()).expect("start");
+        chan.feed(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string())
+            .unwrap();
+        loop {
+            let f = tokio::time::timeout(std::time::Duration::from_secs(10), out_rx.recv())
+                .await
+                .expect("frame within 10s")
+                .expect("channel alive");
+            if f.contains("serverInfo") {
+                break;
+            }
+        }
+        chan.feed(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.to_string())
+            .unwrap();
+        assert_eq!(cache.lock().unwrap().len(), 2);
+
+        // 重生重放,再发 tools/list:排空直到 tools/list 响应(id 2),
+        // 期间绝不能出现重复的 initialize 响应(serverInfo)。
+        drop(chan);
+        let chan = McpChannel::start_replayed("node", &args, out_tx.clone(), cache.clone())
+            .await
+            .expect("start_replayed");
+        chan.feed(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#.to_string())
+            .unwrap();
+        loop {
+            let f = tokio::time::timeout(std::time::Duration::from_secs(10), out_rx.recv())
+                .await
+                .expect("frame within 10s")
+                .expect("channel alive");
+            assert!(
+                !f.contains("serverInfo"),
+                "duplicate initialize response leaked after replay: {f}"
+            );
+            if f.contains(r#""id":2"#) {
+                break;
+            }
+        }
     }
 
     /// 握手缓存由宿主拥有、仅共享进通道:通道收摊(RemoteMcpClosed /
