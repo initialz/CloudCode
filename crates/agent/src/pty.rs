@@ -67,6 +67,8 @@ struct PtyHandle {
 }
 
 impl PtyManager {
+    // 构造参数随 [remote_mcp] 接线增至 8 个;按既有惯例豁免。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         claude: ClaudeConfig,
         tools: HashMap<String, ToolConfig>,

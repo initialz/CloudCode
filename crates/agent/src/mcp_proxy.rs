@@ -100,6 +100,8 @@ impl McpProxy {
 
     pub fn unregister(&self, token: &str) {
         self.routes.remove(token);
+        // 同步清掉该 token 的通知订阅,避免 workspace 删除后残留。
+        self.notify.remove(token);
     }
 
     pub fn session_for(&self, token: &str) -> Option<Uuid> {
@@ -526,7 +528,7 @@ fn router(state: McpProxy) -> axum::Router {
 pub async fn serve_on(listener: tokio::net::TcpListener, state: McpProxy) -> std::io::Result<()> {
     axum::serve(listener, router(state))
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        .map_err(std::io::Error::other)
 }
 
 #[cfg(test)]
