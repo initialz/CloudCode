@@ -226,6 +226,7 @@ async fn serve(config_path: PathBuf) -> anyhow::Result<()> {
         config.sandbox.clone(),
         mcp.clone(),
         config.remote_mcp.clone(),
+        config.browser.clone(),
     )?);
 
     // Process-level audit pipeline: watches ~/.claude/projects/ and

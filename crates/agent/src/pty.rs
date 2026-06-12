@@ -47,6 +47,9 @@ pub struct PtyManager {
     mcp: crate::mcp_proxy::McpProxy,
     /// `[remote_mcp]` 配置快照(enabled / port / manifest 路径)。
     remote_mcp: crate::config::RemoteMcpConfig,
+    /// `[browser]` 配置快照(web_enabled / web_backend):注入配置里
+    /// web stdio 条目的来源(计划②)。
+    browser: crate::config::BrowserConfig,
     /// 每工作区一枚稳定 remote-MCP token,键 (account, workspace)。
     /// 首次注入时铸造、之后每次 open 复用并对新 session_id 重注册
     /// (决策 D12);仅 workspace delete/reset 时移除并注销。
@@ -67,7 +70,7 @@ struct PtyHandle {
 }
 
 impl PtyManager {
-    // 构造参数随 [remote_mcp] 接线增至 8 个;按既有惯例豁免。
+    // 构造参数随 [remote_mcp]/[browser] 接线增至 9 个;按既有惯例豁免。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         claude: ClaudeConfig,
@@ -83,6 +86,7 @@ impl PtyManager {
         _sandbox: SandboxConfig,
         mcp: crate::mcp_proxy::McpProxy,
         remote_mcp: crate::config::RemoteMcpConfig,
+        browser: crate::config::BrowserConfig,
     ) -> Result<Self> {
         // Fail fast if tmux is not installed.
         let tmux_path = which::which(&tmux.executable).with_context(|| {
@@ -188,6 +192,7 @@ impl PtyManager {
             write_sessions: crate::fs::new_write_sessions(),
             mcp,
             remote_mcp,
+            browser,
             workspace_tokens: DashMap::new(),
         })
     }
@@ -629,7 +634,13 @@ impl PtyManager {
                         .unwrap_or_else(|| Uuid::new_v4().simple().to_string())
                 })
                 .clone();
-            let mcp_cfg = crate::mcp_proxy::mcp_config_json(self.remote_mcp.port, &token, None);
+            // [browser] → web stdio 条目:web_enabled=false / 解析失败
+            // ⇒ None ⇒ 单 server(=计划①)。纯函数已单测,此处只是借用
+            // 成 (&str, &[String]) 喂给 mcp_config_json。
+            let web = crate::mcp_proxy::web_backend_command(&self.browser);
+            let web_ref = web.as_ref().map(|(p, a)| (p.as_str(), a.as_slice()));
+            let mcp_cfg =
+                crate::mcp_proxy::mcp_config_json(self.remote_mcp.port, &token, web_ref);
             let mcp_cfg_path = cwd.join(".cloudcode").join("mcp-remote.json");
             if let Some(parent) = mcp_cfg_path.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {

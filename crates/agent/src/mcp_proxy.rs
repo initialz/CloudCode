@@ -36,6 +36,42 @@ pub const CC_BROWSER_SERVER: &str = "cc-browser";
 /// 条目由 claude 直接 spawn,不走帧、不进 client,无需跨端 lockstep。
 pub const WEB_SERVER: &str = "web";
 
+/// 两后端共用的 playwright-mcp pin 版本(spec 组件 6)。与 client 侧
+/// `crates/client/src/mcp_host.rs::PLAYWRIGHT_MCP_PKG` 手工 lockstep;
+/// 升级须两处同改并重跑双后端冒烟。
+pub const PLAYWRIGHT_MCP_PKG: &str = "@playwright/mcp@0.0.76";
+
+/// 把空白分隔的命令串拆成 (程序, argv)。空串/全空白 → None。镜像
+/// client 侧 mcp_host.rs::parse_backend(两 bin crate 无共享 lib,
+/// 按 CC_BROWSER_SERVER 先例就地小复制)。
+fn parse_command(cmd: &str) -> Option<(String, Vec<String>)> {
+    let mut parts = cmd.split_whitespace().map(|s| s.to_string());
+    let prog = parts.next()?;
+    Some((prog, parts.collect()))
+}
+
+/// `[browser]` 段 → 注入配置里 web stdio 条目的命令(决策 P3)。
+/// web_enabled=false 或显式覆盖解析失败 → None(注入退回计划①单
+/// cc-browser);缺省 = 内置默认 `npx -y <pin> --headless`。
+pub fn web_backend_command(
+    cfg: &crate::config::BrowserConfig,
+) -> Option<(String, Vec<String>)> {
+    if !cfg.web_enabled {
+        return None;
+    }
+    match &cfg.web_backend {
+        Some(cmd) => parse_command(cmd),
+        None => Some((
+            "npx".to_string(),
+            vec![
+                "-y".to_string(),
+                PLAYWRIGHT_MCP_PKG.to_string(),
+                "--headless".to_string(),
+            ],
+        )),
+    }
+}
+
 /// 注入给 claude 的双后端选择引导(计划②,经 --append-system-prompt):
 /// 默认恒 `web`(agent 本机无头)、用户明示才 `cc-browser`(client 本地
 /// 有头)、撞登录墙不自切先问、任务级粘住一个后端、两后端状态不互通。
@@ -581,6 +617,74 @@ pub async fn serve_on(listener: tokio::net::TcpListener, state: McpProxy) -> std
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_backend_default_is_pinned_headless_playwright() {
+        // [browser] 全缺省 ⇒ 注入双 server,web = npx -y <pin> --headless。
+        let cfg = crate::config::BrowserConfig::default();
+        let (prog, args) = web_backend_command(&cfg).expect("default web backend");
+        assert_eq!(prog, "npx");
+        assert_eq!(
+            args,
+            vec![
+                "-y".to_string(),
+                PLAYWRIGHT_MCP_PKG.to_string(),
+                "--headless".to_string()
+            ]
+        );
+        assert_eq!(PLAYWRIGHT_MCP_PKG, "@playwright/mcp@0.0.76", "pin 版本单点");
+    }
+
+    #[test]
+    fn web_backend_disabled_or_blank_override_yields_none() {
+        // web_enabled=false ⇒ None ⇒ mcp_config_json 退单 server(=①)。
+        let cfg = crate::config::BrowserConfig {
+            web_enabled: false,
+            web_backend: None,
+        };
+        assert_eq!(web_backend_command(&cfg), None);
+        // 显式覆盖为空白串 = 解析失败 ⇒ 同样退单 server,不注入坏条目。
+        let cfg = crate::config::BrowserConfig {
+            web_enabled: true,
+            web_backend: Some("   ".to_string()),
+        };
+        assert_eq!(web_backend_command(&cfg), None);
+    }
+
+    #[test]
+    fn web_backend_explicit_override_is_parsed() {
+        let cfg = crate::config::BrowserConfig {
+            web_enabled: true,
+            web_backend: Some("npx -y @playwright/mcp@0.0.76 --headless --browser=chromium".to_string()),
+        };
+        let (prog, args) = web_backend_command(&cfg).expect("override parsed");
+        assert_eq!(prog, "npx");
+        assert!(args.contains(&"--browser=chromium".to_string()));
+    }
+
+    #[test]
+    fn injection_glue_default_config_yields_dual_server_json() {
+        // 端到端纯函数串联:默认 [browser] → web_backend_command →
+        // mcp_config_json = 双 server;web_enabled=false → 单 server。
+        // 与 pty.rs 注入块逐字同形(那边只是 self.browser 换 cfg)。
+        let cfg = crate::config::BrowserConfig::default();
+        let web = web_backend_command(&cfg);
+        let web_ref = web.as_ref().map(|(p, a)| (p.as_str(), a.as_slice()));
+        let s = mcp_config_json(7110, "abc123", web_ref);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["mcpServers"][WEB_SERVER]["command"], "npx");
+        assert_eq!(v["mcpServers"]["cc-browser"]["type"], "http");
+
+        let off = crate::config::BrowserConfig {
+            web_enabled: false,
+            web_backend: None,
+        };
+        let web = web_backend_command(&off);
+        let web_ref = web.as_ref().map(|(p, a)| (p.as_str(), a.as_slice()));
+        let s = mcp_config_json(7110, "abc123", web_ref);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(v["mcpServers"].get(WEB_SERVER).is_none());
+    }
 
     #[tokio::test]
     async fn unknown_token_request_gets_jsonrpc_error_not_404() {
