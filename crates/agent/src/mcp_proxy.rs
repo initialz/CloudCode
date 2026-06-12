@@ -32,6 +32,10 @@ use crate::tunnel::ClientMsg;
 /// `crates/client/src/mcp_host.rs::CC_BROWSER_SERVER` 手工 lockstep。
 pub const CC_BROWSER_SERVER: &str = "cc-browser";
 
+/// claude 眼里 agent 本机无头浏览器的 MCP server 名(计划②)。stdio
+/// 条目由 claude 直接 spawn,不走帧、不进 client,无需跨端 lockstep。
+pub const WEB_SERVER: &str = "web";
+
 /// 注入给 claude 的通用引导(决策 D11):说明 cc-browser 的工具在用户
 /// 本地机器执行、收到「未连接」错误时如何转告用户。不写死任何工具名
 /// —— 工具表由后端运行时决定。
@@ -325,12 +329,29 @@ fn extract_id_key(body: &str) -> Option<String> {
     }
 }
 
-/// 生成 claude 要加载的 `--mcp-config` JSON(Streamable HTTP 指向本
-/// proxy)。server 名固定 cc-browser。
-pub fn mcp_config_json(port: u16, token: &str) -> String {
-    format!(
-        r#"{{"mcpServers":{{"{CC_BROWSER_SERVER}":{{"type":"http","url":"http://127.0.0.1:{port}/mcp/{token}"}}}}}}"#
-    )
+/// 生成 claude 要加载的 `--mcp-config` JSON。`web = Some((program,
+/// args))` 时含两个 server:`web`(stdio,claude 直 spawn 的本机无头
+/// 后端)+ `cc-browser`(http 指向本 proxy);`None`(`[browser]`
+/// web_enabled=false 或 web 命令解析失败)退回计划①单 cc-browser。
+/// 用 serde_json 构造:args 可含任意用户配置的路径/引号,必须正确
+/// 转义;serde_json 输出确定(同输入同字节),D12 的字节稳定以本
+/// 格式为新基线。
+pub fn mcp_config_json(port: u16, token: &str, web: Option<(&str, &[String])>) -> String {
+    let mut servers = serde_json::Map::new();
+    if let Some((program, args)) = web {
+        servers.insert(
+            WEB_SERVER.to_string(),
+            serde_json::json!({ "type": "stdio", "command": program, "args": args }),
+        );
+    }
+    servers.insert(
+        CC_BROWSER_SERVER.to_string(),
+        serde_json::json!({
+            "type": "http",
+            "url": format!("http://127.0.0.1:{port}/mcp/{token}")
+        }),
+    );
+    serde_json::json!({ "mcpServers": servers }).to_string()
 }
 
 /// 从先前写盘的 mcp-remote.json 把 token 捞回来:agent 重启后重新采用,
@@ -717,11 +738,77 @@ mod tests {
 
     #[test]
     fn config_has_http_url_with_token_under_cc_browser() {
-        let s = mcp_config_json(7110, "abc123");
+        let s = mcp_config_json(7110, "abc123", None);
         assert!(s.contains("\"cc-browser\""));
         assert!(s.contains("\"type\":\"http\""));
         assert!(s.contains("http://127.0.0.1:7110/mcp/abc123"));
         let _: serde_json::Value = serde_json::from_str(&s).unwrap();
+    }
+
+    #[test]
+    fn config_with_web_backend_has_two_servers() {
+        let args = vec![
+            "-y".to_string(),
+            "@playwright/mcp@0.0.76".to_string(),
+            "--headless".to_string(),
+        ];
+        let s = mcp_config_json(7110, "abc123", Some(("npx", &args)));
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        // web:stdio,claude 直 spawn,不走隧道。
+        assert_eq!(v["mcpServers"][WEB_SERVER]["type"], "stdio");
+        assert_eq!(v["mcpServers"][WEB_SERVER]["command"], "npx");
+        assert_eq!(
+            v["mcpServers"][WEB_SERVER]["args"],
+            serde_json::json!(["-y", "@playwright/mcp@0.0.76", "--headless"])
+        );
+        assert!(v["mcpServers"][WEB_SERVER].get("url").is_none());
+        // cc-browser:http,与计划①字节语义一致。
+        assert_eq!(v["mcpServers"]["cc-browser"]["type"], "http");
+        assert_eq!(
+            v["mcpServers"]["cc-browser"]["url"],
+            "http://127.0.0.1:7110/mcp/abc123"
+        );
+        assert!(v["mcpServers"]["cc-browser"].get("command").is_none());
+    }
+
+    #[test]
+    fn config_without_web_is_single_server_plan1_shape() {
+        // web=None(web_enabled=false / 命令解析失败)⇒ 退回计划①单
+        // server 形态。
+        let s = mcp_config_json(7110, "abc123", None);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(v["mcpServers"].get(WEB_SERVER).is_none());
+        assert_eq!(
+            v["mcpServers"]["cc-browser"]["url"],
+            "http://127.0.0.1:7110/mcp/abc123"
+        );
+    }
+
+    #[test]
+    fn config_json_escapes_hostile_web_args() {
+        // 换 serde_json 构造的动机:args 含引号/空格/反斜杠也必须产出
+        // 合法 JSON(format! 拼接做不到)。
+        let args = vec![r#"--user-data-dir=/tmp/has "quotes" and \slash"#.to_string()];
+        let s = mcp_config_json(7110, "t0", Some(("npx", &args)));
+        let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
+        assert_eq!(
+            v["mcpServers"][WEB_SERVER]["args"][0],
+            r#"--user-data-dir=/tmp/has "quotes" and \slash"#
+        );
+    }
+
+    #[test]
+    fn extract_token_reads_cc_browser_from_dual_and_legacy_configs() {
+        // 自愈回采兼容(spec 组件 1):token 永远从 cc-browser.url 取,
+        // 双 server 新格式与计划①单 server 旧格式都要工作。
+        let args = vec!["--headless".to_string()];
+        let dual = mcp_config_json(7110, "deadbeef", Some(("npx", &args)));
+        assert_eq!(extract_token_from_config(&dual), Some("deadbeef".to_string()));
+        let single = mcp_config_json(7110, "deadbeef", None);
+        assert_eq!(extract_token_from_config(&single), Some("deadbeef".to_string()));
+        // 计划①真实写过盘的旧格式字面量(防 mcp_config_json 回归性巧合)。
+        let legacy = r#"{"mcpServers":{"cc-browser":{"type":"http","url":"http://127.0.0.1:7110/mcp/cafebabe"}}}"#;
+        assert_eq!(extract_token_from_config(legacy), Some("cafebabe".to_string()));
     }
 
     #[test]
@@ -744,7 +831,7 @@ mod tests {
 
     #[test]
     fn extract_token_roundtrip_and_garbage() {
-        let json = mcp_config_json(7110, "abc123");
+        let json = mcp_config_json(7110, "abc123", None);
         assert_eq!(extract_token_from_config(&json), Some("abc123".to_string()));
         assert_eq!(extract_token_from_config("not json at all"), None);
         assert_eq!(extract_token_from_config(""), None);

@@ -629,7 +629,7 @@ impl PtyManager {
                         .unwrap_or_else(|| Uuid::new_v4().simple().to_string())
                 })
                 .clone();
-            let mcp_cfg = crate::mcp_proxy::mcp_config_json(self.remote_mcp.port, &token);
+            let mcp_cfg = crate::mcp_proxy::mcp_config_json(self.remote_mcp.port, &token, None);
             let mcp_cfg_path = cwd.join(".cloudcode").join("mcp-remote.json");
             if let Some(parent) = mcp_cfg_path.parent() {
                 if let Err(e) = std::fs::create_dir_all(parent) {
