@@ -41,6 +41,24 @@ pub const WEB_SERVER: &str = "web";
 /// 升级须两处同改并重跑双后端冒烟。
 pub const PLAYWRIGHT_MCP_PKG: &str = "@playwright/mcp@0.0.76";
 
+/// 占位符:client 端把产物路径重写成 `{{CC_WS}}/.cloudcode/browser-artifacts/<name>`,
+/// 本 proxy 在交给 claude 前替换成本会话工作区绝对路径。
+/// LOCKSTEP: 与 client `crates/client/src/mcp_host.rs` 的 `WS_PLACEHOLDER` 必须一致。
+// Wired into handle_post in a later task; allow dead_code in the meantime.
+#[allow(dead_code)]
+pub const WS_PLACEHOLDER: &str = "{{CC_WS}}";
+
+/// 把响应文本里的 `{{CC_WS}}` 占位符替换成本会话工作区绝对路径。
+/// `ws_abs` 为空时不替换(无映射时的安全 no-op)。
+// Wired into handle_post in a later task; allow dead_code in the meantime.
+#[allow(dead_code)]
+pub fn substitute_ws_placeholder(payload: &str, ws_abs: &str) -> String {
+    if ws_abs.is_empty() || !payload.contains(WS_PLACEHOLDER) {
+        return payload.to_string();
+    }
+    payload.replace(WS_PLACEHOLDER, ws_abs)
+}
+
 /// 把空白分隔的命令串拆成 (程序, argv)。空串/全空白 → None。镜像
 /// client 侧 mcp_host.rs::parse_backend(两 bin crate 无共享 lib,
 /// 按 CC_BROWSER_SERVER 先例就地小复制)。
@@ -1525,5 +1543,25 @@ mod tests {
         std::fs::write(&bad, r#"{"not":"array"}"#).unwrap();
         assert_eq!(load_tools_manifest(Some(&bad)), "[]");
         assert_eq!(load_tools_manifest(Some(&dir.path().join("missing.json"))), "[]");
+    }
+
+    #[test]
+    fn ws_placeholder_substitution() {
+        // 典型:响应里的占位符路径被落地成绝对路径
+        let payload = r#"{"jsonrpc":"2.0","id":7,"result":{"content":[{"type":"text","text":"- [Screenshot]({{CC_WS}}/.cloudcode/browser-artifacts/shot.png)"}]}}"#;
+        let out = substitute_ws_placeholder(payload, "/ws/acct/work");
+        assert!(out.contains("/ws/acct/work/.cloudcode/browser-artifacts/shot.png"));
+        assert!(!out.contains("{{CC_WS}}"));
+
+        // 多次出现都替换
+        let two = "{{CC_WS}}/a {{CC_WS}}/b";
+        assert_eq!(substitute_ws_placeholder(two, "/X"), "/X/a /X/b");
+
+        // 无占位符:原样返回(no-op)
+        let plain = r#"{"result":"hello"}"#;
+        assert_eq!(substitute_ws_placeholder(plain, "/X"), plain);
+
+        // ws_abs 为空:不替换(防止把占位符替成空导致烂路径)
+        assert_eq!(substitute_ws_placeholder(two, ""), two);
     }
 }
