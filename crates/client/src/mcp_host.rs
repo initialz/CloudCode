@@ -292,6 +292,7 @@ impl McpProcess {
 
     /// 写一帧(换行分隔)进子进程 stdin。
     pub async fn feed(&mut self, payload: &str) -> std::io::Result<()> {
+        tracing::debug!(id = ?json_id(payload), method = ?json_method(payload), "→ playwright-mcp stdin");
         self.stdin.write_all(payload.as_bytes()).await?;
         self.stdin.write_all(b"\n").await?;
         self.stdin.flush().await
@@ -310,6 +311,7 @@ impl McpProcess {
             if line.trim().is_empty() {
                 continue;
             }
+            tracing::debug!(id = ?json_id(&line), method = ?json_method(&line), "← playwright-mcp stdout");
             return Some(line);
         }
     }
