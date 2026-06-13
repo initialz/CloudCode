@@ -24,6 +24,19 @@ const UPLOAD_DIR: &str = ".cloudcode/uploads";
 /// Upload chunk size — matches the hub's HTTP upload path (64 KiB
 /// base64-encoded `FsWriteChunk` frames).
 const UPLOAD_CHUNK: usize = 64 * 1024;
+/// 浏览器产物在 agent workspace 里的目标目录(与 mcp_host::ARTIFACT_DIR_REL 一致)。
+const ARTIFACT_DIR: &str = ".cloudcode/browser-artifacts";
+/// 单个产物回传的大小上限;超过则不传、改写成提示。
+const ARTIFACT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+fn is_over_cap(size: u64) -> bool {
+    size > ARTIFACT_MAX_BYTES
+}
+
+fn oversize_artifact_note(basename: &str, size: u64) -> String {
+    let mib = size / (1024 * 1024);
+    format!("[browser artifact not transferred: {basename} ({mib} MiB); generated on client only]")
+}
 
 /// What ended the relay loop.
 #[derive(Debug)]
@@ -159,8 +172,9 @@ async fn relay_loop(
     // 注意:host_out_tx 在本作用域常驻(host 内只持 clone),保证
     // host_out_rx.recv() 永不返回 None 而空转。
     let (host_out_tx, mut host_out_rx) = tokio::sync::mpsc::channel::<String>(64);
+    let artifact_staging = crate::mcp_host::artifact_dir();
     let mut mcp_host: Option<crate::mcp_host::McpHost> = crate::mcp_host::backend_command(browser)
-        .map(|b| crate::mcp_host::McpHost::new(b, host_out_tx.clone(), None));
+        .map(|b| crate::mcp_host::McpHost::new(b, host_out_tx.clone(), artifact_staging.clone()));
 
     loop {
         tokio::select! {
@@ -287,15 +301,31 @@ async fn relay_loop(
                 }
             }
             out = host_out_rx.recv() => {
-                // host_out_tx 常驻本作用域,recv 不会得 None;防御写法。
                 if let Some(payload) = out {
-                    let _ = wire
-                        .out_tx
-                        .send(OutFrame::Text(ClientToHub::RemoteMcp {
+                    let artifacts = match &artifact_staging {
+                        Some(dir) => crate::mcp_host::detect_artifacts(&payload, dir),
+                        None => Vec::new(),
+                    };
+                    if artifacts.is_empty() {
+                        let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::RemoteMcp {
                             server: crate::mcp_host::CC_BROWSER_SERVER.to_string(),
                             payload,
-                        }))
-                        .await;
+                        })).await;
+                    } else {
+                        // 检测非空 ⇒ staging 必为 Some。
+                        let dir = artifact_staging
+                            .clone()
+                            .expect("staging present when artifacts detected");
+                        spawn_artifact_transfer(
+                            &wire.out_tx,
+                            &mut pending_uploads,
+                            agent,
+                            workspace,
+                            dir,
+                            payload,
+                            artifacts,
+                        );
+                    }
                 }
             }
             _ = winch_tick(&mut winch) => {
@@ -341,7 +371,7 @@ fn spawn_upload(
         let mut mentions: Vec<String> = Vec::new();
         for (request_id, path, res_rx) in jobs {
             let file_name = basename(&path);
-            match upload_one_file(&out_tx, request_id, &agent, &workspace, &path, res_rx).await {
+            match upload_one_file(&out_tx, request_id, &agent, &workspace, UPLOAD_DIR, &path, res_rx).await {
                 Ok(final_name) => {
                     mentions.push(format!("@{UPLOAD_DIR}/{final_name}"));
                 }
@@ -361,6 +391,78 @@ fn spawn_upload(
     });
 }
 
+/// 把一条含产物的 MCP 响应转成:逐个产物经 FsWrite 上传到
+/// `.cloudcode/browser-artifacts/`,再把响应里的链接 target 重写成
+/// `{{CC_WS}}/...`(或超限/失败提示),最后发出重写后的 RemoteMcp。
+/// 跑在 spawn 任务里:select! 循环继续路由 FsWriteResult,不会死锁。
+fn spawn_artifact_transfer(
+    out_tx: &mpsc::Sender<OutFrame>,
+    pending_uploads: &mut HashMap<Uuid, mpsc::Sender<HubToClient>>,
+    agent: &str,
+    workspace: &str,
+    staging: std::path::PathBuf,
+    payload: String,
+    artifacts: Vec<(String, String)>,
+) {
+    // 立即决定每个产物:超限 → 提示(不注册通道);否则注册并排进上传队列。
+    let mut immediate: Vec<(String, String)> = Vec::new(); // 超限/缺失 → (target, note)
+    let mut jobs: Vec<(Uuid, String, std::path::PathBuf, mpsc::Receiver<HubToClient>)> = Vec::new();
+    for (target, base) in artifacts {
+        let abs_path = staging.join(&base);
+        let size = std::fs::metadata(&abs_path).map(|m| m.len()).unwrap_or(0);
+        if is_over_cap(size) {
+            tracing::warn!(%base, size, "browser artifact over size cap; not transferred");
+            immediate.push((target, oversize_artifact_note(&base, size)));
+            continue;
+        }
+        let request_id = Uuid::new_v4();
+        let (res_tx, res_rx) = mpsc::channel::<HubToClient>(1);
+        pending_uploads.insert(request_id, res_tx);
+        jobs.push((request_id, target, abs_path, res_rx));
+    }
+
+    let out_tx = out_tx.clone();
+    let agent = agent.to_string();
+    let workspace = workspace.to_string();
+
+    tokio::spawn(async move {
+        let mut repl = immediate;
+        for (request_id, target, abs_path, res_rx) in jobs {
+            match upload_one_file(
+                &out_tx,
+                request_id,
+                &agent,
+                &workspace,
+                ARTIFACT_DIR,
+                &abs_path.to_string_lossy(),
+                res_rx,
+            )
+            .await
+            {
+                Ok(final_name) => repl.push((
+                    target,
+                    format!("{}/{ARTIFACT_DIR}/{final_name}", crate::mcp_host::WS_PLACEHOLDER),
+                )),
+                Err(_) => {
+                    let base = abs_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    tracing::warn!(%base, "browser artifact upload failed");
+                    repl.push((target, format!("[browser artifact transfer failed: {base}]")));
+                }
+            }
+        }
+        let rewritten = crate::mcp_host::rewrite_artifact_links(&payload, &repl);
+        let _ = out_tx
+            .send(OutFrame::Text(ClientToHub::RemoteMcp {
+                server: crate::mcp_host::CC_BROWSER_SERVER.to_string(),
+                payload: rewritten,
+            }))
+            .await;
+    });
+}
+
 /// Upload a single local file via the FsWrite* frames and await its
 /// `FsWriteResult`. Returns the agent-reported final name on success.
 async fn upload_one_file(
@@ -368,11 +470,12 @@ async fn upload_one_file(
     request_id: Uuid,
     agent: &str,
     workspace: &str,
+    dest_dir: &str,
     path: &str,
     mut res_rx: mpsc::Receiver<HubToClient>,
 ) -> Result<String, ()> {
     let file_name = basename(path);
-    let dest = format!("{UPLOAD_DIR}/{file_name}");
+    let dest = format!("{dest_dir}/{file_name}");
 
     if out_tx
         .send(OutFrame::Text(ClientToHub::FsWriteInit {
@@ -484,4 +587,23 @@ fn spawn_winch_signal() -> WinchHandle {
 async fn winch_tick(_: &mut WinchHandle) -> Option<()> {
     std::future::pending::<()>().await;
     None
+}
+
+#[cfg(test)]
+mod artifact_tests {
+    use super::*;
+
+    #[test]
+    fn oversize_note_formats() {
+        let note = oversize_artifact_note("big.pdf", 11 * 1024 * 1024);
+        assert!(note.contains("not transferred"));
+        assert!(note.contains("big.pdf"));
+        assert!(note.contains("MiB"));
+    }
+
+    #[test]
+    fn under_cap_passes() {
+        assert!(!is_over_cap(ARTIFACT_MAX_BYTES));
+        assert!(is_over_cap(ARTIFACT_MAX_BYTES + 1));
+    }
 }

@@ -30,7 +30,6 @@ pub const PLAYWRIGHT_MCP_PKG: &str = "@playwright/mcp@0.0.76";
 /// 占位符:产物路径重写成 `{{CC_WS}}/<ARTIFACT_DIR_REL>/<name>`,由 agent
 /// mcp_proxy 落地成工作区绝对路径。
 /// LOCKSTEP: 与 agent `crates/agent/src/mcp_proxy.rs` 的 `WS_PLACEHOLDER` 必须一致。
-#[allow(dead_code)] // 由后续任务(产物路径重写)消费
 pub const WS_PLACEHOLDER: &str = "{{CC_WS}}";
 
 /// 产物在 agent workspace 里的相对目录(FsWrite 目标 + 重写路径用)。
@@ -240,7 +239,6 @@ impl McpProcess {
 /// 从 MCP 响应文本里找 markdown 链接 `](<target>)`,对每个 target 取
 /// basename,若 `staging/<basename>` 存在,即本次调用产生、claude 即将
 /// 去 Read 的产物。返回 `(链接 target 原串, basename)`。
-#[allow(dead_code)] // 由后续任务(产物回传)消费
 pub fn detect_artifacts(payload: &str, staging: &std::path::Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut rest = payload;
@@ -269,7 +267,6 @@ pub fn detect_artifacts(payload: &str, staging: &std::path::Path) -> Vec<(String
 /// 把响应里每个 `](<原 target>)` 替换成 `](<新值>)`。新值可以是
 /// `{{CC_WS}}/...` 路径,也可以是超限/失败的提示文字。只替换被 `](` `)`
 /// 包裹的精确原串,避免误伤正文。
-#[allow(dead_code)] // 由后续任务(产物回传)消费
 pub fn rewrite_artifact_links(payload: &str, repl: &[(String, String)]) -> String {
     let mut out = payload.to_string();
     for (orig, new) in repl {
