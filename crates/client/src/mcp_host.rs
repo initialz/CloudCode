@@ -1233,4 +1233,184 @@ mod tests {
 
         host.shutdown();
     }
+
+    /// 集成测试(node+chromium 门控):真 `@playwright/mcp` 截图——以 claude 的
+    /// 真实习惯(显式 `filename`)调 `browser_take_screenshot`,逼出 CWD 相对落盘——
+    /// 必须把文件写进 staging 目录;再证 `detect_artifacts` 识别出它、
+    /// `rewrite_artifact_links` 把应答里的链接改写成
+    /// `{{CC_WS}}/.cloudcode/browser-artifacts/...`。环境缺失(无 node / chromium 起不来)
+    /// 一律 skip 保 CI 常绿;只有真断言(没落盘 / 没识别 / 没改写)才算失败。
+    #[tokio::test]
+    async fn screenshot_lands_in_staging_and_is_detected() {
+        if !node_available() {
+            eprintln!("skip: node not available");
+            return;
+        }
+
+        // 唯一 staging 目录(按 pid 区分),既当 CWD 又当 --output-dir。
+        let staging = std::env::temp_dir().join(format!("cc-art-it-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging).expect("create staging dir");
+
+        let args: Vec<String> = vec![
+            "-y".into(),
+            PLAYWRIGHT_MCP_PKG.into(),
+            "--headless".into(),
+            format!("--output-dir={}", staging.display()),
+        ];
+        let mut proc = match McpProcess::spawn("npx", &args, Some(staging.as_path())) {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("skip: spawn failed");
+                let _ = std::fs::remove_dir_all(&staging);
+                return;
+            }
+        };
+
+        // 按 id 匹配应答的小工具:跳过握手期的通知/进度帧,EOF/超时即 None。
+        async fn await_id(
+            proc: &mut McpProcess,
+            id: &str,
+            secs: u64,
+        ) -> Option<String> {
+            loop {
+                let frame = match tokio::time::timeout(
+                    std::time::Duration::from_secs(secs),
+                    proc.next_frame(),
+                )
+                .await
+                {
+                    Ok(Some(f)) => f,
+                    // 超时或后端 EOF —— 环境问题,交由调用方 skip。
+                    Ok(None) | Err(_) => return None,
+                };
+                if frame.contains(id) {
+                    return Some(frame);
+                }
+            }
+        }
+
+        // 1) initialize(协议 2025-06-18)+ notifications/initialized。
+        if proc
+            .feed(
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"cloudcode-itest","version":"0"}}}"#,
+            )
+            .await
+            .is_err()
+        {
+            eprintln!("skip: feed initialize failed");
+            proc.shutdown().await;
+            let _ = std::fs::remove_dir_all(&staging);
+            return;
+        }
+        // npx 首跑可能现装包,给 30s 读 initialize 响应。
+        if await_id(&mut proc, r#""id":1"#, 30).await.is_none() {
+            eprintln!("skip: no initialize response (env)");
+            proc.shutdown().await;
+            let _ = std::fs::remove_dir_all(&staging);
+            return;
+        }
+        if proc
+            .feed(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .await
+            .is_err()
+        {
+            eprintln!("skip: feed initialized failed");
+            proc.shutdown().await;
+            let _ = std::fs::remove_dir_all(&staging);
+            return;
+        }
+
+        // 2) browser_navigate → example.com(id 2)。首跑要起 chromium,给 90s。
+        if proc
+            .feed(
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_navigate","arguments":{"url":"https://example.com"}}}"#,
+            )
+            .await
+            .is_err()
+        {
+            eprintln!("skip: feed navigate failed");
+            proc.shutdown().await;
+            let _ = std::fs::remove_dir_all(&staging);
+            return;
+        }
+        if await_id(&mut proc, r#""id":2"#, 90).await.is_none() {
+            eprintln!("skip: navigate failed (chromium cannot launch in this env)");
+            proc.shutdown().await;
+            let _ = std::fs::remove_dir_all(&staging);
+            return;
+        }
+
+        // 3) browser_wait_for time=1(id 3)——避开 "execution context destroyed" 竞态。
+        if proc
+            .feed(
+                r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_wait_for","arguments":{"time":1}}}"#,
+            )
+            .await
+            .is_err()
+        {
+            eprintln!("skip: feed wait_for failed");
+            proc.shutdown().await;
+            let _ = std::fs::remove_dir_all(&staging);
+            return;
+        }
+        if await_id(&mut proc, r#""id":3"#, 30).await.is_none() {
+            eprintln!("skip: wait_for failed (env)");
+            proc.shutdown().await;
+            let _ = std::fs::remove_dir_all(&staging);
+            return;
+        }
+
+        // 4) browser_take_screenshot —— 必带显式 filename(复刻 claude 习惯,逼 CWD 相对落盘)。
+        if proc
+            .feed(
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"browser_take_screenshot","arguments":{"type":"png","filename":"shot.png"}}}"#,
+            )
+            .await
+            .is_err()
+        {
+            eprintln!("skip: feed screenshot failed");
+            proc.shutdown().await;
+            let _ = std::fs::remove_dir_all(&staging);
+            return;
+        }
+        let screenshot_resp = match await_id(&mut proc, r#""id":4"#, 90).await {
+            Some(r) => r,
+            None => {
+                eprintln!("skip: screenshot failed (env)");
+                proc.shutdown().await;
+                let _ = std::fs::remove_dir_all(&staging);
+                return;
+            }
+        };
+
+        proc.shutdown().await;
+
+        // ── 真正的验证 ──────────────────────────────────────────────────
+        assert!(
+            staging.join("shot.png").is_file(),
+            "staging missing screenshot; resp={screenshot_resp}"
+        );
+        let found = detect_artifacts(&screenshot_resp, &staging);
+        assert!(
+            found.iter().any(|(_, b)| b == "shot.png"),
+            "not detected; resp={screenshot_resp}"
+        );
+        let repl: Vec<(String, String)> = found
+            .iter()
+            .map(|(t, b)| {
+                (
+                    t.clone(),
+                    format!("{}/{}/{}", WS_PLACEHOLDER, ARTIFACT_DIR_REL, b),
+                )
+            })
+            .collect();
+        let rewritten = rewrite_artifact_links(&screenshot_resp, &repl);
+        assert!(
+            rewritten.contains(&format!("{}/{}/shot.png", WS_PLACEHOLDER, ARTIFACT_DIR_REL)),
+            "rewrite missing; got={rewritten}"
+        );
+
+        let _ = std::fs::remove_dir_all(&staging);
+    }
 }
