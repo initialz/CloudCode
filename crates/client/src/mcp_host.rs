@@ -401,6 +401,32 @@ fn json_method(frame: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// 后端(playwright-mcp)发起的**反向请求**(server→client request:同时有
+/// `id` 和 `method`)需要 client 就地应答 —— 我们的隧道只会把 server 的
+/// **响应**往回转,无法路由 server 发起的**请求**;若不回,后端会干等到
+/// 自己的 60s 超时(实测 = cc-browser navigate 卡 60s 的真凶:playwright-mcp
+/// 收到 navigate 后反问 `roots/list`,无人应答 → 60s 后才继续)。
+///
+/// 返回 `Some(reply)` = 这是一条要本地回的 server 请求(reply 喂回后端
+/// stdin,不转发给 agent);`None` = 普通响应/通知,照常转发。
+fn server_request_reply(frame: &str) -> Option<String> {
+    let method = json_method(frame)?; // 响应无 method → None → 不拦截
+    let id = json_id(frame)?; // 通知无 id → None → 不拦截
+    if id.is_null() {
+        return None;
+    }
+    let id_str = serde_json::to_string(&id).ok()?;
+    let body = match method.as_str() {
+        // 我们不暴露任何文件系统 root:回空表,后端即可继续。
+        "roots/list" => format!(r#"{{"jsonrpc":"2.0","id":{id_str},"result":{{"roots":[]}}}}"#),
+        // 其余 server 发起的请求一律 method-not-found,绝不让后端干等超时。
+        _ => format!(
+            r#"{{"jsonrpc":"2.0","id":{id_str},"error":{{"code":-32601,"message":"server-initiated requests are not supported by the cloudcode bridge"}}}}"#
+        ),
+    };
+    Some(body)
+}
+
 /// 宿主自有的合成握手(决策 D16)。id 用字符串 "cc-host-init":
 /// start_replayed 的吞响应按 id 匹配,不会与 claude 的 id 冲突。
 /// 只在「缓存为空且首帧不是 initialize」的冷启动缝隙调用;一经合成
@@ -508,7 +534,17 @@ impl McpChannel {
                     }
                     outbound = proc.next_frame() => {
                         match outbound {
-                            Some(frame) => { if out_tx.send(frame).await.is_err() { break; } }
+                            Some(frame) => {
+                                if let Some(reply) = server_request_reply(&frame) {
+                                    // 后端反向请求(roots/list 等):就地回它,
+                                    // 不转发给 agent(否则被当孤儿响应丢弃,后端
+                                    // 干等 60s 超时)。
+                                    tracing::debug!(id = ?json_id(&frame), method = ?json_method(&frame), "↩ 本地应答 server 反向请求");
+                                    if proc.feed(&reply).await.is_err() { break; }
+                                } else if out_tx.send(frame).await.is_err() {
+                                    break;
+                                }
+                            }
                             None => break, // 子进程 EOF
                         }
                     }
@@ -699,6 +735,36 @@ mod tests {
     pub(super) fn node_available() -> bool {
         let Some(path) = std::env::var_os("PATH") else { return false };
         std::env::split_paths(&path).any(|d| d.join("node").is_file())
+    }
+
+    #[test]
+    fn server_request_reply_answers_roots_list_and_rejects_others() {
+        // roots/list(server→client 请求,有 id+method)→ 回空 roots。
+        let r = server_request_reply(r#"{"jsonrpc":"2.0","id":0,"method":"roots/list"}"#)
+            .expect("roots/list 应本地应答");
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["id"], 0);
+        assert_eq!(v["result"]["roots"], serde_json::json!([]));
+
+        // 其它 server 请求(如 sampling/createMessage)→ method-not-found,
+        // 绝不让后端干等超时;字符串 id 要原样回。
+        let r = server_request_reply(
+            r#"{"jsonrpc":"2.0","id":"abc","method":"sampling/createMessage"}"#,
+        )
+        .expect("未知 server 请求也要回错误");
+        let v: serde_json::Value = serde_json::from_str(&r).unwrap();
+        assert_eq!(v["id"], "abc");
+        assert_eq!(v["error"]["code"], -32601);
+
+        // 普通响应(有 id 无 method)→ 不拦截,照常转发。
+        assert!(server_request_reply(r#"{"jsonrpc":"2.0","id":2,"result":{}}"#).is_none());
+        // 通知(有 method 无 id)→ 不拦截。
+        assert!(
+            server_request_reply(r#"{"jsonrpc":"2.0","method":"notifications/cancelled"}"#)
+                .is_none()
+        );
+        // id=null 不是请求 → 不拦截。
+        assert!(server_request_reply(r#"{"jsonrpc":"2.0","id":null,"method":"x"}"#).is_none());
     }
 
     #[test]
