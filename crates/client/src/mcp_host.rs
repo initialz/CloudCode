@@ -33,7 +33,6 @@ pub const PLAYWRIGHT_MCP_PKG: &str = "@playwright/mcp@0.0.76";
 pub const WS_PLACEHOLDER: &str = "{{CC_WS}}";
 
 /// 产物在 agent workspace 里的相对目录(FsWrite 目标 + 重写路径用)。
-#[allow(dead_code)] // 由后续任务(产物路径重写/落地)消费
 pub const ARTIFACT_DIR_REL: &str = ".cloudcode/browser-artifacts";
 
 /// client 侧 `[browser]` 配置段(计划②,spec 组件 5)。整段缺省 =

@@ -24,8 +24,6 @@ const UPLOAD_DIR: &str = ".cloudcode/uploads";
 /// Upload chunk size — matches the hub's HTTP upload path (64 KiB
 /// base64-encoded `FsWriteChunk` frames).
 const UPLOAD_CHUNK: usize = 64 * 1024;
-/// 浏览器产物在 agent workspace 里的目标目录(与 mcp_host::ARTIFACT_DIR_REL 一致)。
-const ARTIFACT_DIR: &str = ".cloudcode/browser-artifacts";
 /// 单个产物回传的大小上限;超过则不传、改写成提示。
 const ARTIFACT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -433,7 +431,7 @@ fn spawn_artifact_transfer(
                 request_id,
                 &agent,
                 &workspace,
-                ARTIFACT_DIR,
+                crate::mcp_host::ARTIFACT_DIR_REL,
                 &abs_path.to_string_lossy(),
                 res_rx,
             )
@@ -441,7 +439,7 @@ fn spawn_artifact_transfer(
             {
                 Ok(final_name) => repl.push((
                     target,
-                    format!("{}/{ARTIFACT_DIR}/{final_name}", crate::mcp_host::WS_PLACEHOLDER),
+                    format!("{}/{}/{final_name}", crate::mcp_host::WS_PLACEHOLDER, crate::mcp_host::ARTIFACT_DIR_REL),
                 )),
                 Err(_) => {
                     let base = abs_path
