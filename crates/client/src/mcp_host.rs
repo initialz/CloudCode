@@ -237,6 +237,35 @@ impl McpProcess {
     }
 }
 
+/// 从 MCP 响应文本里找 markdown 链接 `](<target>)`,对每个 target 取
+/// basename,若 `staging/<basename>` 存在,即本次调用产生、claude 即将
+/// 去 Read 的产物。返回 `(链接 target 原串, basename)`。
+#[allow(dead_code)] // 由后续任务(产物回传)消费
+pub fn detect_artifacts(payload: &str, staging: &std::path::Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut rest = payload;
+    while let Some(open) = rest.find("](") {
+        let after = &rest[open + 2..];
+        if let Some(close) = after.find(')') {
+            let target = &after[..close];
+            // target 不含换行/括号才算合法链接路径
+            if !target.is_empty() && !target.contains('\n') && !target.contains('(') {
+                let base = target.rsplit('/').next().unwrap_or(target).to_string();
+                if !base.is_empty() && staging.join(&base).is_file() {
+                    let pair = (target.to_string(), base);
+                    if !out.contains(&pair) {
+                        out.push(pair);
+                    }
+                }
+            }
+            rest = &after[close + 1..];
+        } else {
+            break;
+        }
+    }
+    out
+}
+
 /// 读 JSON-RPC 帧的 `id`(通知/非 JSON → None)。
 fn json_id(frame: &str) -> Option<serde_json::Value> {
     serde_json::from_str::<serde_json::Value>(frame)
@@ -1017,6 +1046,32 @@ mod tests {
             saw_cooldown,
             "spawn-ok-but-pump-dies backend must hit the cooldown within 30 delivers, not storm forever"
         );
+    }
+
+    #[test]
+    fn detect_artifacts_from_markdown_links() {
+        let staging = std::env::temp_dir().join("cc-detect-test");
+        let _ = std::fs::create_dir_all(&staging);
+        // 造两个 staging 文件:一个被链接引用(shot.png)、一个不被引用(orphan.png)
+        std::fs::write(staging.join("shot.png"), b"x").unwrap();
+        std::fs::write(staging.join("orphan.png"), b"x").unwrap();
+
+        // 带 filename 的截图响应:链接 target 是 ./shot.png
+        // NOTE: \n inside this JSON string literal is the two characters backslash-n
+        // (as it would appear in a real JSON-encoded MCP response), not a real newline.
+        let payload = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"### Result\\n- [Screenshot of viewport](./shot.png)\\n### Ran Playwright code\"}]}}";
+        let found = detect_artifacts(payload, &staging);
+        // 只检测到被链接引用且存在于 staging 的文件
+        assert_eq!(found, vec![("./shot.png".to_string(), "shot.png".to_string())]);
+
+        // 链接指向不存在于 staging 的文件 → 不检测
+        let none = "{\"text\":\"- [x](./missing.png)\"}";
+        assert!(detect_artifacts(none, &staging).is_empty());
+
+        // 无 markdown 链接 → 空
+        assert!(detect_artifacts("{\"text\":\"plain\"}", &staging).is_empty());
+
+        let _ = std::fs::remove_dir_all(&staging);
     }
 
     #[tokio::test]
