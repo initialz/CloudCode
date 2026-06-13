@@ -254,8 +254,10 @@ async fn main() -> ExitCode {
                 .append(true)
                 .open(&path)
             {
+                // 注意:二进制 crate 名是 `cloudcode`(来自 [[bin]] name),
+                // 不是 `cloudcode_client` —— 日志 target 形如 `cloudcode::mcp_host`。
                 let filter = match spec.trim() {
-                    "" | "1" => "info,cloudcode_client=debug".to_string(),
+                    "" | "1" => "info,cloudcode=debug".to_string(),
                     other => other.to_string(),
                 };
                 let _ = tracing_subscriber::fmt()
