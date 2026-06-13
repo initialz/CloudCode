@@ -238,8 +238,33 @@ impl McpProcess {
         cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true);
+        // 后端(playwright-mcp → node → chromium)的 stderr:默认 inherit
+        // 会灌进 TUI 被吞,看不到"启浏览器"那段静默里在干嘛(冷下载 /
+        // 单例锁重试 / launch 报错)。开了 CLOUDCODE_LOG 就把它落到
+        // <state_dir>/playwright-mcp.log(= --user-data-dir 的父目录),
+        // 否则维持 inherit。
+        let stderr_log_path = std::env::var_os("CLOUDCODE_LOG").and_then(|_| {
+            user_data_dir_from_args(args)
+                .as_deref()
+                .and_then(std::path::Path::parent)
+                .map(|d| d.join("playwright-mcp.log"))
+        });
+        match stderr_log_path.as_ref().and_then(|p| {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+                .ok()
+        }) {
+            Some(file) => {
+                cmd.stderr(std::process::Stdio::from(file));
+                tracing::info!(log = ?stderr_log_path, "capturing backend stderr to file");
+            }
+            None => {
+                cmd.stderr(std::process::Stdio::inherit());
+            }
+        }
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
