@@ -649,7 +649,11 @@ impl PtyManager {
             // respawn 粘性重现)比「干净地无 cc-browser 启动」更糟。
             match write_remote_mcp_config_0600(&mcp_cfg_path, mcp_cfg.as_bytes(), session_id) {
                 Ok(()) => {
-                    self.mcp.register(token.clone(), session_id);
+                    self.mcp.register(
+                        token.clone(),
+                        session_id,
+                        cwd.to_string_lossy().to_string(),
+                    );
                     // 进程级注入:--mcp-config + --strict-mcp-config + 通用
                     // 引导 prompt。绝不写全局 ~/.claude.json,绝不 `claude
                     // mcp add`(D11 铁律)。strict 保证 claude 只看到这份

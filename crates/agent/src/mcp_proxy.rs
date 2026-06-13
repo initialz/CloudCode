@@ -44,14 +44,10 @@ pub const PLAYWRIGHT_MCP_PKG: &str = "@playwright/mcp@0.0.76";
 /// 占位符:client 端把产物路径重写成 `{{CC_WS}}/.cloudcode/browser-artifacts/<name>`,
 /// 本 proxy 在交给 claude 前替换成本会话工作区绝对路径。
 /// LOCKSTEP: 与 client `crates/client/src/mcp_host.rs` 的 `WS_PLACEHOLDER` 必须一致。
-// Wired into handle_post in a later task; allow dead_code in the meantime.
-#[allow(dead_code)]
 pub const WS_PLACEHOLDER: &str = "{{CC_WS}}";
 
 /// 把响应文本里的 `{{CC_WS}}` 占位符替换成本会话工作区绝对路径。
 /// `ws_abs` 为空时不替换(无映射时的安全 no-op)。
-// Wired into handle_post in a later task; allow dead_code in the meantime.
-#[allow(dead_code)]
 pub fn substitute_ws_placeholder(payload: &str, ws_abs: &str) -> String {
     if ws_abs.is_empty() || !payload.contains(WS_PLACEHOLDER) {
         return payload.to_string();
@@ -179,6 +175,9 @@ pub struct McpProxy {
     /// token 而非 session_id:claude 的 GET 长连横跨多次 reattach
     /// (session_id 会换),token 才与 claude 进程同寿。
     notify: Arc<DashMap<String, mpsc::Sender<String>>>,
+    /// token → 本会话工作区绝对路径(= claude 的 cwd / fs resolve base)。
+    /// 给 `{{CC_WS}}` 落地用。与 `routes` 同寿:register 覆盖、unregister 清。
+    workspaces: Arc<DashMap<String, String>>,
 }
 
 impl Default for McpProxy {
@@ -201,23 +200,32 @@ impl McpProxy {
             attached: Arc::new(DashMap::new()),
             static_tools: Arc::new(static_tools),
             notify: Arc::new(DashMap::new()),
+            workspaces: Arc::new(DashMap::new()),
         }
     }
 
     /// token → session 路由注册(会话打开时)。已知 token 重注册 =
-    /// 覆盖改路由(reattach 语义,决策 D12)。
-    pub fn register(&self, token: String, session_id: Uuid) {
-        self.routes.insert(token, session_id);
+    /// 覆盖改路由(reattach 语义,决策 D12)。`workspace_abs` = 本会话
+    /// 工作区绝对路径,供 `{{CC_WS}}` 落地。
+    pub fn register(&self, token: String, session_id: Uuid, workspace_abs: String) {
+        self.routes.insert(token.clone(), session_id);
+        self.workspaces.insert(token, workspace_abs);
     }
 
     pub fn unregister(&self, token: &str) {
         self.routes.remove(token);
         // 同步清掉该 token 的通知订阅,避免 workspace 删除后残留。
         self.notify.remove(token);
+        self.workspaces.remove(token);
     }
 
     pub fn session_for(&self, token: &str) -> Option<Uuid> {
         self.routes.get(token).map(|r| *r.value())
+    }
+
+    /// 取本 token 对应会话的工作区绝对路径(`{{CC_WS}}` 落地用)。
+    pub fn workspace_for(&self, token: &str) -> Option<String> {
+        self.workspaces.get(token).map(|e| e.value().clone())
     }
 
     pub async fn set_hub_sender(&self, tx: mpsc::Sender<OutFrame>) {
@@ -553,7 +561,10 @@ pub async fn handle_post(token: &str, body: String, state: &McpProxy) -> PostOut
                 }))
                 .await;
             match tokio::time::timeout(timeout, rx).await {
-                Ok(Ok(resp)) => PostOutcome::Response(resp),
+                Ok(Ok(resp)) => {
+                    let ws = state.workspace_for(token).unwrap_or_default();
+                    PostOutcome::Response(substitute_ws_placeholder(&resp, &ws))
+                }
                 _ => {
                     state
                         .pending
@@ -791,7 +802,7 @@ mod tests {
     async fn notification_is_forwarded_and_accepted() {
         let state = McpProxy::new();
         let sid = Uuid::new_v4();
-        state.register("t".into(), sid);
+        state.register("t".into(), sid, "/test/ws".to_string());
         state.set_attached(sid);
         let (hub_tx, mut hub_rx) = mpsc::channel(4);
         state.set_hub_sender(hub_tx).await;
@@ -816,7 +827,7 @@ mod tests {
     async fn request_blocks_then_resolves_on_matching_response() {
         let state = McpProxy::new();
         let sid = Uuid::new_v4();
-        state.register("t".into(), sid);
+        state.register("t".into(), sid, "/test/ws".to_string());
         state.set_attached(sid);
         let (hub_tx, mut hub_rx) = mpsc::channel(4);
         state.set_hub_sender(hub_tx).await;
@@ -1111,10 +1122,10 @@ mod tests {
         let sid1 = Uuid::new_v4();
         let sid2 = Uuid::new_v4();
         let tok = "stable-workspace-token".to_string();
-        st.register(tok.clone(), sid1);
+        st.register(tok.clone(), sid1, "/test/ws".to_string());
         assert_eq!(st.session_for(&tok), Some(sid1));
         // reattach:同 token 对 hub 新铸的 session_id 重注册 = 覆盖改路由。
-        st.register(tok.clone(), sid2);
+        st.register(tok.clone(), sid2, "/test/ws2".to_string());
         assert_eq!(st.session_for(&tok), Some(sid2));
         st.unregister(&tok);
         assert_eq!(st.session_for(&tok), None);
@@ -1152,7 +1163,7 @@ mod tests {
         let state = McpProxy::new();
         let sid = Uuid::new_v4();
         let token = "tok-e2e";
-        state.register(token.into(), sid);
+        state.register(token.into(), sid, "/test/ws".to_string());
         state.set_attached(sid);
 
         let (hub_tx, mut hub_rx) = mpsc::channel(4);
@@ -1233,7 +1244,7 @@ mod tests {
         let state = McpProxy::new();
         let sid = Uuid::new_v4();
         let token = "tok-loopback";
-        state.register(token.into(), sid);
+        state.register(token.into(), sid, "/test/ws".to_string());
         state.set_attached(sid);
         let (hub_tx, mut hub_rx) = mpsc::channel(4);
         state.set_hub_sender(hub_tx).await;
@@ -1338,7 +1349,7 @@ mod tests {
             r#"[{"name":"echo","description":"d","inputSchema":{"type":"object"}}]"#.to_string(),
         );
         let sid = Uuid::new_v4();
-        state.register("t".into(), sid);
+        state.register("t".into(), sid, "/test/ws".to_string());
         let out = handle_post(
             "t",
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"claude","version":"1"}}}"#
@@ -1365,7 +1376,7 @@ mod tests {
     async fn detached_tools_list_serves_static_manifest_or_empty() {
         let state = McpProxy::with_static_tools(r#"[{"name":"echo"}]"#.to_string());
         let sid = Uuid::new_v4();
-        state.register("t".into(), sid);
+        state.register("t".into(), sid, "/test/ws".to_string());
         match handle_post(
             "t",
             r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#.to_string(),
@@ -1381,7 +1392,7 @@ mod tests {
         }
         // 缺省构造 = 空表(始终广告:server 健在、工具暂无),不是错误。
         let bare = McpProxy::new();
-        bare.register("t".into(), Uuid::new_v4());
+        bare.register("t".into(), Uuid::new_v4(), "/test/ws".to_string());
         match handle_post(
             "t",
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/list"}"#.to_string(),
@@ -1404,7 +1415,7 @@ mod tests {
         // webterm-only 接入恒走此路径。
         let state = McpProxy::new();
         let sid = Uuid::new_v4();
-        state.register("t".into(), sid);
+        state.register("t".into(), sid, "/test/ws".to_string());
         let out = handle_post(
             "t",
             r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"echo","arguments":{}}}"#
@@ -1427,7 +1438,7 @@ mod tests {
     async fn detached_notification_is_swallowed_not_forwarded() {
         let state = McpProxy::new();
         let sid = Uuid::new_v4();
-        state.register("t".into(), sid);
+        state.register("t".into(), sid, "/test/ws".to_string());
         let (hub_tx, mut hub_rx) = mpsc::channel(4);
         state.set_hub_sender(hub_tx).await;
         let out = handle_post(
@@ -1444,7 +1455,7 @@ mod tests {
     async fn attach_detach_pushes_list_changed_to_subscribed_stream() {
         let state = McpProxy::new();
         let sid = Uuid::new_v4();
-        state.register("tok-n".into(), sid);
+        state.register("tok-n".into(), sid, "/test/ws".to_string());
         let mut rx = state.subscribe("tok-n");
 
         // 模拟 client 上线(pty.rs 在 PtyOpen 时:set_attached + notify)。
@@ -1467,7 +1478,7 @@ mod tests {
         // 不 panic、不阻塞、无副作用。
         let state = McpProxy::new();
         let sid = Uuid::new_v4();
-        state.register("tok-x".into(), sid);
+        state.register("tok-x".into(), sid, "/test/ws".to_string());
         state.notify_list_changed(sid);
     }
 
@@ -1476,7 +1487,7 @@ mod tests {
         let state = McpProxy::new();
         let sid = Uuid::new_v4();
         let token = "tok-sse";
-        state.register(token.into(), sid);
+        state.register(token.into(), sid, "/test/ws".to_string());
         // 镜像本模块其余真 TCP 测试:先绑 127.0.0.1 监听器(Task 10 移除了
         // serve(state, port),绑定上提给调用方),再喂 serve_on。
         let port = free_port();
@@ -1563,5 +1574,21 @@ mod tests {
 
         // ws_abs 为空:不替换(防止把占位符替成空导致烂路径)
         assert_eq!(substitute_ws_placeholder(two, ""), two);
+    }
+
+    #[test]
+    fn register_stores_workspace_and_lookup() {
+        let proxy = McpProxy::new();
+        let token = "a".repeat(32);
+        let sid = Uuid::new_v4();
+        proxy.register(token.clone(), sid, "/ws/acct/work".to_string());
+        assert_eq!(proxy.workspace_for(&token).as_deref(), Some("/ws/acct/work"));
+        // 覆盖式重注册(reattach 语义)更新 workspace
+        let sid2 = Uuid::new_v4();
+        proxy.register(token.clone(), sid2, "/ws/acct/work2".to_string());
+        assert_eq!(proxy.workspace_for(&token).as_deref(), Some("/ws/acct/work2"));
+        // unregister 清除
+        proxy.unregister(&token);
+        assert_eq!(proxy.workspace_for(&token), None);
     }
 }
