@@ -1576,6 +1576,57 @@ mod tests {
         assert_eq!(substitute_ws_placeholder(two, ""), two);
     }
 
+    #[tokio::test]
+    async fn handle_post_substitutes_workspace_placeholder() {
+        // 集成路径:转发响应里的 {{CC_WS}} 占位符在交给 claude 前被替换成
+        // 注册的工作区绝对路径。产品接线在 handle_post Ok(Ok(resp)) 成功臂。
+        let state = McpProxy::new();
+        let sid = Uuid::new_v4();
+        state.register("t".into(), sid, "/ws/acct/work".to_string());
+        state.set_attached(sid);
+        let (hub_tx, mut hub_rx) = mpsc::channel(4);
+        state.set_hub_sender(hub_tx).await;
+
+        // 在飞 POST(会阻塞到 resolve_response 喂回响应)。
+        let st2 = state.clone();
+        let poster = tokio::spawn(async move {
+            handle_post(
+                "t",
+                r#"{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"browser_screenshot","arguments":{}}}"#.to_string(),
+                &st2,
+            )
+            .await
+        });
+
+        // 取走转发帧(确认帧到达 hub)。
+        match hub_rx.recv().await.expect("forwarded to hub") {
+            OutFrame::Text(ClientMsg::RemoteMcp { session_id, .. }) => {
+                assert_eq!(session_id, sid);
+            }
+            _ => panic!("expected a RemoteMcp frame"),
+        }
+
+        // 模拟 client 经 ws 回来的响应:含 {{CC_WS}} 占位符。
+        let payload_with_placeholder = r#"{"jsonrpc":"2.0","id":99,"result":{"content":[{"type":"text","text":"- [Screenshot]({{CC_WS}}/.cloudcode/browser-artifacts/shot.png)"}]}}"#.to_string();
+        let resolved = state.resolve_response(sid, CC_BROWSER_SERVER, payload_with_placeholder);
+        assert!(resolved, "resolve_response must find the pending waiter");
+
+        // 断言:占位符被替换成注册的工作区路径,原始占位符不残留。
+        match poster.await.unwrap() {
+            PostOutcome::Response(body) => {
+                assert!(
+                    body.contains("/ws/acct/work/.cloudcode/browser-artifacts/shot.png"),
+                    "workspace path must be substituted in: {body}"
+                );
+                assert!(
+                    !body.contains("{{CC_WS}}"),
+                    "placeholder must not survive in: {body}"
+                );
+            }
+            _ => panic!("expected a PostOutcome::Response"),
+        }
+    }
+
     #[test]
     fn register_stores_workspace_and_lookup() {
         let proxy = McpProxy::new();
