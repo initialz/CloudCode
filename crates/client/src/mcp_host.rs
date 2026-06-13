@@ -266,6 +266,20 @@ pub fn detect_artifacts(payload: &str, staging: &std::path::Path) -> Vec<(String
     out
 }
 
+/// 把响应里每个 `](<原 target>)` 替换成 `](<新值>)`。新值可以是
+/// `{{CC_WS}}/...` 路径,也可以是超限/失败的提示文字。只替换被 `](` `)`
+/// 包裹的精确原串,避免误伤正文。
+#[allow(dead_code)] // 由后续任务(产物回传)消费
+pub fn rewrite_artifact_links(payload: &str, repl: &[(String, String)]) -> String {
+    let mut out = payload.to_string();
+    for (orig, new) in repl {
+        let from = format!("]({})", orig);
+        let to = format!("]({})", new);
+        out = out.replace(&from, &to);
+    }
+    out
+}
+
 /// 读 JSON-RPC 帧的 `id`(通知/非 JSON → None)。
 fn json_id(frame: &str) -> Option<serde_json::Value> {
     serde_json::from_str::<serde_json::Value>(frame)
@@ -1106,6 +1120,23 @@ mod tests {
             2,
             "synthesized handshake cached for future respawns"
         );
+    }
+
+    #[test]
+    fn rewrite_artifact_links_replaces_targets() {
+        let payload = "- [Screenshot of viewport](./shot.png)\n- [PDF](./doc.pdf)";
+        let repl = vec![
+            ("./shot.png".to_string(), "{{CC_WS}}/.cloudcode/browser-artifacts/shot.png".to_string()),
+            ("./doc.pdf".to_string(), "[browser artifact not transferred: doc.pdf (12 MiB); generated on client only]".to_string()),
+        ];
+        let out = rewrite_artifact_links(payload, &repl);
+        // shot.png link now points at the placeholder path
+        assert!(out.contains("[Screenshot of viewport]({{CC_WS}}/.cloudcode/browser-artifacts/shot.png)"));
+        // doc.pdf link now carries the oversize note
+        assert!(out.contains("[PDF]([browser artifact not transferred: doc.pdf (12 MiB); generated on client only])"));
+        // original targets are gone
+        assert!(!out.contains("(./shot.png)"));
+        assert!(!out.contains("(./doc.pdf)"));
     }
 
     /// playwright chromium 是否已装(macOS `~/Library/Caches/ms-playwright`,
