@@ -173,11 +173,52 @@ fn capable_from(env_backend: Option<&str>, cfg: &BrowserConfig) -> bool {
     cfg.profile_dir.is_some() || default_profile_dir().is_some()
 }
 
+/// 从后端命令行里取 `--user-data-dir=<dir>`(cc-browser 持久 profile)。
+fn user_data_dir_from_args(args: &[String]) -> Option<std::path::PathBuf> {
+    args.iter()
+        .find_map(|a| a.strip_prefix("--user-data-dir="))
+        .map(std::path::PathBuf::from)
+}
+
+/// 删掉 Chrome 单例文件(`SingletonLock`/`Socket`/`Cookie`)。被 SIGKILL
+/// 掉的孤儿 Chrome 会把这些残留在 profile 里;headed Chrome 下次启动会因
+/// stale 锁走 ~21s 单例重试(干净 profile 只要约 0.6s)。spawn 前清掉它们
+/// 即可消除这段延迟。**只动 cloudcode 专属 `--user-data-dir`,绝不碰用户
+/// 日常 Chrome 的 profile。** best-effort:删不掉就算了(下次再试)。
+#[cfg(unix)]
+fn purge_singleton_locks(udd: &std::path::Path) {
+    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+        let p = udd.join(name);
+        // SingletonLock 是符号链接(target = host-pid);用 symlink_metadata
+        // 探测、remove_file 删链接本身,不跟随。
+        if std::fs::symlink_metadata(&p).is_ok() {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+}
+
+/// SIGKILL 整个进程组(负 pid)。`pgid` 是后端直接子进程的 pid —— spawn
+/// 时已 `process_group(0)` 把它设成组长,故整组 = npx 包装层 + node +
+/// Chromium 全部孙进程。`pgid > 1` 守卫:绝不 `-0`(会打到本进程自己的
+/// 组)或 `-1`(全系统)。
+#[cfg(unix)]
+fn kill_process_group(pgid: i32) {
+    if pgid > 1 {
+        // SAFETY: 纯 libc kill 调用,无内存安全隐患。
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
+
 /// 已 spawn 的 MCP 子进程,说「按行分隔的 JSON-RPC over stdio」。
 pub struct McpProcess {
     child: Child,
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
+    /// 后端所在进程组 id(= 直接子进程 pid)。收尸时 `killpg` 整组杀,
+    /// 根除 node/Chromium 孙进程孤儿。`None` = 非 unix / 取不到 pid。
+    pgid: Option<i32>,
 }
 
 impl McpProcess {
@@ -186,6 +227,13 @@ impl McpProcess {
         args: &[String],
         cwd: Option<&std::path::Path>,
     ) -> std::io::Result<Self> {
+        // cc-browser 持久 profile:spawn 前清掉上次孤儿残留的 Singleton 锁,
+        // 否则 headed Chrome 因 stale 锁走 ~21s 单例重试(见 purge 注释)。
+        #[cfg(unix)]
+        if let Some(udd) = user_data_dir_from_args(args) {
+            purge_singleton_locks(&udd);
+        }
+
         let mut cmd = Command::new(program);
         cmd.args(args)
             .stdin(std::process::Stdio::piped())
@@ -195,11 +243,26 @@ impl McpProcess {
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
+        // 关键:把后端放进**独立进程组**(pgid = 子进程 pid)。收尸时按
+        // 组 SIGKILL,npx + node + Chromium 一锅端,杜绝孤儿堆积。只影响
+        // 我们自己起的这一组,不碰用户日常 Chrome。
+        #[cfg(unix)]
+        cmd.process_group(0);
         let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let lines = BufReader::new(stdout).lines();
-        Ok(Self { child, stdin, lines })
+        let pgid = if cfg!(unix) {
+            child.id().map(|id| id as i32)
+        } else {
+            None
+        };
+        Ok(Self {
+            child,
+            stdin,
+            lines,
+            pgid,
+        })
     }
 
     /// 写一帧(换行分隔)进子进程 stdin。
@@ -226,12 +289,30 @@ impl McpProcess {
         }
     }
 
-    /// 收摊:SIGKILL 直接子进程(npx 之类的包装层)并收尸。真正的后端
-    /// 若是孙进程,靠本函数消费 self 掉落 stdin 收口 —— 规范 MCP server
-    /// 监听 stdin 关闭后自行优雅退出(异步于本函数返回)。
+    /// 收摊:SIGKILL **整个进程组**(npx 包装层 + node + Chromium 孙进程
+    /// 一锅端),再收尸直接子进程避免僵尸。不再依赖「掉 stdin 让后端优雅
+    /// 退出」那条不可靠路径 —— 实测它会漏掉 node/Chromium 孙进程,日积月累
+    /// 堆成孤儿,并在 profile 里留 stale Singleton 锁拖慢下次启动。
     pub async fn shutdown(mut self) {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            kill_process_group(pgid);
+        }
         let _ = self.child.start_kill();
         let _ = self.child.wait().await;
+    }
+}
+
+/// 兜底:McpProcess 若未经 `shutdown` 直接 drop(任务被取消/panic 等),
+/// 同样按进程组 SIGKILL,绝不漏掉孙进程。`shutdown` 已杀过组也无妨
+/// (组已空,`kill` 返回 ESRCH,无副作用)。`kill_on_drop(true)` 只收
+/// 直接子进程,这里补上整组。
+#[cfg(unix)]
+impl Drop for McpProcess {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid {
+            kill_process_group(pgid);
+        }
     }
 }
 
@@ -591,6 +672,92 @@ mod tests {
     pub(super) fn node_available() -> bool {
         let Some(path) = std::env::var_os("PATH") else { return false };
         std::env::split_paths(&path).any(|d| d.join("node").is_file())
+    }
+
+    #[test]
+    fn user_data_dir_from_args_extracts() {
+        let args = vec![
+            "-y".to_string(),
+            "@playwright/mcp@0.0.76".to_string(),
+            "--user-data-dir=/p/rofile".to_string(),
+            "--output-dir=/o".to_string(),
+        ];
+        assert_eq!(
+            user_data_dir_from_args(&args),
+            Some(std::path::PathBuf::from("/p/rofile"))
+        );
+        assert_eq!(user_data_dir_from_args(&["-y".to_string()]), None);
+    }
+
+    /// 修复②:spawn 前清掉 stale Singleton 锁,且只动这三个文件、保留
+    /// profile 其余内容(登录态等)。
+    #[test]
+    #[cfg(unix)]
+    fn purge_singleton_locks_removes_stale_and_keeps_others() {
+        let dir = std::env::temp_dir().join(format!("cc-purge-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // SingletonLock 是符号链接(指向 host-pid);Socket/Cookie 普通文件。
+        std::os::unix::fs::symlink("somehost-12345", dir.join("SingletonLock")).unwrap();
+        std::fs::write(dir.join("SingletonSocket"), b"").unwrap();
+        std::fs::write(dir.join("SingletonCookie"), b"x").unwrap();
+        std::fs::write(dir.join("Preferences"), b"keep-me").unwrap(); // 无关文件
+
+        purge_singleton_locks(&dir);
+
+        assert!(
+            std::fs::symlink_metadata(dir.join("SingletonLock")).is_err(),
+            "SingletonLock 应被删"
+        );
+        assert!(!dir.join("SingletonSocket").exists(), "SingletonSocket 应被删");
+        assert!(!dir.join("SingletonCookie").exists(), "SingletonCookie 应被删");
+        assert!(
+            dir.join("Preferences").exists(),
+            "profile 其余文件必须保留"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 修复①:shutdown 按进程组 SIGKILL,孙进程(sleep)也被一并杀掉,
+    /// 不留孤儿。sh(子)→ sleep(孙),echo 把孙 pid 报上来。
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn shutdown_kills_grandchild_process_tree() {
+        let mut proc = McpProcess::spawn(
+            "sh",
+            &[
+                "-c".to_string(),
+                "sleep 300 & echo grandchild:$! ; wait".to_string(),
+            ],
+            None,
+        )
+        .expect("spawn sh");
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), proc.next_frame())
+            .await
+            .expect("timed out reading grandchild pid")
+            .expect("got grandchild line");
+        let pid: i32 = line
+            .trim()
+            .strip_prefix("grandchild:")
+            .expect("grandchild: prefix")
+            .parse()
+            .expect("parse pid");
+        // 孙进程此刻活着(kill 0 = 仅探测存在性)。
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "grandchild sleep({pid}) 应在 shutdown 前存活"
+        );
+
+        proc.shutdown().await;
+        // 给内核一点时间收割整组。
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(
+            !alive,
+            "grandchild sleep({pid}) 应在进程组 shutdown 后被杀掉(无孤儿)"
+        );
     }
 
     #[test]
