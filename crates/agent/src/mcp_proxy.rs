@@ -304,17 +304,17 @@ impl McpProxy {
     /// (如 server 主动通知,计划①丢弃 —— 与 M1-M3 一致)。
     pub fn resolve_response(&self, session_id: Uuid, server: &str, payload: String) -> bool {
         let id = extract_id_key(&payload);
-        tracing::debug!(%session_id, server, has_id = id.is_some(), "remote MCP response from hub");
+        tracing::debug!(%session_id, server, id = ?id, "remote MCP response from hub");
         let Some(id) = id else {
             return false;
         };
         if let Some((_, tx)) = self
             .pending
-            .remove(&(session_id, server.to_string(), id))
+            .remove(&(session_id, server.to_string(), id.clone()))
         {
             return tx.send(payload).is_ok();
         }
-        tracing::debug!(%session_id, "remote MCP response had no pending waiter");
+        tracing::debug!(%session_id, %id, "remote MCP response had no pending waiter");
         false
     }
 }
@@ -445,6 +445,15 @@ fn extract_id_key(body: &str) -> Option<String> {
     }
 }
 
+/// 取 JSON-RPC `method`(诊断日志用;响应帧无 method → None)。
+fn json_method(body: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()?
+        .get("method")?
+        .as_str()
+        .map(str::to_string)
+}
+
 /// 生成 claude 要加载的 `--mcp-config` JSON。`web = Some((program,
 /// args))` 时含两个 server:`web`(stdio,claude 直 spawn 的本机无头
 /// 后端)+ `cc-browser`(http 指向本 proxy);`None`(`[browser]`
@@ -526,6 +535,8 @@ pub async fn handle_post(token: &str, body: String, state: &McpProxy) -> PostOut
     tracing::debug!(
         token = %token_prefix(token),
         is_request = id.is_some(),
+        id = ?id,
+        method = ?json_method(&body),
         session = ?session,
         "remote MCP POST"
     );

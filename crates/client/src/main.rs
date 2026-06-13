@@ -240,6 +240,34 @@ async fn main() -> ExitCode {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let cli = Cli::parse();
 
+    // 可选文件日志:TUI 独占 stderr,诊断(尤其远程-MCP / 浏览器后端
+    // 这条链)只能落文件。靠 CLOUDCODE_LOG 开关,默认不开 → 界面干净。
+    //   CLOUDCODE_LOG=1                       → info,cloudcode_client=debug
+    //   CLOUDCODE_LOG=info,cloudcode_client=trace → 原样当 EnvFilter 用
+    // 落点 state_dir()/client.log(追加)。
+    if let Ok(spec) = std::env::var("CLOUDCODE_LOG") {
+        if let Ok(dir) = state_dir() {
+            let _ = std::fs::create_dir_all(&dir);
+            let path = dir.join("client.log");
+            if let Ok(file) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+            {
+                let filter = match spec.trim() {
+                    "" | "1" => "info,cloudcode_client=debug".to_string(),
+                    other => other.to_string(),
+                };
+                let _ = tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_writer(move || file.try_clone().expect("clone client.log handle"))
+                    .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+                    .try_init();
+                tracing::info!(log = %path.display(), "client file logging enabled");
+            }
+        }
+    }
+
     let result = if cli.init {
         if cli.cmd.is_some() {
             Err(anyhow!("--init cannot be combined with a subcommand"))
