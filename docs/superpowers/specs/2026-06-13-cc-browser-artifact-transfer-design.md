@@ -51,15 +51,15 @@ claude(agent)
                                                        (2) 写文件到 client <output-dir>/shot.png ◄──┘
                                                             响应含 client 本地路径
   client McpHost 在回送响应前:
-       (3a) 检测本次调用新产生的文件(output-dir 调用前/后快照 diff)
-       (3b) 每个 ≤ 上限文件:读字节 ──FsWriteInit/FsWriteChunk──► hub ──► agent fs ──► 写入
+       (3a) 响应驱动检测:扫响应里的 markdown 链接,basename 命中 staging 目录文件 = 本次产物
+       (3b) [spawn 任务] 每个 ≤ 上限文件:读字节 ──FsWriteInit/FsWriteChunk──► hub ──► agent fs ──► 写入
                                                           agent workspace `.cloudcode/browser-artifacts/shot.png`
-            ◄── 等 FsWriteResult 完成 ──
-       (3c) 重写响应文本:client 路径 ──► 占位符 `{{CC_WS}}/.cloudcode/browser-artifacts/shot.png`
-                       (超限文件 ──► 提示文字,记日志)
-  └─(4) 重写后的响应 ──► hub ──► agent mcp_proxy
-       (5) agent mcp_proxy 把 `{{CC_WS}}` ──► 它已知的 workspace 绝对根路径
-  └─(6) claude 收到响应,Read `/abs/workspace/.cloudcode/browser-artifacts/shot.png` ──► 文件在 agent 上 ──► 看见
+            ◄── 等 FsWriteResult 完成,拿回 final_name ──
+       (3c) 重写响应:把该链接 target ──► `{{CC_WS}}/.cloudcode/browser-artifacts/<final_name>`
+                       (超限/失败 ──► 提示文字,记日志)
+  └─(4) [spawn 任务] 重写后的响应 ──► hub ──► agent mcp_proxy
+       (5) agent mcp_proxy 按 token 查本会话工作区绝对路径,把 `{{CC_WS}}` ──► 该绝对路径
+  └─(6) claude 收到响应,Read `/abs/workspace_root/account/workspace/.cloudcode/browser-artifacts/shot.png` ──► 文件在 agent 上 ──► 看见
 ```
 
 ### 职责切分(为什么是 client 传 + agent 落地)
@@ -73,19 +73,17 @@ claude(agent)
 
 ### 1. client `McpHost`(`crates/client/src/mcp_host.rs`)
 
-**1a. 固定 output-dir。** `cc-browser` 后端默认命令追加 `--output-dir <已知目录>`(每 workspace/会话一个稳定目录,例如 client state_dir 下 `browser-output/`)。这样产物落点可预测、可做 diff。`web` 后端命令不加(不走此路径)。
+**1a. 统一产物落点(CWD == output-dir)。** `cc-browser` 默认后端 **spawn 时的工作目录(CWD)** 与 `--output-dir` **都设成同一个已知 staging 目录**(client state_dir 下 `browser-output/`,0700)。关键原因(实测确认):playwright-mcp 对**显式 `filename`** 参数(真 claude 的习惯)按 **CWD** 相对落盘(`./shot.png`),而非 `--output-dir`;只有不带 filename 时才落 `--output-dir`。两者都钉到同一 staging 目录后,所有截图/PDF 都可预测地落在那一个目录里。`web` 后端不走此路径,不改。
 
-**1b. 调用前后目录 diff 检测新产物。** 在把一条 `tools/call` 请求转给 playwright-mcp **之前**对 output-dir 做快照(文件名 + mtime),响应回来**之后**再列一次,差集即本次新产物。按 mtime ≥ 请求开始时刻 且 调用前未见 来认定,降低并发串扰(playwright-mcp 经 proxy 按 JSON-RPC id 串行配对,V1 接受残余并发边界、记日志)。
+**1b. 响应驱动检测(不做目录 diff)。** 不做调用前后快照 diff(有并发/竞态边界)。改为**从响应文本里找 markdown 链接** `](<target>)`:对每个 target 取 basename,若 `staging/<basename>` 存在,即本次调用产生、且 **claude 即将去 Read** 的产物。这把"传什么"直接绑定到"claude 会看到的路径",天然跳过仅内联返回的冗余产物(如 a11y `.yml` 不在链接里就不传),也无需 seen-set/mtime 跟踪。
 
-**1c. 经 FsWrite 上传。** 对每个 ≤ 上限的新文件:读字节,经 client 的出站通道发 `FsWriteInit{ path: ".cloudcode/browser-artifacts/<basename>", ... }` + 若干 `FsWriteChunk{ data_b64, eof }`,**await 对应 `FsWriteResult`**。需把 client 的 FsWrite 发送端(现由 CLI 文件拖拽使用)wire 进 `McpHost`——这是本补丁主要的接线工作量。
+**1c. 经 FsWrite 上传。** 对每个 ≤ 上限的产物:读字节,经 client 出站通道发 `FsWriteInit{ path: ".cloudcode/browser-artifacts/<basename>", ... }` + 若干 `FsWriteChunk{ data_b64, eof }`,**await 对应 `FsWriteResult`**,拿回 `final_name`(agent 侧 `dedupe_path` 可能把重名改成 `x (1).png`,故重写必须用 `final_name` 而非原 basename)。复用现成的 `spawn_upload`/`upload_one_file` 机制(`pending_uploads` 路由 `FsWriteResult`),**在 spawn 出去的任务里跑、不在 relay select! 循环里 await**——否则等 `FsWriteResult` 会和路由它的 text 臂死锁。
 
-**1d. 重写响应路径。** 上传成功后,把响应文本中出现的该 client 本地路径(绝对形式与 markdown 链接里的相对/`../` 形式都要覆盖)替换成 `{{CC_WS}}/.cloudcode/browser-artifacts/<basename>`。超上限或上传失败的文件:把路径替换成 `[browser artifact not transferred: <basename> (<size>); generated on client only]` 并记 warn 日志(**不静默截断**)。
-
-**1e. 顺序保证。** client 只有在(对所有产物)上传完成 + 路径重写完成**之后**才发出该 MCP 响应。claude 在 agent 端要收到响应才会去 Read,故文件必已就位。
+**1d. 重写响应路径 + 顺序。** 转移任务里把响应中**每个产物的 markdown 链接 target**(检测时已拿到精确原串)替换成 `{{CC_WS}}/.cloudcode/browser-artifacts/<final_name>`;超上限或上传失败者替换成 `[browser artifact not transferred: <basename> (<size>); generated on client only]` 并记 warn(**不静默**)。**重写完成后**才发出 `RemoteMcp` 响应——claude 收到响应时文件必已落在 agent 上。无产物的响应仍按原路内联发出(零额外延迟)。多响应乱序无碍:agent proxy 按 JSON-RPC id 配对。
 
 ### 2. agent `mcp_proxy`(`crates/agent/src/mcp_proxy.rs`)
 
-**2a. 占位符落地。** 在把 MCP 响应交给 claude 前,对响应文本做字面替换 `{{CC_WS}}` → agent workspace 绝对根路径。需把 workspace 根路径传入 `mcp_proxy`(现由 agent Config / PtyManager 持有)。
+**2a. 占位符落地(按 token 取本会话工作区绝对路径)。** 在 POST handler 把 MCP 响应交给 claude 前,对响应文本字面替换 `{{CC_WS}}` → **本会话工作区绝对路径**。注意:claude 的 cwd / fs `resolve_safe` 的 base 是 `workspace_root/account/workspace`(**每会话不同**),不是全局 `workspace_root`。该绝对路径在 `pty.rs` 铸 token 时已知(就是 claude 的 `cwd`)。因此扩展 `McpProxy::register` 让它在 `token → session_id` 之外也存 `token → workspace_abs_path`;POST handler 手上有 `token`,据此查表替换。`web` 后端的响应不含 `{{CC_WS}}`,替换是 no-op。
 
 **2b. 仅此一处变换。** proxy 其余仍是透明转发;`{{CC_WS}}` 是受控、唯一、不会与真实页面内容碰撞的标记(实现时若担心碰撞,可用更不可能出现的前缀如 `\u{1}CC_WS\u{1}`,在 spec 落实现时定;原则:唯一、可一次性 find/replace)。
 
@@ -112,15 +110,16 @@ claude(agent)
 ## 测试策略
 
 - **client 单元测试**:
-  - output-dir diff 检测纯函数(给定前/后文件列表 + mtime,返回新产物集合)。
-  - 响应路径重写纯函数(给定响应文本 + 路径→产物名映射,返回重写后文本;覆盖绝对路径、`../` 相对、多文件、超限提示)。
+  - 响应驱动检测纯函数(给定真实 playwright-mcp 截图响应文本 + staging 文件名集合,返回 `[(链接 target 原串, basename)]`;覆盖 `./shot.png`、`page-<ts>.png`、无链接、链接指向不存在文件)。
+  - 响应路径重写纯函数(给定响应文本 + `[(原 target, 新路径)]`,返回重写后文本;覆盖单/多文件、超限提示替换)。
   - 大小上限边界(等于/超过上限的处置)。
-- **agent 单元测试**:`{{CC_WS}}` 落地替换纯函数(给定响应 + workspace 根,返回绝对路径响应;覆盖多次出现、无出现)。
+- **agent 单元测试**:`{{CC_WS}}` 落地替换纯函数(给定响应 + 工作区绝对路径,返回绝对路径响应;覆盖多次出现、无出现/no-op)。
 - **集成测试(node+chromium 门控,延续计划②已有 `host_roundtrips_via_real_playwright_mcp`)**:McpHost 驱动真 playwright-mcp 截图 → 断言产物经 FsWrite(mock/真 agent fs)落到目标目录、响应路径被重写。
 - **真机验证(用户清单)**:`cc-browser` 后端真截图 → claude 在 agent 端 Read 成功看见图;真站点下载/PDF → 回传成功。
 
 ## 开放问题
 
-1. **下载文件落点**:playwright-mcp 各版本里 `browser`/下载文件是否一定落在 `--output-dir`,需实现时实测确认。若落在独立 downloads 目录,V1 仅覆盖 `--output-dir`,下载作为后续项(spec 标注,不强行兜底)。
-2. **relay 循环阻塞**:计划① watch-item 记录 client `host.deliver().await` 跑在 relay select! 循环上;同步等 FsWrite 上传会在该循环上多停一会(≤ 上限文件约数百 ms)。V1 接受(有大小上限兜底),若实测体感卡顿则改"后台上传 + 响应排队"。
-3. **内联图是否一并保留**:不带 filename 时 playwright-mcp 已返回内联图。本方案不主动剥离 filename、也不依赖内联图;内联图若出现则原样透传(claude 双重可见),不冲突。
+1. **下载文件与非 markdown-link 产物**:V1 检测只认响应里的 markdown 链接(截图、`browser_pdf_save` 均是此形)。若某产物(如浏览器下载文件)不以 markdown 链接形式出现在响应里,V1 不转移——作为后续项(spec 标注,不强行兜底)。实现时实测确认 `browser_pdf_save` 的响应形态。
+2. **relay 循环不阻塞(已解决)**:转移在 spawn 出去的任务里跑(复用 `spawn_upload` 模式),select! 循环继续处理 text 臂、路由 `FsWriteResult`——不会死锁、不冻结终端。产物响应的发出被推迟到上传完成(正是要的顺序保证),但不占用 relay 循环。
+3. **内联图一并保留**:不带 filename 时 playwright-mcp 返回内联图。本方案不剥离 filename、也不依赖内联图;内联图若出现则原样透传(claude 双重可见),不冲突。
+4. **`.playwright-mcp/` a11y 快照**:把后端 CWD 设到 staging 目录后,playwright-mcp 可能在此写 a11y `.yml`。因检测是响应驱动(只传被 markdown 链接引用且存在于 staging 的文件),未被链接引用的 `.yml` 不会被传,无噪音。
