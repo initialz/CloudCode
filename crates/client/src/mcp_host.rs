@@ -27,6 +27,16 @@ fn parse_backend(cmd: &str) -> Option<(String, Vec<String>)> {
 /// 升级须两处同改并重跑双后端冒烟。
 pub const PLAYWRIGHT_MCP_PKG: &str = "@playwright/mcp@0.0.76";
 
+/// 占位符:产物路径重写成 `{{CC_WS}}/<ARTIFACT_DIR_REL>/<name>`,由 agent
+/// mcp_proxy 落地成工作区绝对路径。
+/// LOCKSTEP: 与 agent `crates/agent/src/mcp_proxy.rs` 的 `WS_PLACEHOLDER` 必须一致。
+#[allow(dead_code)] // 由后续任务(产物路径重写)消费
+pub const WS_PLACEHOLDER: &str = "{{CC_WS}}";
+
+/// 产物在 agent workspace 里的相对目录(FsWrite 目标 + 重写路径用)。
+#[allow(dead_code)] // 由后续任务(产物路径重写/落地)消费
+pub const ARTIFACT_DIR_REL: &str = ".cloudcode/browser-artifacts";
+
 /// client 侧 `[browser]` 配置段(计划②,spec 组件 5)。整段缺省 =
 /// 全默认零配置:enabled + 内置 playwright-mcp headed 命令 + 持久
 /// profile 在 state 目录下。
@@ -77,6 +87,22 @@ fn default_profile_dir() -> Option<std::path::PathBuf> {
     }
 }
 
+/// 浏览器产物 staging 目录(client 本地):后端 spawn 的 CWD 与
+/// `--output-dir` 都钉到这里,使带/不带 filename 的截图都落到一处。
+pub fn artifact_dir() -> Option<std::path::PathBuf> {
+    match crate::state_dir() {
+        Ok(d) => {
+            let dir = d.join("browser-output");
+            ensure_profile_dir(&dir); // 复用 0700 create_dir_all
+            Some(dir)
+        }
+        Err(_) => {
+            tracing::warn!("无法确定 state 目录,浏览器产物回传不可用");
+            None
+        }
+    }
+}
+
 /// 创建 profile 目录并(unix)收紧 0700:登录态(cookie/会话)落在
 /// 这里,不给同机其他用户可读窗口。best-effort —— 失败不阻断命令
 /// 构造,playwright-mcp 自己也会建目录。
@@ -116,14 +142,15 @@ fn backend_command_from(
     }
     let profile = cfg.profile_dir.clone().or_else(default_profile_dir)?;
     ensure_profile_dir(&profile);
-    Some((
-        "npx".to_string(),
-        vec![
-            "-y".to_string(),
-            PLAYWRIGHT_MCP_PKG.to_string(),
-            format!("--user-data-dir={}", profile.display()),
-        ],
-    ))
+    let mut args = vec![
+        "-y".to_string(),
+        PLAYWRIGHT_MCP_PKG.to_string(),
+        format!("--user-data-dir={}", profile.display()),
+    ];
+    if let Some(out) = artifact_dir() {
+        args.push(format!("--output-dir={}", out.display()));
+    }
+    Some(("npx".to_string(), args))
 }
 
 /// `backend_command` 会不会返回 Some —— 纯判断,不碰文件系统(不建
@@ -156,14 +183,21 @@ pub struct McpProcess {
 }
 
 impl McpProcess {
-    pub fn spawn(program: &str, args: &[String]) -> std::io::Result<Self> {
-        let mut child = Command::new(program)
-            .args(args)
+    pub fn spawn(
+        program: &str,
+        args: &[String],
+        cwd: Option<&std::path::Path>,
+    ) -> std::io::Result<Self> {
+        let mut cmd = Command::new(program);
+        cmd.args(args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
+        let mut child = cmd.spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let lines = BufReader::new(stdout).lines();
@@ -253,11 +287,12 @@ impl McpChannel {
     pub fn start(
         program: &str,
         args: &[String],
+        cwd: Option<&std::path::Path>,
         out_tx: mpsc::Sender<String>,
         handshake: Arc<Mutex<Vec<String>>>,
     ) -> std::io::Result<Self> {
         tracing::info!(program, ?args, "starting MCP backend subprocess");
-        let proc = McpProcess::spawn(program, args)?;
+        let proc = McpProcess::spawn(program, args, cwd)?;
         Ok(Self::from_process(proc, out_tx, handshake))
     }
 
@@ -267,11 +302,12 @@ impl McpChannel {
     pub async fn start_replayed(
         program: &str,
         args: &[String],
+        cwd: Option<&std::path::Path>,
         out_tx: mpsc::Sender<String>,
         handshake: Arc<Mutex<Vec<String>>>,
     ) -> std::io::Result<Self> {
         tracing::info!(program, ?args, "restarting MCP backend subprocess (handshake replay)");
-        let mut proc = McpProcess::spawn(program, args)?;
+        let mut proc = McpProcess::spawn(program, args, cwd)?;
         let frames: Vec<String> = handshake.lock().expect("handshake mutex").clone();
         for frame in &frames {
             let init_id = if json_method(frame).as_deref() == Some("initialize") {
@@ -390,10 +426,15 @@ pub struct McpHost {
     out_tx: mpsc::Sender<String>,
     consecutive_failures: u32,
     cooldown_until: Option<tokio::time::Instant>,
+    cwd: Option<std::path::PathBuf>,
 }
 
 impl McpHost {
-    pub fn new(backend: (String, Vec<String>), out_tx: mpsc::Sender<String>) -> Self {
+    pub fn new(
+        backend: (String, Vec<String>),
+        out_tx: mpsc::Sender<String>,
+        cwd: Option<std::path::PathBuf>,
+    ) -> Self {
         Self {
             backend,
             chan: None,
@@ -401,6 +442,7 @@ impl McpHost {
             out_tx,
             consecutive_failures: 0,
             cooldown_until: None,
+            cwd,
         }
     }
 
@@ -465,10 +507,22 @@ impl McpHost {
         let (prog, args) = self.backend.clone();
         let empty = self.handshake.lock().expect("handshake mutex").is_empty();
         let started = if empty {
-            McpChannel::start(&prog, &args, self.out_tx.clone(), self.handshake.clone())
+            McpChannel::start(
+                &prog,
+                &args,
+                self.cwd.as_deref(),
+                self.out_tx.clone(),
+                self.handshake.clone(),
+            )
         } else {
-            McpChannel::start_replayed(&prog, &args, self.out_tx.clone(), self.handshake.clone())
-                .await
+            McpChannel::start_replayed(
+                &prog,
+                &args,
+                self.cwd.as_deref(),
+                self.out_tx.clone(),
+                self.handshake.clone(),
+            )
+            .await
         };
         match started {
             Ok(ch) => {
@@ -589,7 +643,11 @@ mod tests {
         assert_eq!(PLAYWRIGHT_MCP_PKG, "@playwright/mcp@0.0.76", "pin 版本单点");
         let uddir = format!("--user-data-dir={}", dir.path().join("prof").display());
         assert_eq!(args[2], uddir);
-        assert_eq!(args.len(), 3, "默认命令不得夹带其他参数");
+        // args[3](若有)只能是 --output-dir(产物 staging);除此之外不夹带。
+        for a in &args[3..] {
+            assert!(a.starts_with("--output-dir="), "默认命令不得夹带其他参数: {args:?}");
+        }
+        assert!(args.len() <= 4, "默认命令不得夹带其他参数: {args:?}");
         // 不再回落 echo 桩(撤销 ee92506 生产路径)。
         assert!(!args.iter().any(|a| a.contains("echo")), "echo stub must be gone: {args:?}");
         // profile 目录被创建且(unix)收紧 0700。
@@ -600,6 +658,25 @@ mod tests {
             let mode = std::fs::metadata(dir.path().join("prof")).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o700, "profile dir must be 0700");
         }
+    }
+
+    #[test]
+    fn builtin_backend_includes_output_dir() {
+        let cfg = BrowserConfig {
+            enabled: true,
+            backend: None,
+            profile_dir: Some(std::env::temp_dir().join("cc-test-profile")),
+        };
+        let (prog, args) = backend_command_from(None, &cfg).expect("default backend");
+        assert_eq!(prog, "npx");
+        assert!(
+            args.iter().any(|a| a.starts_with("--user-data-dir=")),
+            "args={args:?}"
+        );
+        assert!(
+            args.iter().any(|a| a.starts_with("--output-dir=")),
+            "args={args:?}"
+        );
     }
 
     #[test]
@@ -682,7 +759,7 @@ mod tests {
         }
         let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/echo-mcp.mjs");
         let mut proc =
-            McpProcess::spawn("node", &[fixture.to_string()]).expect("spawn echo stub");
+            McpProcess::spawn("node", &[fixture.to_string()], None).expect("spawn echo stub");
         proc.feed(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#)
             .await
             .unwrap();
@@ -701,6 +778,7 @@ mod tests {
         let chan = McpChannel::start(
             "node",
             &[fixture.to_string()],
+            None,
             out_tx,
             Arc::new(Mutex::new(Vec::new())),
         )
@@ -723,7 +801,7 @@ mod tests {
         let args = vec![fixture.to_string()];
         let (out_tx, mut out_rx) = mpsc::channel(8);
         let cache = Arc::new(Mutex::new(Vec::new()));
-        let chan = McpChannel::start("node", &args, out_tx.clone(), cache.clone()).expect("start");
+        let chan = McpChannel::start("node", &args, None, out_tx.clone(), cache.clone()).expect("start");
 
         // 正常握手:initialize 响应到 out_rx,两帧入缓存。
         chan.feed(
@@ -739,7 +817,7 @@ mod tests {
 
         // 收摊后重生:握手重放,重放出的 initialize 响应(id 1)必须被吞。
         drop(chan);
-        let chan = McpChannel::start_replayed("node", &args, out_tx.clone(), cache.clone())
+        let chan = McpChannel::start_replayed("node", &args, None, out_tx.clone(), cache.clone())
             .await
             .expect("start_replayed");
 
@@ -770,7 +848,7 @@ mod tests {
         let cache = Arc::new(Mutex::new(Vec::new()));
 
         // 冷启动 + 握手:排空冷启动帧直到看到 initialize 响应(serverInfo)。
-        let chan = McpChannel::start("node", &args, out_tx.clone(), cache.clone()).expect("start");
+        let chan = McpChannel::start("node", &args, None, out_tx.clone(), cache.clone()).expect("start");
         chan.feed(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#.to_string())
             .unwrap();
         loop {
@@ -789,7 +867,7 @@ mod tests {
         // 重生重放,再发 tools/list:排空直到 tools/list 响应(id 2),
         // 期间绝不能出现重复的 initialize 响应(serverInfo)。
         drop(chan);
-        let chan = McpChannel::start_replayed("node", &args, out_tx.clone(), cache.clone())
+        let chan = McpChannel::start_replayed("node", &args, None, out_tx.clone(), cache.clone())
             .await
             .expect("start_replayed");
         chan.feed(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#.to_string())
@@ -819,7 +897,7 @@ mod tests {
         let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/echo-mcp.mjs");
         let (out_tx, mut out_rx) = mpsc::channel(8);
         let cache = Arc::new(Mutex::new(Vec::new()));
-        let chan = McpChannel::start("node", &[fixture.to_string()], out_tx, cache.clone())
+        let chan = McpChannel::start("node", &[fixture.to_string()], None, out_tx, cache.clone())
             .expect("start channel");
         let init = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#;
         chan.feed(init.to_string()).unwrap();
@@ -838,7 +916,7 @@ mod tests {
         }
         let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/echo-mcp.mjs");
         let (out_tx, mut out_rx) = mpsc::channel(8);
-        let mut host = McpHost::new(("node".to_string(), vec![fixture.to_string()]), out_tx);
+        let mut host = McpHost::new(("node".to_string(), vec![fixture.to_string()]), out_tx, None);
         // 首帧触发惰性 spawn;echo 桩应答按 id 配对回来。
         host.deliver(
             r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"echo","arguments":{"text":"hi"}}}"#
@@ -858,6 +936,7 @@ mod tests {
         let mut host = McpHost::new(
             ("/nonexistent/cloudcode-test-backend".to_string(), vec![]),
             out_tx,
+            None,
         );
         for _ in 0..MAX_CONSECUTIVE_SPAWN_FAILURES {
             let err = host
@@ -880,7 +959,7 @@ mod tests {
         }
         let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/echo-mcp.mjs");
         let (out_tx, mut out_rx) = mpsc::channel(8);
-        let mut host = McpHost::new(("node".to_string(), vec![fixture.to_string()]), out_tx);
+        let mut host = McpHost::new(("node".to_string(), vec![fixture.to_string()]), out_tx, None);
         host.deliver(
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#
                 .to_string(),
@@ -919,7 +998,7 @@ mod tests {
         let fixture =
             concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/exit-on-frame-mcp.mjs");
         let (out_tx, _out_rx) = mpsc::channel(8);
-        let mut host = McpHost::new(("node".to_string(), vec![fixture.to_string()]), out_tx);
+        let mut host = McpHost::new(("node".to_string(), vec![fixture.to_string()]), out_tx, None);
         let mut saw_cooldown = false;
         for _ in 0..30 {
             if let Err(e) = host
@@ -951,7 +1030,7 @@ mod tests {
         // 合成 initialize 的响应,否则后端报「未初始化」。
         let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../../test-fixtures/echo-mcp.mjs");
         let (out_tx, mut out_rx) = mpsc::channel(8);
-        let mut host = McpHost::new(("node".to_string(), vec![fixture.to_string()]), out_tx);
+        let mut host = McpHost::new(("node".to_string(), vec![fixture.to_string()]), out_tx, None);
         host.deliver(r#"{"jsonrpc":"2.0","id":9,"method":"tools/list"}"#.to_string())
             .await
             .expect("deliver");
@@ -1015,7 +1094,7 @@ mod tests {
         ];
 
         let (out_tx, mut out_rx) = mpsc::channel(16);
-        let mut host = McpHost::new((prog, args), out_tx);
+        let mut host = McpHost::new((prog, args), out_tx, None);
 
         // 1) initialize(惰性 spawn 真后端)+ notifications/initialized。
         host.deliver(

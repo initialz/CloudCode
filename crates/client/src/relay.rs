@@ -160,7 +160,7 @@ async fn relay_loop(
     // host_out_rx.recv() 永不返回 None 而空转。
     let (host_out_tx, mut host_out_rx) = tokio::sync::mpsc::channel::<String>(64);
     let mut mcp_host: Option<crate::mcp_host::McpHost> = crate::mcp_host::backend_command(browser)
-        .map(|b| crate::mcp_host::McpHost::new(b, host_out_tx.clone()));
+        .map(|b| crate::mcp_host::McpHost::new(b, host_out_tx.clone(), None));
 
     loop {
         tokio::select! {
