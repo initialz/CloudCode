@@ -103,11 +103,19 @@ pub fn enter_session_mode() -> Result<()> {
 pub fn leave_session_mode() {
     disable_raw_mode().ok();
     let mut stdout = std::io::stdout();
-    // Best-effort reset of alt-screen / cursor / every mouse-tracking
-    // variant so the next program in this iTerm2 tab inherits a
-    // clean state.
+    // Best-effort reset of cursor visibility / application-cursor-keys
+    // mode / every mouse-tracking variant so the next program in this
+    // iTerm2 tab (notably our own menu) inherits a clean state.
+    //
+    //   ?25h  — show cursor
+    //   ?1l   — DECCKM off (normal cursor keys). claude/tmux set ?1h,
+    //           which makes arrows emit SS3 (ESC O A) instead of CSI;
+    //           leaving it set broke ↑↓ navigation in the picker. The
+    //           menu parser now also accepts SS3 as a belt-and-braces,
+    //           but we still restore the terminal to a sane default.
+    //   ?1000-1016l — reset every X11/SGR mouse-tracking variant
     let _ = stdout.write_all(
-        b"\x1b[?25h\
+        b"\x1b[?25h\x1b[?1l\
           \x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\
           \x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\r\n",
     );

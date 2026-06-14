@@ -100,12 +100,26 @@ pub fn parse_keys(buf: &[u8]) -> Vec<MenuKey> {
                 i = j + 1;
                 continue;
             } else if n == b'O' {
-                // SS3 (F1..F4 et al.) — drop the 3-byte sequence.
-                if i + 2 < buf.len() {
-                    i += 3;
-                } else {
-                    break;
+                // SS3. In DECCKM (application cursor-keys) mode — which
+                // tmux / claude enable and can leave set when a session
+                // exits back to the menu — the arrow + Home/End keys
+                // arrive as `ESC O A`..`ESC O F` instead of the CSI form.
+                // Map those exactly like the CSI branch so the menu stays
+                // navigable regardless of terminal mode; drop the rest
+                // (F1..F4 = P/Q/R/S, etc).
+                if i + 2 >= buf.len() {
+                    break; // incomplete; drop tail
                 }
+                match buf[i + 2] {
+                    b'A' => out.push(MenuKey::Up),
+                    b'B' => out.push(MenuKey::Down),
+                    b'C' => out.push(MenuKey::Right),
+                    b'D' => out.push(MenuKey::Left),
+                    b'H' => out.push(MenuKey::Home),
+                    b'F' => out.push(MenuKey::End),
+                    _ => {}
+                }
+                i += 3;
                 continue;
             } else {
                 // ESC + anything else: surface as ESC, then re-process the
@@ -126,4 +140,50 @@ pub fn parse_keys(buf: &[u8]) -> Vec<MenuKey> {
         i += 1;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_keys, MenuKey};
+
+    #[test]
+    fn csi_arrows_parse() {
+        // Normal cursor-keys mode: ESC [ A..D.
+        assert_eq!(parse_keys(b"\x1b[A"), vec![MenuKey::Up]);
+        assert_eq!(parse_keys(b"\x1b[B"), vec![MenuKey::Down]);
+        assert_eq!(parse_keys(b"\x1b[C"), vec![MenuKey::Right]);
+        assert_eq!(parse_keys(b"\x1b[D"), vec![MenuKey::Left]);
+    }
+
+    #[test]
+    fn ss3_arrows_parse_in_application_mode() {
+        // DECCKM (application cursor-keys) mode: ESC O A..D. This is the
+        // form tmux/claude leave the terminal in after a session exits;
+        // the menu must still navigate. Regression guard for the bug
+        // where SS3 arrows were dropped and ↑↓ went dead in the picker.
+        assert_eq!(parse_keys(b"\x1bOA"), vec![MenuKey::Up]);
+        assert_eq!(parse_keys(b"\x1bOB"), vec![MenuKey::Down]);
+        assert_eq!(parse_keys(b"\x1bOC"), vec![MenuKey::Right]);
+        assert_eq!(parse_keys(b"\x1bOD"), vec![MenuKey::Left]);
+        assert_eq!(parse_keys(b"\x1bOH"), vec![MenuKey::Home]);
+        assert_eq!(parse_keys(b"\x1bOF"), vec![MenuKey::End]);
+    }
+
+    #[test]
+    fn ss3_function_keys_dropped() {
+        // F1..F4 (ESC O P/Q/R/S) carry no menu binding → dropped, and
+        // must not be mistaken for navigation.
+        assert!(parse_keys(b"\x1bOP").is_empty());
+        assert!(parse_keys(b"\x1bOQ").is_empty());
+    }
+
+    #[test]
+    fn ss3_arrow_amid_other_keys() {
+        // An SS3 arrow sandwiched between plain chars parses cleanly and
+        // doesn't swallow its neighbours.
+        assert_eq!(
+            parse_keys(b"a\x1bOBb"),
+            vec![MenuKey::Char('a'), MenuKey::Down, MenuKey::Char('b')]
+        );
+    }
 }
