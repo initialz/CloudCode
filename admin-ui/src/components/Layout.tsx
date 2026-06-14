@@ -18,6 +18,7 @@ export function Layout() {
   const nav = useNavigate();
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [hubVersion, setHubVersion] = useState<string | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const [update, setUpdate] = useState<UpdateState>({ kind: 'idle' });
   const [dot, setDot] = useState(1); // animates 1→2→3→1 every 500ms during update
 
@@ -27,6 +28,21 @@ export function Layout() {
       () => setHubVersion(null),
     );
   }, []);
+
+  // Manual re-fetch of the hub version (same source as the initial load,
+  // so the displayed format stays identical). Useful after updating the
+  // hub out-of-band — e.g. via the CLI — without a full page reload.
+  async function refreshHubVersion() {
+    setRefreshing(true);
+    try {
+      const r = await apiClient.me();
+      setHubVersion(r.hub_version ?? null);
+    } catch {
+      /* transient — keep the current value */
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   // Probe the latest release tag periodically so the Update badge
   // shows up shortly after a new tag is published, not just at page
@@ -141,11 +157,36 @@ export function Layout() {
             <Logo className="h-6 w-6 text-zinc-900 dark:text-zinc-100" />
             <span>CloudCode admin</span>
             {hubVersion && (
-              <span
-                className="font-mono text-xs font-normal px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500"
-                title="Hub binary version"
-              >
-                hub {hubVersion}
+              <span className="inline-flex items-center gap-1">
+                <span
+                  className="font-mono text-xs font-normal px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500"
+                  title="Hub binary version"
+                >
+                  hub {hubVersion}
+                </span>
+                <button
+                  type="button"
+                  onClick={refreshHubVersion}
+                  disabled={refreshing}
+                  className="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 disabled:opacity-50 disabled:cursor-default"
+                  title="Refresh hub version"
+                  aria-label="Refresh hub version"
+                >
+                  <svg
+                    className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin' : ''}`}
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden
+                  >
+                    <path d="M23 4v6h-6" />
+                    <path d="M1 20v-6h6" />
+                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+                  </svg>
+                </button>
               </span>
             )}
             {update.kind === 'available' && (
@@ -167,11 +208,14 @@ export function Layout() {
                 }
               >
                 Updating
-                {/* Fixed-width box for the dot animation so the
-                    badge doesn't reflow as the dot count changes. */}
+                {/* Fixed-width box for the dot animation so the badge
+                    doesn't reflow as the dot count changes. Reserve the
+                    max (3 dots): in a monospace font each '.' advances a
+                    full 1ch, so the old 1.5ch box clipped the 3rd dot
+                    past the badge's right edge. */}
                 <span
                   className="inline-block text-left"
-                  style={{ width: '1.5ch' }}
+                  style={{ width: '3ch' }}
                   aria-hidden
                 >
                   {'.'.repeat(dot)}
