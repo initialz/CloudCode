@@ -208,17 +208,28 @@ async fn run_inner<B: ratatui::backend::Backend>(
                         if let Some(ws) = workspaces.get(sel).cloned() {
                             // The list snapshot's `agent_online` goes
                             // briefly stale right after a session exits,
-                            // while the bound agent re-registers with the
-                            // hub — so a snapshot that says "offline" gets
-                            // re-confirmed live before we believe it.
-                            // Still offline → a polling "connecting" screen
-                            // that proceeds the moment the agent returns,
-                            // or Esc back to the picker. Fixes the spurious
-                            // "offline" on the first post-session open.
-                            if !ws.agent_online
-                                && !wait_for_agent(term, wire, bytes, keys, &ws.agent).await?
-                            {
-                                continue;
+                            // while the bound agent re-registers — so a
+                            // "offline" snapshot is re-confirmed live before
+                            // we believe it. A stale-offline that's actually
+                            // back corrects here and opens; a genuinely
+                            // offline agent gets a plain notice (Esc/any key
+                            // back to the picker) — we do NOT try to connect
+                            // to an offline agent.
+                            if !ws.agent_online {
+                                let online = list_agents(wire).await.unwrap_or_default();
+                                if !online.iter().any(|a| a == &ws.agent) {
+                                    show_message(
+                                        term,
+                                        &format!(
+                                            "agent '{}' is offline; can't open '{}'",
+                                            ws.agent, ws.name
+                                        ),
+                                        bytes,
+                                        keys,
+                                    )
+                                    .await?;
+                                    continue;
+                                }
                             }
                             let mut redraw = |pressed: bool| -> Result<()> {
                                 term.draw(|f| {
@@ -1120,71 +1131,6 @@ async fn fast_bind(wire: &mut Wire, target: &str) -> Option<String> {
     match expect_text(wire).await.ok()? {
         HubToClient::AgentSelected { .. } => Some(target.to_string()),
         _ => None,
-    }
-}
-
-/// Poll the hub until `agent` shows up in the online set, drawing a
-/// retro "connecting" dialog meanwhile. Returns `Ok(true)` once the
-/// agent is live (caller proceeds to open), `Ok(false)` if the user
-/// pressed Esc/q to cancel back to the picker.
-///
-/// The first liveness check runs BEFORE any dialog is drawn, so a
-/// merely-stale snapshot — the common case right after a session exits
-/// while the bound agent re-registers — resolves instantly with no
-/// visible flash. Only a genuinely-offline agent shows the waiting
-/// screen. `list_agents` reads the same hub registry the picker's
-/// `agent_online` badge does, so it's the authoritative check.
-async fn wait_for_agent<B: ratatui::backend::Backend>(
-    term: &mut Terminal<B>,
-    wire: &mut Wire,
-    bytes: &mut ByteRx,
-    keys: &mut MenuKeyQueue,
-    agent: &str,
-) -> Result<bool> {
-    loop {
-        // Transport error → treat as offline and keep waiting (the wire
-        // may itself be mid-reconnect; the menu's other queries will
-        // surface a hard failure if the hub is truly gone).
-        let online = list_agents(wire).await.unwrap_or_default();
-        if online.iter().any(|a| a == agent) {
-            return Ok(true);
-        }
-        let msg = format!("Connecting to agent '{}'…", agent);
-        let dialog_w: u16 = 56;
-        let text_w = (dialog_w as usize)
-            .saturating_sub(2)
-            .saturating_sub(DIALOG_TEXT_PAD as usize * 2);
-        let lines = wrap_text(&msg, text_w);
-        let dialog_h: u16 = 6u16.saturating_add(lines.len() as u16);
-        term.draw(|f| {
-            let body = draw_titled_dialog(f, "cloudcode", dialog_w, dialog_h);
-            let mut text: Vec<Line> = Vec::with_capacity(lines.len() + 1);
-            text.push(Line::raw(""));
-            for l in &lines {
-                text.push(Line::from(Span::raw(format!(
-                    "{pad}{l}",
-                    pad = " ".repeat(DIALOG_TEXT_PAD as usize),
-                ))));
-            }
-            f.render_widget(
-                Paragraph::new(text).style(Style::default().bg(DIALOG_BG).fg(DIALOG_FG)),
-                body,
-            );
-            hint_bar(f, "waiting for agent · Esc to cancel");
-        })?;
-        // Either the user cancels, or we re-poll after a short tick.
-        // keys.next() pops any already-buffered key synchronously, so a
-        // sleep-win drop never loses input (mpsc recv is cancel-safe).
-        tokio::select! {
-            k = keys.next(bytes) => {
-                match k {
-                    Some(MenuKey::Escape) | Some(MenuKey::Char('q')) => return Ok(false),
-                    None => return Ok(false), // stdin closed
-                    _ => {} // ignore other keys, keep waiting
-                }
-            }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(700)) => {}
-        }
     }
 }
 

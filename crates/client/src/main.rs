@@ -449,21 +449,36 @@ async fn session_loop(
     tool: &Option<String>,
 ) -> Result<()> {
     let mut backoff = Duration::from_millis(500);
+    // Did the *current* open attempt follow a mid-session agent drop?
+    // Drives the banner wording: a user-initiated open of an online agent
+    // shows "Connecting…" (it's expected up — the menu already confirmed
+    // it), while an agent that vanished out from under a live session
+    // shows "Agent disconnected". Starts false: the first open is always
+    // user-initiated from the picker.
+    let mut lost_mid_session = false;
     loop {
-        // (1) Open or re-open the session on the *current* wire.
+        // (1) Open or re-open the session on the *current* wire. Paint a
+        //     "Connecting" banner first so the warm-up window (the hub
+        //     blocks up to OPEN_TIMEOUT for the agent's PtyOpened) isn't a
+        //     blank black screen. Skipped after a drop — that path paints
+        //     its own "Agent disconnected" banner below.
+        if !lost_mid_session {
+            show_connecting_pill(agent);
+        }
         match open_session(wire, agent, workspace, claude_args, tool).await {
             OpenResult::Opened => {
                 backoff = Duration::from_millis(500);
+                lost_mid_session = false;
                 clear_pill();
             }
             OpenResult::SessionError(_msg) => {
-                // Hub answered but rejected the open. The common case is
-                // "agent X is offline" — right after a hub restart, or
-                // while a bounced agent re-registers. Hold on the agent
-                // reconnect banner and re-open once it's back; Esc bails
-                // to the menu so a *real* config error (workspace gone,
-                // ACL change) isn't an inescapable loop.
-                if !wait_for_agent_reconnect(bytes, agent).await {
+                // Hub answered but rejected the open — "agent offline" or
+                // "pty open timeout" while the agent warms up. Hold on a
+                // banner (Connecting vs Agent-disconnected per the flag)
+                // and re-open once it's ready; Esc bails to the menu so a
+                // *real* config error (workspace gone, ACL change) isn't
+                // an inescapable loop.
+                if !wait_for_agent_reconnect(bytes, agent, lost_mid_session).await {
                     return Ok(()); // Esc → menu
                 }
                 continue;
@@ -482,9 +497,10 @@ async fn session_loop(
             RelayOutcome::Closed => return Ok(()),
             RelayOutcome::AgentLost => {
                 // Agent bounced mid-session; tmux holds the session on
-                // its side. Loop back to (1) and re-open — the
-                // SessionError arm there paints the reconnect banner and
+                // its side. Loop back to (1) and re-open — now flagged as
+                // a drop so the banner reads "Agent disconnected" and
                 // watches Esc until the agent returns (then we reattach).
+                lost_mid_session = true;
                 continue;
             }
             RelayOutcome::HubLost => {
@@ -631,8 +647,8 @@ fn show_pill(text: &str) {
 }
 
 /// Agent-disconnected banner — the wire is fine but the bound agent
-/// dropped. tmux holds the session, so we hold here and reattach when
-/// the agent returns; Esc abandons to the menu.
+/// dropped mid-session. tmux holds the session, so we hold here and
+/// reattach when the agent returns; Esc abandons to the menu.
 fn show_agent_pill(agent: &str) {
     paint_banner(
         "Agent disconnected",
@@ -641,19 +657,37 @@ fn show_agent_pill(agent: &str) {
     );
 }
 
-/// Hold on the agent-reconnect banner while the bound agent is
-/// unreachable, watching stdin for Esc/q. Returns `true` to retry the
-/// open (caller loops back to `open_session`, reattaching tmux once the
-/// agent is back), `false` if the user pressed Esc/q (or stdin closed)
-/// to abandon and return to the menu.
+/// Connecting banner — a user-initiated open of an agent that's expected
+/// online (the picker confirmed it); shown while it warms up / reattaches
+/// tmux. Distinct wording from `show_agent_pill` so a fresh connect never
+/// claims the agent "disconnected".
+fn show_connecting_pill(agent: &str) {
+    paint_banner(
+        "Connecting",
+        &format!("opening session on '{}'…", agent),
+        "Esc to cancel",
+    );
+}
+
+/// Hold on a reconnect/connect banner while the open can't yet complete,
+/// watching stdin for Esc/q. Returns `true` to retry the open (caller
+/// loops back to `open_session`, reattaching tmux once the agent is
+/// ready), `false` if the user pressed Esc/q (or stdin closed) to abandon
+/// and return to the menu. `disconnected` picks the wording: `true` =
+/// mid-session drop ("Agent disconnected"), `false` = fresh open warming
+/// up ("Connecting").
 ///
 /// Polls on a fixed short interval rather than exponential backoff: the
 /// tmux session is intact on the agent, so reattach should be prompt
-/// once it reappears. Each returned `true` is one re-open attempt.
-async fn wait_for_agent_reconnect(bytes: &mut ByteRx, agent: &str) -> bool {
+/// once it's ready. Each returned `true` is one re-open attempt.
+async fn wait_for_agent_reconnect(bytes: &mut ByteRx, agent: &str, disconnected: bool) -> bool {
     use crate::input::{parse_keys, MenuKey};
     const POLL: Duration = Duration::from_millis(1000);
-    show_agent_pill(agent);
+    if disconnected {
+        show_agent_pill(agent);
+    } else {
+        show_connecting_pill(agent);
+    }
     let deadline = tokio::time::Instant::now() + POLL;
     loop {
         tokio::select! {
