@@ -389,7 +389,7 @@ async fn run_chat(
         match outcome {
             menu::MenuOutcome::OpenWorkspace { agent, workspace } => {
                 write_last_workspace_global(&agent, &workspace);
-                if let Err(e) = session_with_reconnect(
+                match session_with_reconnect(
                     &cfg,
                     &mut wire,
                     &mut bytes,
@@ -400,11 +400,18 @@ async fn run_chat(
                 )
                 .await
                 {
-                    // session_with_reconnect always cleans up the
-                    // terminal before returning Err. Surface the
-                    // reason on a single line so we land back at the
-                    // menu cleanly.
-                    eprintln!("[cc] {}", e);
+                    Ok(SessionExit::ToMenu) => {}
+                    // User pressed Esc on the hub-disconnected screen.
+                    // The menu needs a live hub, so there's nowhere
+                    // useful to return — quit cloudcode cleanly.
+                    Ok(SessionExit::Quit) => return Ok(()),
+                    Err(e) => {
+                        // session_with_reconnect always cleans up the
+                        // terminal before returning Err. Surface the
+                        // reason on a single line so we land back at the
+                        // menu cleanly.
+                        eprintln!("[cc] {}", e);
+                    }
                 }
             }
             menu::MenuOutcome::Quit => {
@@ -432,11 +439,21 @@ async fn session_with_reconnect(
     workspace: &str,
     claude_args: &[String],
     tool: &Option<String>,
-) -> Result<()> {
+) -> Result<SessionExit> {
     relay::enter_session_mode()?;
     let outcome = session_loop(cfg, wire, bytes, agent, workspace, claude_args, tool).await;
     relay::leave_session_mode();
     outcome
+}
+
+/// Why `session_loop` returned to the top-level driver.
+enum SessionExit {
+    /// Back to the workspace picker (clean tool exit, agent abandoned via
+    /// Esc, etc.). The wire is still live.
+    ToMenu,
+    /// Quit cloudcode entirely — the user pressed Esc on the
+    /// hub-disconnected screen, and the picker can't run without the hub.
+    Quit,
 }
 
 async fn session_loop(
@@ -447,7 +464,7 @@ async fn session_loop(
     workspace: &str,
     claude_args: &[String],
     tool: &Option<String>,
-) -> Result<()> {
+) -> Result<SessionExit> {
     let mut backoff = Duration::from_millis(500);
     // Did the *current* open attempt follow a mid-session agent drop?
     // Drives the banner wording: a user-initiated open of an online agent
@@ -479,13 +496,17 @@ async fn session_loop(
                 // *real* config error (workspace gone, ACL change) isn't
                 // an inescapable loop.
                 if !wait_for_agent_reconnect(bytes, agent, lost_mid_session).await {
-                    return Ok(()); // Esc → menu
+                    return Ok(SessionExit::ToMenu); // Esc → menu
                 }
                 continue;
             }
             OpenResult::WireLost => {
-                if !reconnect_wire(cfg, wire, &mut backoff).await? {
-                    return Err(anyhow!("hub rejected the reconnect"));
+                match reconnect_wire(cfg, wire, bytes, &mut backoff).await {
+                    ReconnectOutcome::Reconnected => {}
+                    ReconnectOutcome::Rejected => {
+                        return Err(anyhow!("hub rejected the reconnect"))
+                    }
+                    ReconnectOutcome::Cancelled => return Ok(SessionExit::Quit),
                 }
                 continue;
             }
@@ -494,7 +515,7 @@ async fn session_loop(
         //     (Closed → return to menu) or the wire dies (HubLost →
         //     reconnect + re-open the same workspace).
         match relay::run(wire, bytes, agent, workspace, &cfg.browser).await? {
-            RelayOutcome::Closed => return Ok(()),
+            RelayOutcome::Closed => return Ok(SessionExit::ToMenu),
             RelayOutcome::AgentLost => {
                 // Agent bounced mid-session; tmux holds the session on
                 // its side. Loop back to (1) and re-open — now flagged as
@@ -504,8 +525,12 @@ async fn session_loop(
                 continue;
             }
             RelayOutcome::HubLost => {
-                if !reconnect_wire(cfg, wire, &mut backoff).await? {
-                    return Err(anyhow!("hub rejected the reconnect"));
+                match reconnect_wire(cfg, wire, bytes, &mut backoff).await {
+                    ReconnectOutcome::Reconnected => {}
+                    ReconnectOutcome::Rejected => {
+                        return Err(anyhow!("hub rejected the reconnect"))
+                    }
+                    ReconnectOutcome::Cancelled => return Ok(SessionExit::Quit),
                 }
                 // Loop back to (1) — fresh open_session on the new wire.
             }
@@ -555,41 +580,94 @@ async fn open_session(
     }
 }
 
-/// Reopen the hub WS, with exponential backoff and a top-right pill
-/// painted on every attempt. Returns `Ok(true)` when a fresh wire is
-/// installed; `Ok(false)` if the hub responded with a terminal
-/// `Rejected` (bad token, etc.) and we should bail out to the menu.
+/// Outcome of a hub-WS reconnect loop.
+enum ReconnectOutcome {
+    /// A fresh wire was installed; resume the session.
+    Reconnected,
+    /// Hub returned a terminal `Rejected` (bad token, etc.) — bail with an
+    /// error.
+    Rejected,
+    /// User pressed Esc/q on the hub-disconnected banner — quit cloudcode
+    /// (the picker can't run without the hub).
+    Cancelled,
+}
+
+/// Reopen the hub WS, with exponential backoff and a full-screen banner
+/// painted on every attempt. The whole loop — backoff, dial, and welcome
+/// handshake — is cancellable: an Esc/q press at any point returns
+/// `Cancelled` so the user isn't trapped staring at a dead hub.
 async fn reconnect_wire(
     cfg: &ClientConfig,
     wire: &mut Wire,
+    bytes: &mut ByteRx,
     backoff: &mut Duration,
-) -> Result<bool> {
+) -> ReconnectOutcome {
     let mut attempt = 0u32;
     loop {
         attempt += 1;
         show_pill(&format!("Reconnecting ({})", attempt));
-        tokio::time::sleep(*backoff).await;
+        // Back off, but wake immediately if the user wants out.
+        if race_esc(bytes, tokio::time::sleep(*backoff)).await.is_none() {
+            return ReconnectOutcome::Cancelled;
+        }
         *backoff = bump(*backoff);
-        let new_wire = match wire::connect(&cfg.hub_url, &cfg.token, &cfg.browser).await {
-            Ok(w) => w,
-            Err(_) => continue,
-        };
+        let new_wire =
+            match race_esc(bytes, wire::connect(&cfg.hub_url, &cfg.token, &cfg.browser)).await {
+                None => return ReconnectOutcome::Cancelled,
+                Some(Err(_)) => continue,
+                Some(Ok(w)) => w,
+            };
         let mut new_wire = new_wire;
-        match tokio::time::timeout(Duration::from_secs(10), new_wire.in_text_rx.recv()).await {
-            Ok(Some(HubToClient::Welcome { .. })) => {
+        match race_esc(
+            bytes,
+            tokio::time::timeout(Duration::from_secs(10), new_wire.in_text_rx.recv()),
+        )
+        .await
+        {
+            None => return ReconnectOutcome::Cancelled,
+            Some(Ok(Some(HubToClient::Welcome { .. }))) => {
                 *wire = new_wire;
                 *backoff = Duration::from_millis(500);
                 clear_pill();
-                return Ok(true);
+                return ReconnectOutcome::Reconnected;
             }
-            Ok(Some(HubToClient::Rejected { .. })) => return Ok(false),
-            _ => continue,
+            Some(Ok(Some(HubToClient::Rejected { .. }))) => return ReconnectOutcome::Rejected,
+            Some(_) => continue,
         }
     }
 }
 
 fn bump(d: Duration) -> Duration {
     (d * 2).min(Duration::from_secs(30))
+}
+
+/// True if a raw stdin chunk carries an Esc or `q` — the menu's parser is
+/// reused so an arrow key (`ESC [ A` / `ESC O A`) isn't mistaken for Esc.
+fn chunk_has_quit_key(chunk: &[u8]) -> bool {
+    use crate::input::{parse_keys, MenuKey};
+    parse_keys(chunk)
+        .iter()
+        .any(|k| matches!(k, MenuKey::Escape | MenuKey::Char('q')))
+}
+
+/// Drive `fut` to completion while watching stdin for an Esc/q. Returns
+/// `Some(output)` if the future finished first, `None` if the user
+/// pressed Esc/q (or stdin closed) — caller treats `None` as "cancel".
+/// Non-quit keystrokes are swallowed so the future keeps running.
+async fn race_esc<F: std::future::Future>(bytes: &mut ByteRx, fut: F) -> Option<F::Output> {
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            out = &mut fut => return Some(out),
+            chunk = bytes.recv() => {
+                match chunk {
+                    None => return None, // stdin closed
+                    Some(b) if chunk_has_quit_key(&b) => return None,
+                    Some(_) => {} // ignore other keys, keep waiting
+                }
+            }
+        }
+    }
 }
 
 /// Repaint the entire alt-screen with a centered status banner (title +
@@ -642,7 +720,7 @@ fn show_pill(text: &str) {
     paint_banner(
         "Hub disconnected",
         text,
-        "session resumes automatically once the hub is back",
+        "resumes automatically once the hub is back · Esc to quit",
     );
 }
 
@@ -681,29 +759,15 @@ fn show_connecting_pill(agent: &str) {
 /// tmux session is intact on the agent, so reattach should be prompt
 /// once it's ready. Each returned `true` is one re-open attempt.
 async fn wait_for_agent_reconnect(bytes: &mut ByteRx, agent: &str, disconnected: bool) -> bool {
-    use crate::input::{parse_keys, MenuKey};
     const POLL: Duration = Duration::from_millis(1000);
     if disconnected {
         show_agent_pill(agent);
     } else {
         show_connecting_pill(agent);
     }
-    let deadline = tokio::time::Instant::now() + POLL;
-    loop {
-        tokio::select! {
-            chunk = bytes.recv() => {
-                let Some(b) = chunk else { return false; }; // stdin closed → menu
-                if parse_keys(&b)
-                    .iter()
-                    .any(|k| matches!(k, MenuKey::Escape | MenuKey::Char('q')))
-                {
-                    return false;
-                }
-                // Other keys ignored — keep holding until the poll tick.
-            }
-            _ = tokio::time::sleep_until(deadline) => return true,
-        }
-    }
+    // `race_esc` returns None on Esc/q (or stdin close) → cancel; Some on
+    // the poll tick → retry the open.
+    race_esc(bytes, tokio::time::sleep(POLL)).await.is_some()
 }
 
 /// Tear the banner down. After a successful reconnect the tmux
