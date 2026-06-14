@@ -36,6 +36,15 @@ fn oversize_artifact_note(basename: &str, size: u64) -> String {
     format!("[browser artifact not transferred: {basename} ({mib} MiB); generated on client only]")
 }
 
+/// Sentinel `reason` the hub stamps on `SessionClosed` when the *agent's*
+/// own WS dropped (hub `registry::unregister`), as opposed to the tool
+/// actually exiting ("pty closed") or a take-over eviction ("closed by
+/// hub"). Must stay byte-identical to the hub string — see
+/// `crates/hub/src/registry.rs` `unregister`. The agent's tmux session
+/// survives an agent bounce, so this is a recoverable interruption, not
+/// a real session end.
+const AGENT_DISCONNECT_REASON: &str = "agent disconnected";
+
 /// What ended the relay loop.
 #[derive(Debug)]
 pub enum RelayOutcome {
@@ -43,6 +52,11 @@ pub enum RelayOutcome {
     /// from the local side). Caller should leave alt-screen + return to
     /// the menu.
     Closed,
+    /// The bound agent dropped its hub connection mid-session (distinct
+    /// from a clean tool exit). The tmux session persists on the agent,
+    /// so the caller should hold on a reconnect banner and re-open
+    /// (reattach) once the agent is back — not bounce to the menu.
+    AgentLost,
     /// One of the wire channels went `None` — the underlying WS is dead.
     /// Caller is expected to attempt reconnect; terminal state is left
     /// untouched (still in alt-screen + raw mode) so a status banner can
@@ -250,7 +264,16 @@ async fn relay_loop(
                     HubToClient::Ping => {
                         let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
                     }
-                    HubToClient::SessionClosed { .. } => return Ok(RelayOutcome::Closed),
+                    HubToClient::SessionClosed { reason } => {
+                        // "agent disconnected" = the agent bounced; hold +
+                        // reconnect (tmux kept the session). Any other
+                        // reason ("pty closed", "closed by hub", …) is a
+                        // real end → return to the menu.
+                        if reason.as_deref() == Some(AGENT_DISCONNECT_REASON) {
+                            return Ok(RelayOutcome::AgentLost);
+                        }
+                        return Ok(RelayOutcome::Closed);
+                    }
                     HubToClient::SessionError { message } => {
                         tracing::warn!(%message, "session error during relay");
                     }

@@ -456,17 +456,16 @@ async fn session_loop(
                 backoff = Duration::from_millis(500);
                 clear_pill();
             }
-            OpenResult::SessionError(msg) => {
+            OpenResult::SessionError(_msg) => {
                 // Hub answered but rejected the open. The common case is
-                // "agent X is offline" right after a hub restart, while
-                // the agent hasn't caught up yet — that's transient.
-                // We keep looping; a *real* config error (workspace
-                // gone, ACL change) will keep firing the same message
-                // and the user sees it on the pill on every attempt,
-                // which is good enough discovery in practice.
-                show_pill(&format!("Reconnecting: {}", trim_one_line(&msg, 60)));
-                tokio::time::sleep(backoff).await;
-                backoff = bump(backoff);
+                // "agent X is offline" — right after a hub restart, or
+                // while a bounced agent re-registers. Hold on the agent
+                // reconnect banner and re-open once it's back; Esc bails
+                // to the menu so a *real* config error (workspace gone,
+                // ACL change) isn't an inescapable loop.
+                if !wait_for_agent_reconnect(bytes, agent).await {
+                    return Ok(()); // Esc → menu
+                }
                 continue;
             }
             OpenResult::WireLost => {
@@ -481,6 +480,13 @@ async fn session_loop(
         //     reconnect + re-open the same workspace).
         match relay::run(wire, bytes, agent, workspace, &cfg.browser).await? {
             RelayOutcome::Closed => return Ok(()),
+            RelayOutcome::AgentLost => {
+                // Agent bounced mid-session; tmux holds the session on
+                // its side. Loop back to (1) and re-open — the
+                // SessionError arm there paints the reconnect banner and
+                // watches Esc until the agent returns (then we reattach).
+                continue;
+            }
             RelayOutcome::HubLost => {
                 if !reconnect_wire(cfg, wire, &mut backoff).await? {
                     return Err(anyhow!("hub rejected the reconnect"));
@@ -570,34 +576,17 @@ fn bump(d: Duration) -> Duration {
     (d * 2).min(Duration::from_secs(30))
 }
 
-/// Trim a hub-supplied error message to a single line `<= max` chars so
-/// the top-right pill can show it without wrapping. Anything past the
-/// first newline is dropped first.
-fn trim_one_line(msg: &str, max: usize) -> String {
-    let one_line = msg.lines().next().unwrap_or("").trim();
-    if one_line.chars().count() <= max {
-        one_line.to_string()
-    } else {
-        let trimmed: String = one_line.chars().take(max.saturating_sub(1)).collect();
-        format!("{}…", trimmed)
-    }
-}
-
-/// Repaint the entire alt-screen with a centered "hub disconnected"
-/// banner. Called on every reconnect attempt — clearing claude's UI
-/// is intentional, otherwise users freeze the wrong way: typing into
-/// a still-visible UI that ignores them with no feedback. The tmux
-/// reattach push will fill alt-screen back in once a fresh session
-/// opens, so we don't lose anything permanent.
-fn show_pill(text: &str) {
+/// Repaint the entire alt-screen with a centered status banner (title +
+/// status + hint). Clearing claude's UI is intentional, otherwise users
+/// freeze the wrong way: typing into a still-visible UI that ignores
+/// them with no feedback. The tmux reattach push fills alt-screen back
+/// in once a fresh session opens, so nothing permanent is lost.
+fn paint_banner(title: &str, status: &str, hint: &str) {
     use std::io::Write;
     let mut stdout = std::io::stdout();
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
 
-    // Two-line block: a fixed title + the per-attempt status line.
-    let title = "Hub disconnected";
-    let hint = "session resumes automatically once the hub is back";
-    let lines = [title, text, "", hint];
+    let lines = [title, status, "", hint];
     let widest = lines.iter().map(|s| s.chars().count()).max().unwrap_or(0);
     let inner = widest + 4; // 2-cell padding on each side
     let box_height = lines.len() as u16;
@@ -615,7 +604,7 @@ fn show_pill(text: &str) {
         let inner_pad = inner.saturating_sub(line.chars().count());
         let left = inner_pad / 2;
         let right = inner_pad - left;
-        // Bold title + plain rest; whole pill is yellow-on-black.
+        // Bold title + plain rest; whole banner is yellow-on-black.
         let attr = if i == 0 { "\x1b[1;33m" } else { "\x1b[33m" };
         let _ = write!(
             stdout,
@@ -629,6 +618,58 @@ fn show_pill(text: &str) {
         );
     }
     let _ = stdout.flush();
+}
+
+/// Hub-disconnected banner — the wire (client↔hub) is down and we're
+/// auto-reconnecting. No user action required.
+fn show_pill(text: &str) {
+    paint_banner(
+        "Hub disconnected",
+        text,
+        "session resumes automatically once the hub is back",
+    );
+}
+
+/// Agent-disconnected banner — the wire is fine but the bound agent
+/// dropped. tmux holds the session, so we hold here and reattach when
+/// the agent returns; Esc abandons to the menu.
+fn show_agent_pill(agent: &str) {
+    paint_banner(
+        "Agent disconnected",
+        &format!("waiting for '{}' to reconnect", agent),
+        "Esc to return to the menu",
+    );
+}
+
+/// Hold on the agent-reconnect banner while the bound agent is
+/// unreachable, watching stdin for Esc/q. Returns `true` to retry the
+/// open (caller loops back to `open_session`, reattaching tmux once the
+/// agent is back), `false` if the user pressed Esc/q (or stdin closed)
+/// to abandon and return to the menu.
+///
+/// Polls on a fixed short interval rather than exponential backoff: the
+/// tmux session is intact on the agent, so reattach should be prompt
+/// once it reappears. Each returned `true` is one re-open attempt.
+async fn wait_for_agent_reconnect(bytes: &mut ByteRx, agent: &str) -> bool {
+    use crate::input::{parse_keys, MenuKey};
+    const POLL: Duration = Duration::from_millis(1000);
+    show_agent_pill(agent);
+    let deadline = tokio::time::Instant::now() + POLL;
+    loop {
+        tokio::select! {
+            chunk = bytes.recv() => {
+                let Some(b) = chunk else { return false; }; // stdin closed → menu
+                if parse_keys(&b)
+                    .iter()
+                    .any(|k| matches!(k, MenuKey::Escape | MenuKey::Char('q')))
+                {
+                    return false;
+                }
+                // Other keys ignored — keep holding until the poll tick.
+            }
+            _ = tokio::time::sleep_until(deadline) => return true,
+        }
+    }
 }
 
 /// Tear the banner down. After a successful reconnect the tmux

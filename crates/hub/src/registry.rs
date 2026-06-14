@@ -75,6 +75,10 @@ impl AgentRegistry {
         let sids: Vec<Uuid> = conn.sessions.iter().map(|e| *e.key()).collect();
         for sid in sids {
             if let Some((_, tx)) = conn.sessions.remove(&sid) {
+                // NOTE: the CLI client keys off this exact reason string to
+                // tell an agent bounce (recoverable — tmux survives, hold +
+                // reattach) from a real session end. Keep it byte-identical
+                // to `AGENT_DISCONNECT_REASON` in crates/client/src/relay.rs.
                 let _ = tx.try_send(PtyEventOut::Frame(ClientMsg::PtyClosed {
                     session_id: sid,
                     reason: Some("agent disconnected".into()),
