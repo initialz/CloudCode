@@ -1093,12 +1093,26 @@ export default function Workbench() {
         const imeTextarea = tab.term.textarea;
         const imeEl = tab.term.element;
         if (imeTextarea && imeEl) {
-          imeTextarea.addEventListener('compositionstart', () =>
-            imeEl.classList.add('cc-composing'),
-          );
-          imeTextarea.addEventListener('compositionend', () =>
-            imeEl.classList.remove('cc-composing'),
-          );
+          // Hide the block cursor while composing so it doesn't sit as a
+          // filled block behind the first pinyin letter. The old approach
+          // (.cc-composing CSS hiding .xterm-cursor) only works for the DOM
+          // renderer; under the WebGL renderer the cursor is painted on the
+          // canvas where CSS can't reach it. Instead, recolour the cursor to
+          // the terminal background (an invisible block) for the duration of
+          // the composition and restore it on commit — renderer-agnostic. The
+          // class toggle stays so the DOM-renderer fallback path still works.
+          let savedCursor: string | undefined;
+          imeTextarea.addEventListener('compositionstart', () => {
+            imeEl.classList.add('cc-composing');
+            const th = tab.term.options.theme ?? {};
+            savedCursor = th.cursor;
+            tab.term.options.theme = { ...th, cursor: th.background };
+          });
+          imeTextarea.addEventListener('compositionend', () => {
+            imeEl.classList.remove('cc-composing');
+            const th = tab.term.options.theme ?? {};
+            tab.term.options.theme = { ...th, cursor: savedCursor };
+          });
         }
 
         // Paste-image (Ctrl/Cmd+V): if the clipboard holds image data, upload
