@@ -658,6 +658,10 @@ export default function Workbench() {
       const isDark = effectiveTheme(getStoredTheme()) === 'dark';
       const term = new Terminal({
         cursorBlink: true,
+        // A slim vertical bar (I-beam) instead of the default chunky block —
+        // less visually heavy, and it never sits as a solid box over the
+        // character it's on. Apps can still override per-cursor via DECSCUSR.
+        cursorStyle: 'bar',
         scrollback: 50000,
         fontFamily: 'ui-monospace, Menlo, Monaco, monospace',
         fontSize: 14,
