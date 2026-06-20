@@ -634,12 +634,13 @@ pub async fn agents_list(State(state): State<AdminState>) -> Response {
 // Agent releases + self-update
 // ---------------------------------------------------------------------
 
-// Cache GitHub releases for 5 minutes. Keep this comfortably long: we hit the
+// Cache GitHub releases for 10 minutes. Keep this comfortably long: we hit the
 // GitHub API UNAUTHENTICATED (60 req/hour/IP), so a short TTL plus admin-UI
 // polling exhausts the rate limit, the fetch starts returning 403, and
-// `latest_version` collapses to None (the "Update to undefined" bug). At 5 min
-// that's ~12 req/hour, well under the limit.
-const RELEASES_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+// `latest_version` collapses to None (the "Update to undefined" bug). At 10 min
+// that's ~6 req/hour, well under the limit. The admin UI's manual refresh
+// button can still force a fresh fetch on demand (see `refresh_now` / ?force=1).
+const RELEASES_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 const GITHUB_RELEASES_URL: &str =
     "https://api.github.com/repos/initialz/cloudcode/releases";
 const UPDATE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
@@ -699,6 +700,29 @@ impl ReleasesCache {
             Err(e) => {
                 if let Some(entry) = self.inner.read().await.clone() {
                     tracing::warn!(error = %e, "releases refresh failed; serving stale cache");
+                    return Ok(entry);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Force a fresh GitHub fetch regardless of TTL and update the cache.
+    /// Backs the admin UI's manual refresh button so an operator can see
+    /// GitHub's real state on demand without waiting out the TTL. On fetch
+    /// failure, fall back to a stale cache if present (same graceful degrade
+    /// as `get_fresh`) so a transient GitHub hiccup / rate-limit doesn't
+    /// blank the badge.
+    async fn refresh_now(&self) -> Result<ReleasesCacheEntry, String> {
+        match fetch_releases().await {
+            Ok(fresh) => {
+                let mut w = self.inner.write().await;
+                *w = Some(fresh.clone());
+                Ok(fresh)
+            }
+            Err(e) => {
+                if let Some(entry) = self.inner.read().await.clone() {
+                    tracing::warn!(error = %e, "forced releases refresh failed; serving stale cache");
                     return Ok(entry);
                 }
                 Err(e)
@@ -814,8 +838,25 @@ pub async fn hub_version() -> Response {
         .into_response()
 }
 
-pub async fn agents_releases(State(state): State<AdminState>) -> Response {
-    match state.releases.get_fresh().await {
+pub async fn agents_releases(
+    State(state): State<AdminState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    // The admin UI's manual refresh button passes ?force=1 to bypass the TTL
+    // cache and check GitHub's real state on demand; the 60s auto-poll omits
+    // it and rides the 10-minute cache. The button is disabled while a refresh
+    // is in flight (frontend), so force can't be spammed faster than a
+    // round-trip, and on rate-limit we still fall back to the stale cache.
+    let force = q
+        .get("force")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    let fetched = if force {
+        state.releases.refresh_now().await
+    } else {
+        state.releases.get_fresh().await
+    };
+    match fetched {
         Ok(entry) => Json(entry.public.clone()).into_response(),
         // Degrade gracefully instead of 503-ing the whole agents page: the
         // release list is auxiliary, and the only way we get here is a GitHub

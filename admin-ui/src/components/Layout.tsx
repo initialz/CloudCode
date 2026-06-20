@@ -29,16 +29,35 @@ export function Layout() {
     );
   }, []);
 
-  // Manual re-fetch of the hub version (same source as the initial load,
-  // so the displayed format stays identical). Useful after updating the
-  // hub out-of-band — e.g. via the CLI — without a full page reload.
+  // Manual refresh: re-read the hub's own running version (/me) AND force a
+  // fresh GitHub check for the latest release (bypassing the hub's 10-minute
+  // cache) so the operator sees GitHub's real state on demand — both after an
+  // out-of-band hub update (e.g. via the CLI) and to pull a just-published
+  // release without waiting out the TTL. The periodic auto-poll below still
+  // rides the cache; only this button forces a live fetch.
   async function refreshHubVersion() {
     setRefreshing(true);
     try {
-      const r = await apiClient.me();
-      setHubVersion(r.hub_version ?? null);
+      const [meRes, rel] = await Promise.all([
+        apiClient.me(),
+        apiClient.agents.releases(true).catch(() => null),
+      ]);
+      const v = meRes.hub_version ?? null;
+      setHubVersion(v);
+      if (rel?.latest && v) {
+        const latest = rel.latest;
+        // Don't clobber an update that's actively in flight; otherwise
+        // recompute the badge from the freshly-fetched GitHub state.
+        setUpdate((cur) =>
+          cur.kind === 'updating' || cur.kind === 'waiting'
+            ? cur
+            : compareSemver(latest, v) > 0
+              ? { kind: 'available', latest }
+              : { kind: 'idle' },
+        );
+      }
     } catch {
-      /* transient — keep the current value */
+      /* transient — keep the current values */
     } finally {
       setRefreshing(false);
     }
@@ -169,8 +188,8 @@ export function Layout() {
                   onClick={refreshHubVersion}
                   disabled={refreshing}
                   className="text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-300 disabled:opacity-50 disabled:cursor-default"
-                  title="Refresh hub version"
-                  aria-label="Refresh hub version"
+                  title="Refresh hub version & check GitHub for updates"
+                  aria-label="Refresh hub version and check for updates"
                 >
                   <svg
                     className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin' : ''}`}

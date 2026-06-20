@@ -209,7 +209,11 @@ export const apiClient = {
       }),
     delete: (name: string) =>
       api<void>(`/agents/${encodeURIComponent(name)}`, { method: 'DELETE' }),
-    releases: () => api<ReleasesResponseDto>('/agents/releases'),
+    // `force` bypasses the hub's 10-minute release cache and re-queries
+    // GitHub immediately (manual refresh button). Omit it for the periodic
+    // auto-poll so it stays within GitHub's unauthenticated rate limit.
+    releases: (force?: boolean) =>
+      api<ReleasesResponseDto>(`/agents/releases${force ? '?force=1' : ''}`),
     update: (name: string, version: string) =>
       api<{ ok: true }>(`/agents/${encodeURIComponent(name)}/update`, {
         method: 'POST',
