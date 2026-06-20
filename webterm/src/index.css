@@ -44,12 +44,22 @@ body {
 }
 
 /* IME composition: while you're choosing a Chinese character the pinyin stays
-   visible and underlined to mark it as composing (not yet committed), like a
-   native terminal — no background highlight. A slim caret sits at its end; the
-   chunky block cursor is hidden separately (see .cc-composing below). The
-   composing bytes are held locally and sent only once composition ends. */
+   visible and underlined to mark it as composing (not yet committed). A slim
+   caret sits at its end. The composing bytes are held locally and sent only
+   once composition ends.
+
+   The background is OPAQUE and matches the terminal's own bg colour. xterm
+   draws this preedit as an absolutely-positioned overlay that sits right on
+   the buffer cursor cell — and claude paints its own cursor there as a
+   reverse-video (inverse) cell, not a real terminal cursor. With a transparent
+   overlay that white inverse block bled through behind the first pinyin letter
+   ("第一个字母背景发白"). Matching the terminal bg occludes whatever cell sits
+   beneath the overlay, so the first letter reads black like the rest — while
+   staying a "no highlight box" look since the colour equals the bg. (Safe now
+   that the WebGL renderer pins committed text to the grid: the overlay only
+   ever lands on the cursor cell / blank space, never over real CJK text.) */
 .xterm .composition-view {
-  background: transparent;
+  background: #ffffff; /* light-theme terminal bg — occludes the cell beneath */
   color: #1a1a1a; /* visible pinyin on a light theme */
   text-decoration: underline; /* mark the text as composing, not committed */
   text-underline-offset: 2px;
@@ -57,6 +67,7 @@ body {
 }
 
 html.dark .xterm .composition-view {
+  background: #18181b; /* dark-theme terminal bg — occludes the cell beneath */
   color: #e6e6e6; /* visible pinyin on a dark theme */
   border-right-color: #ccc;
 }

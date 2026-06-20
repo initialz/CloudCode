@@ -658,10 +658,6 @@ export default function Workbench() {
       const isDark = effectiveTheme(getStoredTheme()) === 'dark';
       const term = new Terminal({
         cursorBlink: true,
-        // A slim vertical bar (I-beam) instead of the default chunky block —
-        // less visually heavy, and it never sits as a solid box over the
-        // character it's on. Apps can still override per-cursor via DECSCUSR.
-        cursorStyle: 'bar',
         scrollback: 50000,
         fontFamily: 'ui-monospace, Menlo, Monaco, monospace',
         fontSize: 14,
@@ -687,18 +683,6 @@ export default function Workbench() {
       term.loadAddon(fitAddon);
       term.loadAddon(linksAddon);
       term.loadAddon(serializeAddon);
-
-      // Force the slim bar cursor to win. claude (via tmux) emits DECSCUSR
-      // (`CSI Ps SP q`) to set a steady block, which overrides the
-      // `cursorStyle: 'bar'` option above and lands us back on a block.
-      // Intercept that sequence and swallow it: returning true marks it
-      // handled so xterm's built-in DECSCUSR handler never runs, and we
-      // re-assert 'bar' in case anything nudged it. The intermediate is a
-      // literal space (0x20), the final byte is 'q'.
-      term.parser.registerCsiHandler({ intermediates: ' ', final: 'q' }, () => {
-        if (term.options.cursorStyle !== 'bar') term.options.cursorStyle = 'bar';
-        return true; // consumed — don't let the app change the cursor shape
-      });
 
       // OSC 52 clipboard write. tmux (with `set -g set-clipboard on`)
       // emits this escape on every drag-select copy: `OSC 52 ; c ;
@@ -1109,26 +1093,12 @@ export default function Workbench() {
         const imeTextarea = tab.term.textarea;
         const imeEl = tab.term.element;
         if (imeTextarea && imeEl) {
-          // Hide the block cursor while composing so it doesn't sit as a
-          // filled block behind the first pinyin letter. The old approach
-          // (.cc-composing CSS hiding .xterm-cursor) only works for the DOM
-          // renderer; under the WebGL renderer the cursor is painted on the
-          // canvas where CSS can't reach it. Instead, recolour the cursor to
-          // the terminal background (an invisible block) for the duration of
-          // the composition and restore it on commit — renderer-agnostic. The
-          // class toggle stays so the DOM-renderer fallback path still works.
-          let savedCursor: string | undefined;
-          imeTextarea.addEventListener('compositionstart', () => {
-            imeEl.classList.add('cc-composing');
-            const th = tab.term.options.theme ?? {};
-            savedCursor = th.cursor;
-            tab.term.options.theme = { ...th, cursor: th.background };
-          });
-          imeTextarea.addEventListener('compositionend', () => {
-            imeEl.classList.remove('cc-composing');
-            const th = tab.term.options.theme ?? {};
-            tab.term.options.theme = { ...th, cursor: savedCursor };
-          });
+          imeTextarea.addEventListener('compositionstart', () =>
+            imeEl.classList.add('cc-composing'),
+          );
+          imeTextarea.addEventListener('compositionend', () =>
+            imeEl.classList.remove('cc-composing'),
+          );
         }
 
         // Paste-image (Ctrl/Cmd+V): if the clipboard holds image data, upload
