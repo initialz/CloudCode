@@ -15,6 +15,7 @@ import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
 import { WebLinksAddon } from '@xterm/addon-web-links';
 import { SerializeAddon } from '@xterm/addon-serialize';
+import { WebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
 
 import { apiClient } from '@/lib/api';
@@ -1059,6 +1060,27 @@ export default function Workbench() {
       if (!tab || tab.opened) return;
       try {
         tab.term.open(el);
+        // Switch from xterm's default DOM renderer to the WebGL renderer.
+        // The DOM renderer lays each row out as real text and trusts the
+        // font's glyph advance to match the cell grid — true for the Latin
+        // monospace stack, but CJK glyphs (esp. fullwidth punctuation like
+        // 「，」) come from a system fallback font whose advance ≠ 2× the
+        // cell width, so every wide char drifts the rest of the row to the
+        // right. That drift is what made the IME composition overlay land on
+        // top of already-rendered text. WebGL draws every glyph clipped into
+        // its `col × cellWidth` box, so committed text is pinned to the grid
+        // and the overlay (positioned by the same grid math) stays aligned.
+        // Must load AFTER open(); guard for browsers without WebGL2 (falls
+        // back to the DOM renderer, i.e. prior behaviour).
+        try {
+          const webgl = new WebglAddon();
+          // On GPU context loss, drop the addon so xterm reverts to the DOM
+          // renderer instead of freezing on a dead canvas.
+          webgl.onContextLoss(() => webgl.dispose());
+          tab.term.loadAddon(webgl);
+        } catch (e) {
+          console.warn('[webterm] WebGL renderer unavailable, using DOM renderer', e);
+        }
         tab.fitAddon.fit();
         tab.opened = true;
         // While an IME composition is in flight (e.g. typing pinyin before

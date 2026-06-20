@@ -45,21 +45,11 @@ body {
 
 /* IME composition: while you're choosing a Chinese character the pinyin stays
    visible and underlined to mark it as composing (not yet committed), like a
-   native terminal. A slim caret sits at its end; the chunky block cursor is
-   hidden separately (see .cc-composing below). The composing bytes are held
-   locally and sent only once composition ends.
-
-   The background is OPAQUE and set to the terminal's own bg colour (not
-   transparent). xterm renders this preedit as an absolutely-positioned overlay
-   that doesn't occupy real character cells — so once the input line grows long
-   enough that the overlay sits over already-rendered committed text (cursor
-   near the right edge, or the TUI repainting the input row under it), a
-   transparent overlay let the pinyin and the Chinese underneath bleed through
-   and superimpose ("拼音和文字叠加"). Matching the terminal bg keeps the "no
-   highlight box" look while occluding whatever cells sit beneath it, exactly
-   like a native terminal's preedit. */
+   native terminal — no background highlight. A slim caret sits at its end; the
+   chunky block cursor is hidden separately (see .cc-composing below). The
+   composing bytes are held locally and sent only once composition ends. */
 .xterm .composition-view {
-  background: #ffffff; /* light-theme terminal bg — occludes cells underneath */
+  background: transparent;
   color: #1a1a1a; /* visible pinyin on a light theme */
   text-decoration: underline; /* mark the text as composing, not committed */
   text-underline-offset: 2px;
@@ -67,7 +57,6 @@ body {
 }
 
 html.dark .xterm .composition-view {
-  background: #18181b; /* dark-theme terminal bg — occludes cells underneath */
   color: #e6e6e6; /* visible pinyin on a dark theme */
   border-right-color: #ccc;
 }
