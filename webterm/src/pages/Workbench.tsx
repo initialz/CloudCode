@@ -688,6 +688,18 @@ export default function Workbench() {
       term.loadAddon(linksAddon);
       term.loadAddon(serializeAddon);
 
+      // Force the slim bar cursor to win. claude (via tmux) emits DECSCUSR
+      // (`CSI Ps SP q`) to set a steady block, which overrides the
+      // `cursorStyle: 'bar'` option above and lands us back on a block.
+      // Intercept that sequence and swallow it: returning true marks it
+      // handled so xterm's built-in DECSCUSR handler never runs, and we
+      // re-assert 'bar' in case anything nudged it. The intermediate is a
+      // literal space (0x20), the final byte is 'q'.
+      term.parser.registerCsiHandler({ intermediates: ' ', final: 'q' }, () => {
+        if (term.options.cursorStyle !== 'bar') term.options.cursorStyle = 'bar';
+        return true; // consumed — don't let the app change the cursor shape
+      });
+
       // OSC 52 clipboard write. tmux (with `set -g set-clipboard on`)
       // emits this escape on every drag-select copy: `OSC 52 ; c ;
       // <base64-text> BEL`. Without a handler xterm.js drops it on the
