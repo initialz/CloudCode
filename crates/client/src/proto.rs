@@ -53,6 +53,16 @@ pub enum ClientToHub {
         name: String,
         agent: String,
     },
+    /// Read this account's opaque preferences blob (the same one webterm
+    /// stores via HTTP `/api/preferences`). Reply: `HubToClient::Preferences`.
+    /// The CLI uses it for workspace sort/pin state shared with webterm.
+    GetPreferences,
+    /// Overwrite this account's preferences blob. `data` must be a JSON
+    /// object (<32 KiB) — same contract as the webterm HTTP PUT. The CLI
+    /// does a read-modify-write so webterm-owned fields are preserved.
+    SetPreferences {
+        data: serde_json::Value,
+    },
     /// Open a PTY session in the given workspace. The owning agent
     /// is carried through from the workspace identity, so the menu
     /// no longer needs an explicit SelectAgent step.
@@ -147,6 +157,11 @@ pub enum HubToClient {
     },
     WorkspaceReset {
         name: String,
+    },
+    /// Reply to GetPreferences: the stored account preferences blob, or
+    /// `null` when the account has none yet.
+    Preferences {
+        data: serde_json::Value,
     },
     /// PTY session is up.
     SessionOpened {

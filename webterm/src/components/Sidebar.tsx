@@ -5,6 +5,7 @@ import Logo from '@/components/Logo';
 import AgentTree from '@/components/AgentTree';
 import ConfirmDialog from '@/components/ConfirmDialog';
 import type { AgentItem, WorkspaceItem } from '@/lib/wire';
+import type { Preferences } from '@/lib/preferences';
 
 type Props = {
   account: string;
@@ -14,6 +15,8 @@ type Props = {
   workspaces: WorkspaceItem[];
   openTabKeys: Set<string>;
   activeTabKey: string | null;
+  preferences: Preferences;
+  onSavePreferences: (next: Preferences) => void;
   onOpenWorkspace: (agent: string, workspace: string, tool?: string) => void;
   onCreateWorkspace: (agent: string, name: string) => void;
   onResetWorkspace: (agent: string, workspace: string) => void;
@@ -40,6 +43,8 @@ export default function Sidebar({
   workspaces,
   openTabKeys,
   activeTabKey,
+  preferences,
+  onSavePreferences,
   onOpenWorkspace,
   onCreateWorkspace,
   onResetWorkspace,
@@ -142,6 +147,8 @@ export default function Sidebar({
             loading={agentsLoading}
             openTabKeys={openTabKeys}
             activeTabKey={activeTabKey}
+            preferences={preferences}
+            onSavePreferences={onSavePreferences}
             onOpenWorkspace={onOpenWorkspace}
             onResetWorkspace={askReset}
             onDeleteWorkspace={askDelete}

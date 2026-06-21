@@ -23,12 +23,25 @@ export type ScopedConfig = {
   toolArgs: Record<Tool, string[]>;
 };
 
+/** Sort/pin state for one workspace, keyed by `<agent>/<workspace>`.
+ *  `pinned` floats it into the pinned group; `rank` orders it within its
+ *  group (pinned and unpinned are sorted independently — see
+ *  `sortByPreference`). Workspaces without an entry fall back to the
+ *  default online-first / agent↑ / name↑ order, after any tracked ones. */
+export type WorkspaceOrderEntry = { pinned: boolean; rank: number };
+
 export type Preferences = ScopedConfig & {
   /** Per-workspace forked snapshots, keyed by `<agent>/<workspace>`.
    *  A key present means the workspace has been customised (forked);
    *  a key absent means it inherits the global config live. */
   workspaces: Record<string, ScopedConfig>;
+  /** User-defined sort + pin state, keyed by `<agent>/<workspace>`.
+   *  Shared with the cloudcode CLI menu via the same hub prefs blob. */
+  workspaceOrder: Record<string, WorkspaceOrderEntry>;
 };
+
+/** Minimal shape the ordering helpers need from a workspace row. */
+export type Orderable = { agent: string; name: string; agent_online?: boolean };
 
 function emptyToolArgs(): Record<Tool, string[]> {
   // Build with an explicit object so TS keeps the typed key shape; using
@@ -42,6 +55,7 @@ export const DEFAULT_PREFERENCES: Preferences = {
   env: {},
   toolArgs: emptyToolArgs(),
   workspaces: {},
+  workspaceOrder: {},
 };
 
 /** The key under `workspaces` for a given (agent, workspace) pair. */
@@ -62,8 +76,11 @@ type WireScoped = {
   env?: Record<string, string>;
 };
 
+type WireOrderEntry = { pinned?: boolean; rank?: number };
+
 type WireShape = WireScoped & {
   workspaces?: Record<string, WireScoped>;
+  workspace_order?: Record<string, WireOrderEntry>;
 };
 
 function parseEnv(raw: unknown): EnvMap {
@@ -105,18 +122,28 @@ export function parsePreferences(blob: unknown): Preferences {
       env: {},
       toolArgs: emptyToolArgs(),
       workspaces: {},
+      workspaceOrder: {},
     };
   }
   const wire = blob as WireShape;
   const base: Preferences = {
     ...parseScoped(wire),
     workspaces: {},
+    workspaceOrder: {},
   };
   if (wire.workspaces && typeof wire.workspaces === 'object') {
     for (const [key, val] of Object.entries(wire.workspaces)) {
       if (typeof key !== 'string' || !key) continue;
       if (!val || typeof val !== 'object') continue;
       base.workspaces[key] = parseScoped(val as WireScoped);
+    }
+  }
+  if (wire.workspace_order && typeof wire.workspace_order === 'object') {
+    for (const [key, val] of Object.entries(wire.workspace_order)) {
+      if (typeof key !== 'string' || !key) continue;
+      if (!val || typeof val !== 'object') continue;
+      const rank = typeof val.rank === 'number' && Number.isFinite(val.rank) ? val.rank : 0;
+      base.workspaceOrder[key] = { pinned: val.pinned === true, rank };
     }
   }
   return base;
@@ -136,6 +163,11 @@ export function serializePreferences(prefs: Preferences): WireShape {
     workspaces[key] = serializeScoped(cfg);
   }
   out.workspaces = workspaces;
+  const order: Record<string, WireOrderEntry> = {};
+  for (const [key, entry] of Object.entries(prefs.workspaceOrder)) {
+    order[key] = { pinned: entry.pinned, rank: entry.rank };
+  }
+  out.workspace_order = order;
   return out;
 }
 
@@ -202,6 +234,107 @@ export function resetWorkspaceConfig(
   const next = { ...prefs.workspaces };
   delete next[key];
   return { ...prefs, workspaces: next };
+}
+
+// ── Workspace sort / pin helpers ─────────────────────────────────────────────
+//
+// Ordering model (shared verbatim with the cloudcode CLI menu):
+//   - Pinned workspaces float to the top as one group; the rest follow.
+//   - Within each group, items the user has explicitly ordered come first
+//     (by their stored `rank`), then any untouched ones by the default
+//     online-first / agent↑ / name↑ order.
+//   - Pin/move always re-materialise ranks for the whole visible list, so
+//     subsequent moves are deterministic; entries for workspaces not in the
+//     current list are preserved (an offline agent's pins survive).
+
+/** The default order when a workspace has no stored rank. */
+function defaultCompare(a: Orderable, b: Orderable): number {
+  const online = (b.agent_online ? 1 : 0) - (a.agent_online ? 1 : 0);
+  if (online !== 0) return online;
+  if (a.agent !== b.agent) return a.agent.localeCompare(b.agent);
+  return a.name.localeCompare(b.name);
+}
+
+/** Whether a workspace is pinned. */
+export function isPinned(prefs: Preferences, agent: string, name: string): boolean {
+  return prefs.workspaceOrder[workspaceKey(agent, name)]?.pinned === true;
+}
+
+/** Sort a workspace list by the user's pin/rank preferences. Pure. */
+export function sortByPreference<T extends Orderable>(prefs: Preferences, items: T[]): T[] {
+  const order = prefs.workspaceOrder;
+  return [...items].sort((a, b) => {
+    const ea = order[workspaceKey(a.agent, a.name)];
+    const eb = order[workspaceKey(b.agent, b.name)];
+    const pa = ea?.pinned ? 1 : 0;
+    const pb = eb?.pinned ? 1 : 0;
+    if (pa !== pb) return pb - pa; // pinned group first
+    if (ea && eb) {
+      if (ea.rank !== eb.rank) return ea.rank - eb.rank;
+      return defaultCompare(a, b);
+    }
+    if (ea) return -1; // user-ordered before untouched (same pinned-ness)
+    if (eb) return 1;
+    return defaultCompare(a, b);
+  });
+}
+
+/** Re-materialise ranks for `finalKeys` (the new display order), preserving
+ *  entries for any workspace not currently visible. */
+function applyOrder(
+  prefs: Preferences,
+  finalKeys: string[],
+  pinnedSet: Set<string>,
+): Preferences {
+  const next: Record<string, WorkspaceOrderEntry> = { ...prefs.workspaceOrder };
+  finalKeys.forEach((k, i) => {
+    next[k] = { pinned: pinnedSet.has(k), rank: i };
+  });
+  return { ...prefs, workspaceOrder: next };
+}
+
+/** Toggle a workspace's pinned state, placing it at its new group's edge. */
+export function togglePin<T extends Orderable>(
+  prefs: Preferences,
+  items: T[],
+  agent: string,
+  name: string,
+): Preferences {
+  const key = workspaceKey(agent, name);
+  const willPin = !isPinned(prefs, agent, name);
+  const keys = sortByPreference(prefs, items).map((w) => workspaceKey(w.agent, w.name));
+  const pinnedSet = new Set(keys.filter((k) => prefs.workspaceOrder[k]?.pinned));
+  if (willPin) pinnedSet.add(key);
+  else pinnedSet.delete(key);
+  const without = keys.filter((k) => k !== key);
+  const pinnedPart = without.filter((k) => pinnedSet.has(k));
+  const normalPart = without.filter((k) => !pinnedSet.has(k));
+  if (willPin) pinnedPart.push(key); // newly pinned → bottom of pinned group
+  else normalPart.unshift(key); // newly unpinned → top of the rest
+  return applyOrder(prefs, [...pinnedPart, ...normalPart], pinnedSet);
+}
+
+/** Move a workspace one slot up/down within its own group (pinned or not). */
+export function moveWorkspace<T extends Orderable>(
+  prefs: Preferences,
+  items: T[],
+  agent: string,
+  name: string,
+  dir: 'up' | 'down',
+): Preferences {
+  const key = workspaceKey(agent, name);
+  const keys = sortByPreference(prefs, items).map((w) => workspaceKey(w.agent, w.name));
+  const pinnedSet = new Set(keys.filter((k) => prefs.workspaceOrder[k]?.pinned));
+  const inPinned = pinnedSet.has(key);
+  const group = keys.filter((k) => pinnedSet.has(k) === inPinned);
+  const idx = group.indexOf(key);
+  if (idx < 0) return prefs;
+  const swap = dir === 'up' ? idx - 1 : idx + 1;
+  if (swap < 0 || swap >= group.length) return prefs; // at the edge — no-op
+  [group[idx], group[swap]] = [group[swap], group[idx]];
+  const pinnedPart = inPinned ? group : keys.filter((k) => pinnedSet.has(k));
+  const normalPart = inPinned ? keys.filter((k) => !pinnedSet.has(k)) : group;
+  return applyOrder(prefs, [...pinnedPart, ...normalPart], pinnedSet);
 }
 
 // ── Args ↔ text helpers ─────────────────────────────────────────────────────

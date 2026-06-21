@@ -87,9 +87,14 @@ async fn run_inner<B: ratatui::backend::Backend>(
     let mut pending_select: Option<(String, String)> = None;
     let mut w_state = ListState::default();
     let title = "Select workspace";
-    let hint = "↑↓ Enter · c create · r reset · d delete · q quit";
+    let hint = "↑↓ Enter · f pin · [ ] move · c new · r reset · d del · q quit";
+    // Workspace sort/pin state, shared with webterm via the account prefs
+    // blob. Loaded once; pin/move mutate this copy and write it straight back.
+    let mut prefs = get_preferences(wire).await;
     loop {
-        let workspaces = list_workspaces(wire).await?;
+        let order = parse_order(&prefs);
+        let mut workspaces = list_workspaces(wire).await?;
+        sort_workspaces(&order, &mut workspaces);
         // Disambiguate names that exist on more than one agent —
         // bare "proj" when unique, "proj@agentA" / "proj@agentB"
         // when colliding within the list.
@@ -101,10 +106,17 @@ async fn run_inner<B: ratatui::backend::Backend>(
         let workspace_rows: Vec<PickerRow> = workspaces
             .iter()
             .map(|w| {
-                let display = if name_counts.get(w.name.as_str()).copied().unwrap_or(0) > 1 {
+                let base = if name_counts.get(w.name.as_str()).copied().unwrap_or(0) > 1 {
                     format!("{}@{}", w.name, w.agent)
                 } else {
                     w.name.clone()
+                };
+                // Pinned rows carry a leading ★; the two-space lead on the
+                // rest keeps the name column aligned across both groups.
+                let display = if is_pinned(&order, &w.agent, &w.name) {
+                    format!("★ {base}")
+                } else {
+                    format!("  {base}")
                 };
                 PickerRow {
                     name: display,
@@ -197,6 +209,42 @@ async fn run_inner<B: ratatui::backend::Backend>(
                             if let Some(err) = reset_workspace(wire, &ws.name, &ws.agent).await? {
                                 show_message(term, &err, bytes, keys).await?;
                             }
+                            w_state.select(None);
+                        }
+                    }
+                }
+            }
+            MenuKey::Char('f') => {
+                // Toggle pin (favourite) on the highlighted workspace and
+                // persist the new order; keep the cursor on it by identity.
+                if let Some(sel) = w_state.selected() {
+                    if let Some(ws) = workspaces.get(sel).cloned() {
+                        toggle_pin(&mut prefs, &workspaces, &ws.agent, &ws.name);
+                        set_preferences(wire, prefs.clone()).await;
+                        pending_select = Some((ws.agent, ws.name));
+                        w_state.select(None);
+                    }
+                }
+            }
+            MenuKey::Char('[') => {
+                // Move the highlighted workspace up within its group.
+                if let Some(sel) = w_state.selected() {
+                    if let Some(ws) = workspaces.get(sel).cloned() {
+                        if move_workspace(&mut prefs, &workspaces, &ws.agent, &ws.name, true) {
+                            set_preferences(wire, prefs.clone()).await;
+                            pending_select = Some((ws.agent, ws.name));
+                            w_state.select(None);
+                        }
+                    }
+                }
+            }
+            MenuKey::Char(']') => {
+                // Move the highlighted workspace down within its group.
+                if let Some(sel) = w_state.selected() {
+                    if let Some(ws) = workspaces.get(sel).cloned() {
+                        if move_workspace(&mut prefs, &workspaces, &ws.agent, &ws.name, false) {
+                            set_preferences(wire, prefs.clone()).await;
+                            pending_select = Some((ws.agent, ws.name));
                             w_state.select(None);
                         }
                     }
@@ -1174,6 +1222,224 @@ async fn list_workspaces(wire: &mut Wire) -> Result<Vec<crate::proto::WorkspaceI
     }
 }
 
+/// Fetch this account's preferences blob (shared with webterm via the
+/// HTTP `/api/preferences` endpoint). Returns `Value::Null` on any error
+/// so the menu degrades to the default order rather than failing.
+async fn get_preferences(wire: &mut Wire) -> serde_json::Value {
+    if wire
+        .out_tx
+        .send(OutFrame::Text(ClientToHub::GetPreferences))
+        .await
+        .is_err()
+    {
+        return serde_json::Value::Null;
+    }
+    loop {
+        match expect_text(wire).await {
+            Ok(HubToClient::Preferences { data }) => return data,
+            Ok(HubToClient::SessionError { .. }) => return serde_json::Value::Null,
+            Ok(HubToClient::Ping) => {
+                let _ = wire.out_tx.send(OutFrame::Text(ClientToHub::Pong)).await;
+            }
+            Ok(_) => continue,
+            Err(_) => return serde_json::Value::Null,
+        }
+    }
+}
+
+/// Persist the (read-modify-written) preferences blob. Fire-and-forget:
+/// the change is already applied to our local copy; a hub-side failure
+/// only means it won't survive a reconnect.
+async fn set_preferences(wire: &mut Wire, data: serde_json::Value) {
+    let _ = wire
+        .out_tx
+        .send(OutFrame::Text(ClientToHub::SetPreferences { data }))
+        .await;
+}
+
+// ── Workspace sort / pin — shared blob format with webterm ────────────────────
+//
+// Mirrors webterm/src/lib/preferences.ts: pinned workspaces float to the
+// top as one group, the rest follow; within each group, user-ranked items
+// come first (by stored `rank`), then untouched ones by the default
+// online-first / agent↑ / name↑ order. Pin/move re-materialise the whole
+// visible order so subsequent moves stay deterministic; entries for
+// workspaces not currently listed are preserved.
+
+struct OrderEntry {
+    pinned: bool,
+    rank: i64,
+}
+
+fn ws_key(agent: &str, name: &str) -> String {
+    format!("{agent}/{name}")
+}
+
+fn parse_order(blob: &serde_json::Value) -> std::collections::HashMap<String, OrderEntry> {
+    let mut map = std::collections::HashMap::new();
+    if let Some(obj) = blob.get("workspace_order").and_then(|v| v.as_object()) {
+        for (k, v) in obj {
+            let pinned = v.get("pinned").and_then(|x| x.as_bool()).unwrap_or(false);
+            let rank = v.get("rank").and_then(|x| x.as_i64()).unwrap_or(0);
+            map.insert(k.clone(), OrderEntry { pinned, rank });
+        }
+    }
+    map
+}
+
+fn is_pinned(
+    order: &std::collections::HashMap<String, OrderEntry>,
+    agent: &str,
+    name: &str,
+) -> bool {
+    order
+        .get(&ws_key(agent, name))
+        .map(|e| e.pinned)
+        .unwrap_or(false)
+}
+
+fn default_cmp(a: &crate::proto::WorkspaceInfo, b: &crate::proto::WorkspaceInfo) -> std::cmp::Ordering {
+    (b.agent_online as u8)
+        .cmp(&(a.agent_online as u8))
+        .then_with(|| a.agent.cmp(&b.agent))
+        .then_with(|| a.name.cmp(&b.name))
+}
+
+fn sort_workspaces(
+    order: &std::collections::HashMap<String, OrderEntry>,
+    ws: &mut [crate::proto::WorkspaceInfo],
+) {
+    ws.sort_by(|a, b| {
+        let ea = order.get(&ws_key(&a.agent, &a.name));
+        let eb = order.get(&ws_key(&b.agent, &b.name));
+        let pa = ea.map(|e| e.pinned).unwrap_or(false);
+        let pb = eb.map(|e| e.pinned).unwrap_or(false);
+        if pa != pb {
+            return pb.cmp(&pa); // pinned (true) sorts first
+        }
+        match (ea, eb) {
+            (Some(x), Some(y)) => x.rank.cmp(&y.rank).then_with(|| default_cmp(a, b)),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => default_cmp(a, b),
+        }
+    });
+}
+
+/// Re-materialise ranks for `final_keys` (the new display order),
+/// preserving entries for workspaces not currently visible.
+fn apply_order(
+    blob: &mut serde_json::Value,
+    final_keys: &[String],
+    pinned: &std::collections::HashSet<String>,
+) {
+    if !blob.is_object() {
+        *blob = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let obj = blob.as_object_mut().unwrap();
+    let order_obj = obj
+        .entry("workspace_order".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !order_obj.is_object() {
+        *order_obj = serde_json::Value::Object(serde_json::Map::new());
+    }
+    let order_map = order_obj.as_object_mut().unwrap();
+    for (i, k) in final_keys.iter().enumerate() {
+        order_map.insert(
+            k.clone(),
+            serde_json::json!({ "pinned": pinned.contains(k), "rank": i as i64 }),
+        );
+    }
+}
+
+/// Toggle pin for (agent,name), placing it at its new group's edge.
+/// `sorted` is the current display order.
+fn toggle_pin(
+    blob: &mut serde_json::Value,
+    sorted: &[crate::proto::WorkspaceInfo],
+    agent: &str,
+    name: &str,
+) {
+    let order = parse_order(blob);
+    let key = ws_key(agent, name);
+    let will_pin = !order.get(&key).map(|e| e.pinned).unwrap_or(false);
+    let keys: Vec<String> = sorted.iter().map(|w| ws_key(&w.agent, &w.name)).collect();
+    let mut pinned: std::collections::HashSet<String> = keys
+        .iter()
+        .filter(|k| order.get(*k).map(|e| e.pinned).unwrap_or(false))
+        .cloned()
+        .collect();
+    if will_pin {
+        pinned.insert(key.clone());
+    } else {
+        pinned.remove(&key);
+    }
+    let without: Vec<String> = keys.iter().filter(|k| **k != key).cloned().collect();
+    let mut pinned_part: Vec<String> =
+        without.iter().filter(|k| pinned.contains(*k)).cloned().collect();
+    let mut normal_part: Vec<String> =
+        without.iter().filter(|k| !pinned.contains(*k)).cloned().collect();
+    if will_pin {
+        pinned_part.push(key.clone());
+    } else {
+        normal_part.insert(0, key.clone());
+    }
+    let final_keys: Vec<String> = pinned_part.into_iter().chain(normal_part).collect();
+    apply_order(blob, &final_keys, &pinned);
+}
+
+/// Move (agent,name) one slot up/down within its own group. Returns
+/// whether anything changed (false at a group edge).
+fn move_workspace(
+    blob: &mut serde_json::Value,
+    sorted: &[crate::proto::WorkspaceInfo],
+    agent: &str,
+    name: &str,
+    up: bool,
+) -> bool {
+    let order = parse_order(blob);
+    let key = ws_key(agent, name);
+    let keys: Vec<String> = sorted.iter().map(|w| ws_key(&w.agent, &w.name)).collect();
+    let pinned: std::collections::HashSet<String> = keys
+        .iter()
+        .filter(|k| order.get(*k).map(|e| e.pinned).unwrap_or(false))
+        .cloned()
+        .collect();
+    let in_pinned = pinned.contains(&key);
+    let mut group: Vec<String> = keys
+        .iter()
+        .filter(|k| pinned.contains(*k) == in_pinned)
+        .cloned()
+        .collect();
+    let Some(idx) = group.iter().position(|k| *k == key) else {
+        return false;
+    };
+    let swap = if up {
+        if idx == 0 {
+            return false;
+        }
+        idx - 1
+    } else {
+        idx + 1
+    };
+    if swap >= group.len() {
+        return false;
+    }
+    group.swap(idx, swap);
+    let other: Vec<String> = keys
+        .iter()
+        .filter(|k| pinned.contains(*k) != in_pinned)
+        .cloned()
+        .collect();
+    let final_keys: Vec<String> = if in_pinned {
+        group.into_iter().chain(other).collect()
+    } else {
+        other.into_iter().chain(group).collect()
+    };
+    apply_order(blob, &final_keys, &pinned);
+    true
+}
+
 /// `Ok(None)` = hub accepted; `Ok(Some(err))` = hub returned a
 /// SessionError with a human-readable reason the caller should
 /// surface in the TUI. Returns `Err` only on transport failure.
@@ -1277,5 +1543,89 @@ mod tests {
     fn empty_message_yields_one_blank_line() {
         let out = wrap_text("", 20);
         assert_eq!(out, vec![String::new()]);
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::{
+        is_pinned, move_workspace, parse_order, sort_workspaces, toggle_pin,
+    };
+    use crate::proto::WorkspaceInfo;
+
+    fn ws(agent: &str, name: &str, online: bool) -> WorkspaceInfo {
+        WorkspaceInfo {
+            name: name.into(),
+            agent: agent.into(),
+            agent_online: online,
+            tmux_alive: false,
+            has_client: false,
+        }
+    }
+
+    /// Current display order (just the names) for a blob + list.
+    fn names(blob: &serde_json::Value, list: &[WorkspaceInfo]) -> Vec<String> {
+        let mut l = list.to_vec();
+        sort_workspaces(&parse_order(blob), &mut l);
+        l.into_iter().map(|w| w.name).collect()
+    }
+
+    fn sorted(blob: &serde_json::Value, list: &[WorkspaceInfo]) -> Vec<WorkspaceInfo> {
+        let mut l = list.to_vec();
+        sort_workspaces(&parse_order(blob), &mut l);
+        l
+    }
+
+    #[test]
+    fn default_sort_is_online_then_agent_then_name() {
+        let blob = serde_json::Value::Null;
+        let list = vec![ws("b", "z", true), ws("a", "y", false), ws("a", "x", true)];
+        // online first (x@a, z@b — agent asc), offline last (y@a).
+        assert_eq!(names(&blob, &list), vec!["x", "z", "y"]);
+    }
+
+    #[test]
+    fn pin_floats_to_top_and_preserves_other_fields() {
+        let mut blob = serde_json::json!({ "env": { "K": "V" } });
+        let list = vec![ws("a", "x", true), ws("a", "y", true), ws("a", "z", true)];
+        let s = sorted(&blob, &list);
+        toggle_pin(&mut blob, &s, "a", "z");
+        assert_eq!(names(&blob, &list)[0], "z");
+        assert!(is_pinned(&parse_order(&blob), "a", "z"));
+        // webterm-owned fields in the same blob must survive the rewrite.
+        assert_eq!(blob["env"]["K"], serde_json::json!("V"));
+    }
+
+    #[test]
+    fn pinned_and_unpinned_sort_independently() {
+        let mut blob = serde_json::Value::Null;
+        let list = vec![
+            ws("a", "x", true),
+            ws("a", "y", true),
+            ws("a", "z", true),
+        ];
+        let s = sorted(&blob, &list);
+        toggle_pin(&mut blob, &s, "a", "z"); // pin z
+        let s = sorted(&blob, &list);
+        toggle_pin(&mut blob, &s, "a", "y"); // pin y (below z)
+        // pinned group: z, y (pin order); unpinned: x.
+        assert_eq!(names(&blob, &list), vec!["z", "y", "x"]);
+        // move y up inside the pinned group -> y, z, x.
+        let s = sorted(&blob, &list);
+        assert!(move_workspace(&mut blob, &s, "a", "y", true));
+        assert_eq!(names(&blob, &list), vec!["y", "z", "x"]);
+    }
+
+    #[test]
+    fn move_within_group_and_edge_is_noop() {
+        let mut blob = serde_json::Value::Null;
+        let list = vec![ws("a", "x", true), ws("a", "y", true), ws("a", "z", true)];
+        // x,y,z -> move z up -> x,z,y
+        let s = sorted(&blob, &list);
+        assert!(move_workspace(&mut blob, &s, "a", "z", true));
+        assert_eq!(names(&blob, &list), vec!["x", "z", "y"]);
+        // moving the top item up does nothing.
+        let s = sorted(&blob, &list);
+        assert!(!move_workspace(&mut blob, &s, "a", "x", true));
     }
 }

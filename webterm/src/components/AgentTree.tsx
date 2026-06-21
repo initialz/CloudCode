@@ -2,8 +2,15 @@
 // agent↑ name↑. When two workspaces share a name across agents the display
 // label becomes "name@agent" (matches cloudcode CLI menu.rs convention).
 
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, type MouseEvent } from 'react';
 import type { WorkspaceItem } from '@/lib/wire';
+import {
+  type Preferences,
+  sortByPreference,
+  isPinned,
+  togglePin,
+  moveWorkspace,
+} from '@/lib/preferences';
 
 type Props = {
   workspaces: WorkspaceItem[];
@@ -12,6 +19,8 @@ type Props = {
   openTabKeys: Set<string>;
   /** Key of the workspace whose tab is currently in focus. */
   activeTabKey: string | null;
+  preferences: Preferences;
+  onSavePreferences: (next: Preferences) => void;
   onOpenWorkspace: (agent: string, workspace: string, tool?: string) => void;
   onResetWorkspace: (agent: string, workspace: string) => void;
   onDeleteWorkspace: (agent: string, workspace: string) => void;
@@ -26,6 +35,8 @@ export default function AgentTree({
   loading,
   openTabKeys,
   activeTabKey,
+  preferences,
+  onSavePreferences,
   onOpenWorkspace,
   onResetWorkspace,
   onDeleteWorkspace,
@@ -33,6 +44,11 @@ export default function AgentTree({
   onConfigWorkspace,
 }: Props) {
   const [wsMenu, setWsMenu] = useState<WorkspaceMenu | null>(null);
+
+  const togglePinned = (agent: string, workspace: string) =>
+    onSavePreferences(togglePin(preferences, workspaces, agent, workspace));
+  const move = (agent: string, workspace: string, dir: 'up' | 'down') =>
+    onSavePreferences(moveWorkspace(preferences, workspaces, agent, workspace, dir));
 
   // Close menu on Escape.
   useEffect(() => {
@@ -44,16 +60,17 @@ export default function AgentTree({
     return () => window.removeEventListener('keydown', onKey);
   }, [wsMenu]);
 
-  // Sorted list: online first, then by agent asc, then by name asc.
-  const sorted = useMemo(() => {
-    return [...workspaces].sort((a, b) => {
-      const onlineDiff =
-        (b.agent_online ? 1 : 0) - (a.agent_online ? 1 : 0);
-      if (onlineDiff !== 0) return onlineDiff;
-      if (a.agent !== b.agent) return a.agent.localeCompare(b.agent);
-      return a.name.localeCompare(b.name);
-    });
-  }, [workspaces]);
+  // Sorted by the user's pin/rank preferences (pinned group first, each
+  // group independently ordered), falling back to online-first / agent↑ /
+  // name↑ for untouched workspaces.
+  const sorted = useMemo(
+    () => sortByPreference(preferences, workspaces),
+    [preferences, workspaces],
+  );
+  const pinnedCount = useMemo(
+    () => sorted.filter((w) => isPinned(preferences, w.agent, w.name)).length,
+    [sorted, preferences],
+  );
 
   if (loading) {
     return (
@@ -158,27 +175,43 @@ export default function AgentTree({
         );
       })()}
 
-      {sorted.map((ws) => {
+      {sorted.map((ws, i) => {
         const label = `${ws.name}@${ws.agent}`;
         const key = `${ws.agent}::${ws.name}`;
         const isLive = openTabKeys.has(key);
         const isActive = activeTabKey === key;
+        const pinned = i < pinnedCount;
+        // Position within this row's own group (pinned vs unpinned), used to
+        // grey out the up/down arrows at the group edges.
+        const idxInGroup = pinned ? i : i - pinnedCount;
+        const groupLen = pinned ? pinnedCount : sorted.length - pinnedCount;
+        // A faint separator between the pinned group and the rest.
+        const divider = i === pinnedCount && pinnedCount > 0 && pinnedCount < sorted.length;
 
         return (
-          <WorkspaceRow
-            key={key}
-            workspace={ws}
-            label={label}
-            isLive={isLive}
-            isActive={isActive}
-            onOpen={() => {
-              if (!ws.agent_online) return;
-              onOpenWorkspace(ws.agent, ws.name);
-            }}
-            onContextMenu={(x, y) => {
-              setWsMenu({ x, y, agent: ws.agent, workspace: ws.name });
-            }}
-          />
+          <div key={key}>
+            {divider && (
+              <div className="mx-3 my-1 border-t border-dashed border-zinc-200 dark:border-zinc-700/70" />
+            )}
+            <WorkspaceRow
+              workspace={ws}
+              label={label}
+              isLive={isLive}
+              isActive={isActive}
+              pinned={pinned}
+              canUp={idxInGroup > 0}
+              canDown={idxInGroup < groupLen - 1}
+              onOpen={() => {
+                if (!ws.agent_online) return;
+                onOpenWorkspace(ws.agent, ws.name);
+              }}
+              onTogglePin={() => togglePinned(ws.agent, ws.name)}
+              onMove={(dir) => move(ws.agent, ws.name, dir)}
+              onContextMenu={(x, y) => {
+                setWsMenu({ x, y, agent: ws.agent, workspace: ws.name });
+              }}
+            />
+          </div>
         );
       })}
     </div>
@@ -214,14 +247,24 @@ function WorkspaceRow({
   label,
   isLive,
   isActive,
+  pinned,
+  canUp,
+  canDown,
   onOpen,
+  onTogglePin,
+  onMove,
   onContextMenu,
 }: {
   workspace: WorkspaceItem;
   label: string;
   isLive: boolean;
   isActive: boolean;
+  pinned: boolean;
+  canUp: boolean;
+  canDown: boolean;
   onOpen: () => void;
+  onTogglePin: () => void;
+  onMove: (dir: 'up' | 'down') => void;
   onContextMenu: (x: number, y: number) => void;
 }) {
   const offline = !workspace.agent_online;
@@ -229,9 +272,15 @@ function WorkspaceRow({
     ? `${label} — agent '${workspace.agent}' is offline`
     : label;
 
+  // Reorder/pin controls must not also trigger the row's open-on-click.
+  const stop = (fn: () => void) => (e: MouseEvent) => {
+    e.stopPropagation();
+    fn();
+  };
+
   return (
     <div
-      className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono transition-colors ${
+      className={`group flex items-center gap-1.5 px-3 py-1.5 text-xs font-mono transition-colors ${
         offline
           ? 'text-zinc-400 dark:text-zinc-600 cursor-not-allowed'
           : isActive
@@ -249,12 +298,111 @@ function WorkspaceRow({
         <WorkspaceBadge ws={workspace} isLive={isLive} />
       </span>
       <span className="flex-1 truncate">{label}</span>
+
+      {/* Reorder + pin controls. The up/down arrows show on hover; the star
+          stays visible while pinned, otherwise reveals on hover. */}
+      <span className="flex items-center gap-0.5 shrink-0">
+        <button
+          type="button"
+          aria-label="Move up"
+          title="Move up"
+          disabled={!canUp}
+          onClick={stop(() => onMove('up'))}
+          className={`opacity-0 group-hover:opacity-100 transition-opacity p-0.5 ${
+            canUp
+              ? 'text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200'
+              : 'text-zinc-300 dark:text-zinc-700 cursor-default'
+          }`}
+        >
+          <ChevronUpIcon />
+        </button>
+        <button
+          type="button"
+          aria-label="Move down"
+          title="Move down"
+          disabled={!canDown}
+          onClick={stop(() => onMove('down'))}
+          className={`opacity-0 group-hover:opacity-100 transition-opacity p-0.5 ${
+            canDown
+              ? 'text-zinc-400 hover:text-zinc-700 dark:hover:text-zinc-200'
+              : 'text-zinc-300 dark:text-zinc-700 cursor-default'
+          }`}
+        >
+          <ChevronDownIcon />
+        </button>
+        <button
+          type="button"
+          aria-label={pinned ? 'Unpin' : 'Pin to top'}
+          title={pinned ? 'Unpin' : 'Pin to top'}
+          onClick={stop(onTogglePin)}
+          className={`p-0.5 transition-opacity ${
+            pinned
+              ? 'text-amber-500'
+              : 'text-zinc-400 opacity-0 group-hover:opacity-100 hover:text-amber-500'
+          }`}
+        >
+          <StarIcon filled={pinned} />
+        </button>
+      </span>
     </div>
   );
 }
 
 // ── Icons ────────────────────────────────────────────────────────────────────
 
+function StarIcon({ filled }: { filled: boolean }) {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill={filled ? 'currentColor' : 'none'}
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
+    </svg>
+  );
+}
+
+function ChevronUpIcon() {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <polyline points="18 15 12 9 6 15" />
+    </svg>
+  );
+}
+
+function ChevronDownIcon() {
+  return (
+    <svg
+      width="12"
+      height="12"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden
+    >
+      <polyline points="6 9 12 15 18 9" />
+    </svg>
+  );
+}
 
 function FolderOpenIcon() {
   return (

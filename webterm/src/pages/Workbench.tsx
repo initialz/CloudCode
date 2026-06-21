@@ -1218,6 +1218,8 @@ export default function Workbench() {
         workspaces={workspaces}
         openTabKeys={openTabKeys}
         activeTabKey={activeTabKey}
+        preferences={preferences}
+        onSavePreferences={savePreferences}
         onOpenWorkspace={openTab}
         onCreateWorkspace={handleCreateWorkspace}
         onResetWorkspace={handleResetWorkspace}

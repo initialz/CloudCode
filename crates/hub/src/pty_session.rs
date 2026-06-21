@@ -534,6 +534,68 @@ where
             let _ = send_client(sink, &HubToClient::WorkspaceList { items: infos }).await;
             true
         }
+        ClientToHub::GetPreferences => {
+            // Same account-scoped blob the webterm SPA reads over HTTP
+            // (`GET /api/preferences`); the CLI uses it for workspace
+            // sort/pin state. Hand back parsed JSON (or null) so the
+            // client never has to deal with a string-of-JSON.
+            let data = match ctx.state.db.get_user_preferences(&ctx.account_name).await {
+                Ok(blob) => blob
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                    .unwrap_or(serde_json::Value::Null),
+                Err(e) => {
+                    tracing::warn!(error = %e, "get_user_preferences failed");
+                    serde_json::Value::Null
+                }
+            };
+            let _ = send_client(sink, &HubToClient::Preferences { data }).await;
+            true
+        }
+        ClientToHub::SetPreferences { data } => {
+            // Mirror the HTTP PUT contract exactly: object-only, <32 KiB.
+            // The CLI read-modify-writes the whole blob, so webterm-owned
+            // fields (env / tool_args / per-workspace forks) survive.
+            if !data.is_object() {
+                let _ = send_client(
+                    sink,
+                    &HubToClient::SessionError {
+                        message: "preferences must be a JSON object".into(),
+                    },
+                )
+                .await;
+                return true;
+            }
+            let serialised = data.to_string();
+            if serialised.len() > 32 * 1024 {
+                let _ = send_client(
+                    sink,
+                    &HubToClient::SessionError {
+                        message: "preferences exceed 32 KiB".into(),
+                    },
+                )
+                .await;
+                return true;
+            }
+            if let Err(e) = ctx
+                .state
+                .db
+                .set_user_preferences(&ctx.account_name, &serialised)
+                .await
+            {
+                tracing::warn!(error = %e, "set_user_preferences failed");
+                let _ = send_client(
+                    sink,
+                    &HubToClient::SessionError {
+                        message: "could not save preferences".into(),
+                    },
+                )
+                .await;
+            }
+            // No ack needed — the client already applied the change
+            // optimistically; a failure surfaces as the SessionError above.
+            true
+        }
         ClientToHub::CreateWorkspace { name, agent } => {
             // v1.13: client picks the owning agent at creation time
             // and carries it on the wire. Hub validates the ACL,
