@@ -47,6 +47,33 @@ pub struct WorkspaceBinding {
     pub created_at: i64,
 }
 
+/// Parse `(input, output, cache_creation, cache_read)` token counts from an
+/// assistant message body's `$.message.usage`. Non-assistant rows return all
+/// `None` (the token report only sums assistant rows). For an assistant row,
+/// missing fields default to `0` so the stored value is non-NULL — which also
+/// marks the row as "already extracted" for the backfill's `IS NULL` probe.
+fn usage_tokens(kind: &str, body: &str) -> (Option<i64>, Option<i64>, Option<i64>, Option<i64>) {
+    if kind != "assistant" {
+        return (None, None, None, None);
+    }
+    let usage = serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("message").and_then(|m| m.get("usage")).cloned());
+    let get = |k: &str| -> i64 {
+        usage
+            .as_ref()
+            .and_then(|u| u.get(k))
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0)
+    };
+    (
+        Some(get("input_tokens")),
+        Some(get("output_tokens")),
+        Some(get("cache_creation_input_tokens")),
+        Some(get("cache_read_input_tokens")),
+    )
+}
+
 impl Db {
     pub async fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -67,6 +94,10 @@ impl Db {
             .with_context(|| format!("opening sqlite at {}", path.display()))?;
         let db = Self { pool };
         db.run_migrations().await?;
+        // Backfill precomputed token columns for pre-existing assistant rows
+        // in the background, so an upgrade doesn't block boot on a full-table
+        // json_extract pass. New rows are populated at insert time.
+        db.spawn_token_backfill();
         Ok(db)
     }
 
@@ -147,17 +178,46 @@ impl Db {
             // jsonl logs. One row per JSONL line; `kind` is the outer
             // `type` field (user / assistant / permission-mode / ...);
             // `body` is the raw line as JSON.
+            // Token columns are precomputed from `body.$.message.usage` at
+            // insert time (assistant rows only; NULL elsewhere) so the daily
+            // token report is a plain integer SUM instead of a json_extract
+            // over every body — see `usage_tokens` + the assistant token
+            // index below. Existing dbs get these via an ALTER in
+            // `migrate_message_tokens`.
             "CREATE TABLE IF NOT EXISTS messages (
-                id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                cc_session_id     TEXT NOT NULL,
-                claude_session_id TEXT NOT NULL,
-                ts                INTEGER NOT NULL,
-                kind              TEXT NOT NULL,
-                body              TEXT NOT NULL
+                id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+                cc_session_id         TEXT NOT NULL,
+                claude_session_id     TEXT NOT NULL,
+                ts                    INTEGER NOT NULL,
+                kind                  TEXT NOT NULL,
+                body                  TEXT NOT NULL,
+                input_tokens          INTEGER,
+                output_tokens         INTEGER,
+                cache_creation_tokens INTEGER,
+                cache_read_tokens     INTEGER
             )",
             "CREATE INDEX IF NOT EXISTS idx_messages_cc_session ON messages(cc_session_id, id)",
             "CREATE INDEX IF NOT EXISTS idx_messages_claude_session ON messages(claude_session_id, id)",
             "CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts DESC)",
+            // Covering index for the daily message-count report
+            // (`WHERE ts>=? GROUP BY day, kind`): ts + kind both come from
+            // the index, so COUNT/GROUP never touches the table.
+            "CREATE INDEX IF NOT EXISTS idx_messages_ts_kind ON messages(ts, kind)",
+            // Precomputed token columns for existing dbs (fresh dbs get them
+            // in CREATE TABLE above). The migration loop tolerates the
+            // "duplicate column name" error these throw once applied.
+            "ALTER TABLE messages ADD COLUMN input_tokens INTEGER",
+            "ALTER TABLE messages ADD COLUMN output_tokens INTEGER",
+            "ALTER TABLE messages ADD COLUMN cache_creation_tokens INTEGER",
+            "ALTER TABLE messages ADD COLUMN cache_read_tokens INTEGER",
+            // Partial covering index for the daily token report
+            // (`SUM(input_tokens)… WHERE ts>=? AND kind='assistant'`): all
+            // summed columns live in the index, restricted to assistant
+            // rows, so the query is index-only — no body reads, no
+            // json_extract. This is the fix for the slow/502 tokens-daily.
+            "CREATE INDEX IF NOT EXISTS idx_messages_assistant_tokens
+                 ON messages(ts, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
+                 WHERE kind = 'assistant'",
             // Track each jsonl file's byte offset so the agent can resume
             // tailing where it left off after a restart. Keyed on the
             // claude session id (== filename without .jsonl); the cc
@@ -334,6 +394,55 @@ impl Db {
             }
         }
         Ok(())
+    }
+
+    /// One-time backfill of the precomputed token columns for assistant rows
+    /// that predate the column migration. Runs in the background, newest-first
+    /// (so the dashboard's recent window goes accurate first), in small paced
+    /// batches so we never hold a long write lock that would stall agents
+    /// shipping new messages. `COALESCE(..., 0)` guarantees every processed
+    /// row becomes non-NULL — including assistant rows that carry no usage —
+    /// so the `input_tokens IS NULL` cursor always makes progress and the loop
+    /// terminates.
+    fn spawn_token_backfill(&self) {
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            let mut total: u64 = 0;
+            loop {
+                let res = sqlx::query(
+                    "UPDATE messages
+                        SET input_tokens          = COALESCE(CAST(json_extract(body,'$.message.usage.input_tokens') AS INTEGER), 0),
+                            output_tokens         = COALESCE(CAST(json_extract(body,'$.message.usage.output_tokens') AS INTEGER), 0),
+                            cache_creation_tokens = COALESCE(CAST(json_extract(body,'$.message.usage.cache_creation_input_tokens') AS INTEGER), 0),
+                            cache_read_tokens     = COALESCE(CAST(json_extract(body,'$.message.usage.cache_read_input_tokens') AS INTEGER), 0)
+                      WHERE id IN (
+                          SELECT id FROM messages
+                           WHERE kind = 'assistant' AND input_tokens IS NULL
+                           ORDER BY id DESC
+                           LIMIT 2000)",
+                )
+                .execute(&pool)
+                .await;
+                match res {
+                    Ok(r) => {
+                        let n = r.rows_affected();
+                        total += n;
+                        if n == 0 {
+                            if total > 0 {
+                                tracing::info!(rows = total, "message token backfill complete");
+                            }
+                            break;
+                        }
+                        // Yield to writers between batches.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "token backfill batch failed; will retry next boot");
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     // ---- accounts ------------------------------------------------------
@@ -1075,17 +1184,25 @@ impl Db {
     // ---- messages ------------------------------------------------------
 
     /// Append one conversation message. Idempotency is the caller's job
-    /// (agent dedupes via jsonl_progress offsets).
+    /// (agent dedupes via jsonl_progress offsets). Token columns are
+    /// precomputed here so the daily report never json_extracts a body.
     pub async fn insert_message(&self, row: &MessageRow) {
+        let (it, ot, cc, cr) = usage_tokens(&row.kind, &row.body);
         let res = sqlx::query(
-            "INSERT INTO messages (cc_session_id, claude_session_id, ts, kind, body)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO messages
+                 (cc_session_id, claude_session_id, ts, kind, body,
+                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         )
         .bind(&row.cc_session_id)
         .bind(&row.claude_session_id)
         .bind(row.ts)
         .bind(&row.kind)
         .bind(&row.body)
+        .bind(it)
+        .bind(ot)
+        .bind(cc)
+        .bind(cr)
         .execute(&self.pool)
         .await;
         if let Err(e) = res {
@@ -2011,5 +2128,115 @@ fn build_activity_select(
     }
     if let Some(v) = f.until_ms {
         qb.push(" AND ts_ms <= ").push_bind(v);
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+    use sqlx::Row;
+
+    #[test]
+    fn usage_tokens_extracts_assistant_usage() {
+        let body = r#"{"message":{"usage":{"input_tokens":5,"output_tokens":7,"cache_creation_input_tokens":3,"cache_read_input_tokens":11}}}"#;
+        assert_eq!(usage_tokens("assistant", body), (Some(5), Some(7), Some(3), Some(11)));
+    }
+
+    #[test]
+    fn usage_tokens_non_assistant_is_none() {
+        let body = r#"{"message":{"content":"hi"}}"#;
+        assert_eq!(usage_tokens("user", body), (None, None, None, None));
+    }
+
+    #[test]
+    fn usage_tokens_missing_usage_defaults_zero() {
+        let body = r#"{"message":{"content":[]}}"#;
+        assert_eq!(usage_tokens("assistant", body), (Some(0), Some(0), Some(0), Some(0)));
+    }
+
+    async fn temp_db() -> Db {
+        // Unique per call: parallel tests share a pid (and can collide on a
+        // coarse clock), so an atomic sequence guarantees distinct files.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("cc-test-{}-{}.db", std::process::id(), seq));
+        Db::open(&path).await.unwrap()
+    }
+
+    fn msg(kind: &str, ts: i64, body: &str) -> MessageRow {
+        MessageRow {
+            cc_session_id: "s".into(),
+            claude_session_id: "c".into(),
+            ts,
+            kind: kind.into(),
+            body: body.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn insert_populates_token_columns_and_sums() {
+        let db = temp_db().await;
+        db.insert_message(&msg(
+            "assistant",
+            1000,
+            r#"{"message":{"usage":{"input_tokens":10,"output_tokens":20,"cache_creation_input_tokens":1,"cache_read_input_tokens":2}}}"#,
+        ))
+        .await;
+        db.insert_message(&msg(
+            "assistant",
+            1000,
+            r#"{"message":{"usage":{"input_tokens":5,"output_tokens":6,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#,
+        ))
+        .await;
+        db.insert_message(&msg("user", 1000, r#"{"message":{"content":"hi"}}"#))
+            .await;
+
+        // Mirrors the tokens-daily query: index-only SUM over assistant rows.
+        let row = sqlx::query(
+            "SELECT SUM(input_tokens) AS i, SUM(output_tokens) AS o,
+                    SUM(cache_creation_tokens) AS cc, SUM(cache_read_tokens) AS cr
+               FROM messages WHERE ts >= ?1 AND kind = 'assistant'",
+        )
+        .bind(0i64)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<i64, _>("i"), 15);
+        assert_eq!(row.get::<i64, _>("o"), 26);
+        assert_eq!(row.get::<i64, _>("cc"), 1);
+        assert_eq!(row.get::<i64, _>("cr"), 2);
+    }
+
+    #[tokio::test]
+    async fn backfill_populates_legacy_null_rows() {
+        let db = temp_db().await;
+        // Simulate a pre-migration assistant row: token columns left NULL.
+        sqlx::query(
+            "INSERT INTO messages (cc_session_id, claude_session_id, ts, kind, body)
+             VALUES ('s','c',1000,'assistant',?1)",
+        )
+        .bind(r#"{"message":{"usage":{"input_tokens":42,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        // Run the backfill UPDATE (same statement spawn_token_backfill uses).
+        sqlx::query(
+            "UPDATE messages
+                SET input_tokens          = COALESCE(CAST(json_extract(body,'$.message.usage.input_tokens') AS INTEGER), 0),
+                    output_tokens         = COALESCE(CAST(json_extract(body,'$.message.usage.output_tokens') AS INTEGER), 0),
+                    cache_creation_tokens = COALESCE(CAST(json_extract(body,'$.message.usage.cache_creation_input_tokens') AS INTEGER), 0),
+                    cache_read_tokens     = COALESCE(CAST(json_extract(body,'$.message.usage.cache_read_input_tokens') AS INTEGER), 0)
+              WHERE kind = 'assistant' AND input_tokens IS NULL",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        let row = sqlx::query("SELECT input_tokens AS i FROM messages WHERE ts = 1000")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(row.get::<i64, _>("i"), 42);
     }
 }

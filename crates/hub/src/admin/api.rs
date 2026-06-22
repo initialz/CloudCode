@@ -2496,12 +2496,16 @@ pub async fn stats_tokens_daily(
     let now = chrono::Utc::now().timestamp();
     let cutoff = now - days * 86_400;
 
+    // Sums the precomputed token columns (populated at insert + backfilled
+    // for old rows). With the partial index on assistant rows covering
+    // (ts, input_tokens, …), this is an index-only scan — no body reads, no
+    // json_extract — which is what fixes the previously slow / 502 query.
     let rows = match sqlx::query(
         "SELECT date(ts, 'unixepoch') AS day,
-                SUM(CAST(json_extract(body, '$.message.usage.input_tokens') AS INTEGER)) AS i,
-                SUM(CAST(json_extract(body, '$.message.usage.output_tokens') AS INTEGER)) AS o,
-                SUM(CAST(json_extract(body, '$.message.usage.cache_creation_input_tokens') AS INTEGER)) AS cc,
-                SUM(CAST(json_extract(body, '$.message.usage.cache_read_input_tokens') AS INTEGER)) AS cr
+                SUM(input_tokens) AS i,
+                SUM(output_tokens) AS o,
+                SUM(cache_creation_tokens) AS cc,
+                SUM(cache_read_tokens) AS cr
            FROM messages
           WHERE ts >= ?1 AND kind = 'assistant'
           GROUP BY day",
