@@ -12,7 +12,7 @@
 
 use anyhow::{Context, Result};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::{ConnectOptions, Row, SqlitePool};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -86,7 +86,14 @@ impl Db {
         let opts = SqliteConnectOptions::from_str(&dsn)?
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
-            .busy_timeout(std::time::Duration::from_secs(5));
+            .busy_timeout(std::time::Duration::from_secs(5))
+            // TEMP DIAGNOSTIC (v1.31.1): log every statement with its
+            // elapsed time at INFO so a production log shows exactly which
+            // SQL holds the write lock during a "database is locked" storm.
+            // The lock holder shows up as the line with the large `elapsed`.
+            // Revert once the culprit is identified — this is verbose.
+            .log_statements(log::LevelFilter::Info)
+            .log_slow_statements(log::LevelFilter::Warn, std::time::Duration::from_millis(500));
         let pool = SqlitePoolOptions::new()
             .max_connections(8)
             .connect_with(opts)

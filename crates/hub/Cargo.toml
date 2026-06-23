@@ -32,6 +32,7 @@ chrono.workspace = true
 dashmap.workspace = true
 uuid.workspace = true
 sqlx.workspace = true
+log = "0.4"
 reqwest.workspace = true
 dirs.workspace = true
 libc.workspace = true
