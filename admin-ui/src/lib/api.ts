@@ -116,6 +116,23 @@ export type AuditEventDto = {
 
 export type HourlyBucket = { ts: number; count: number };
 
+export type CleanupPreviewDto = {
+  months: number;
+  cutoff: number; // unix seconds
+  messages: number;
+  sessions: number;
+  user_interactions: number;
+};
+
+export type CleanupResultDto = {
+  months: number;
+  cutoff: number;
+  deleted_messages: number;
+  deleted_sessions: number;
+  deleted_user_interactions: number;
+  vacuumed: boolean;
+};
+
 export const apiClient = {
   login: (username: string, token: string) =>
     api<{ ok: true }>('/login', {
@@ -230,6 +247,19 @@ export const apiClient = {
     // after a self-update — /me 401s indefinitely once the in-memory
     // cookie session is wiped during the restart.
     version: () => api<{ version: string }>('/hub-version'),
+  },
+  maintenance: {
+    // Preview how many rows older than `months` (1/3/6/12) would be
+    // deleted from messages / sessions / user_interactions.
+    cleanupPreview: (months: number) =>
+      api<CleanupPreviewDto>(`/maintenance/cleanup?months=${months}`),
+    // Delete those rows; `vacuum` also rewrites the file to reclaim disk.
+    cleanup: (months: number, vacuum: boolean) =>
+      api<CleanupResultDto>('/maintenance/cleanup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ months, vacuum }),
+      }),
   },
   workspaces: {
     list: () => api<WorkspaceRowDto[]>('/workspaces'),

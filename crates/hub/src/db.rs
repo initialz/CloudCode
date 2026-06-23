@@ -2131,6 +2131,78 @@ fn build_activity_select(
     }
 }
 
+// ---- data maintenance / retention cleanup --------------------------------
+
+/// Row counts for the prunable time-series tables. `audit_events` is
+/// deliberately excluded — the audit trail is retained.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct CleanupCounts {
+    pub messages: i64,
+    pub sessions: i64,
+    pub user_interactions: i64,
+}
+
+impl Db {
+    /// Count rows older than `cutoff_secs` across the prunable tables —
+    /// used to preview a cleanup before committing to it.
+    pub async fn cleanup_counts(&self, cutoff_secs: i64) -> Result<CleanupCounts> {
+        let cutoff_ms = cutoff_secs.saturating_mul(1000);
+        let messages: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE ts < ?1")
+            .bind(cutoff_secs)
+            .fetch_one(&self.pool)
+            .await?;
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions WHERE started_at < ?1")
+            .bind(cutoff_secs)
+            .fetch_one(&self.pool)
+            .await?;
+        let user_interactions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM user_interactions WHERE ts_ms < ?1")
+                .bind(cutoff_ms)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(CleanupCounts {
+            messages,
+            sessions,
+            user_interactions,
+        })
+    }
+
+    /// Delete rows older than `cutoff_secs` from the prunable tables and
+    /// return how many were removed from each. Does NOT vacuum — the caller
+    /// decides whether to reclaim the freed space.
+    pub async fn cleanup_delete(&self, cutoff_secs: i64) -> Result<CleanupCounts> {
+        let cutoff_ms = cutoff_secs.saturating_mul(1000);
+        let messages = sqlx::query("DELETE FROM messages WHERE ts < ?1")
+            .bind(cutoff_secs)
+            .execute(&self.pool)
+            .await?
+            .rows_affected() as i64;
+        let sessions = sqlx::query("DELETE FROM sessions WHERE started_at < ?1")
+            .bind(cutoff_secs)
+            .execute(&self.pool)
+            .await?
+            .rows_affected() as i64;
+        let user_interactions = sqlx::query("DELETE FROM user_interactions WHERE ts_ms < ?1")
+            .bind(cutoff_ms)
+            .execute(&self.pool)
+            .await?
+            .rows_affected() as i64;
+        Ok(CleanupCounts {
+            messages,
+            sessions,
+            user_interactions,
+        })
+    }
+
+    /// Rewrite the database file to reclaim space freed by deletes. Takes an
+    /// exclusive lock for the duration — callers should treat it as a brief
+    /// write-stall.
+    pub async fn vacuum(&self) -> Result<()> {
+        sqlx::query("VACUUM").execute(&self.pool).await?;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod token_tests {
     use super::*;
@@ -2238,5 +2310,50 @@ mod token_tests {
             .await
             .unwrap();
         assert_eq!(row.get::<i64, _>("i"), 42);
+    }
+
+    #[tokio::test]
+    async fn cleanup_deletes_old_keeps_recent_and_handles_ms() {
+        let db = temp_db().await;
+        let cutoff = 1_000_000i64;
+        let usage = r#"{"message":{"usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}"#;
+        // messages: one older than cutoff, one newer (seconds).
+        db.insert_message(&msg("assistant", cutoff - 10, usage)).await;
+        db.insert_message(&msg("assistant", cutoff + 10, usage)).await;
+        // user_interactions stores ts in MILLISECONDS — exercise the *1000.
+        for (ts_ms, who) in [((cutoff - 10) * 1000, "old"), ((cutoff + 10) * 1000, "new")] {
+            sqlx::query(
+                "INSERT INTO user_interactions
+                     (account, agent, workspace, claude_session_id, ts_ms, kind, content)
+                 VALUES ('a','ag','w','c',?1,'k',?2)",
+            )
+            .bind(ts_ms)
+            .bind(who)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        let counts = db.cleanup_counts(cutoff).await.unwrap();
+        assert_eq!(counts.messages, 1);
+        assert_eq!(counts.user_interactions, 1);
+
+        let deleted = db.cleanup_delete(cutoff).await.unwrap();
+        assert_eq!(deleted.messages, 1);
+        assert_eq!(deleted.user_interactions, 1);
+
+        // The recent rows survive.
+        let m: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let u: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_interactions")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(m, 1);
+        assert_eq!(u, 1);
+
+        db.vacuum().await.unwrap();
     }
 }

@@ -272,7 +272,14 @@ pub fn router(state: AdminState) -> Router {
         )
         .route(
             "/admin/api/stats/tokens-daily",
-            get(api::stats_tokens_daily).route_layer(gate),
+            get(api::stats_tokens_daily).route_layer(gate.clone()),
+        )
+        // Data maintenance: GET previews row counts, POST deletes + vacuums.
+        .route(
+            "/admin/api/maintenance/cleanup",
+            get(api::maintenance_cleanup_preview)
+                .post(api::maintenance_cleanup)
+                .route_layer(gate),
         )
         // -- SPA bundle (built by `cd admin-ui && npm run build`) --
         // /admin/assets/<hash>.{js,css,...} → long-cache hashed file

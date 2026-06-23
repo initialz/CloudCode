@@ -2550,6 +2550,113 @@ pub async fn stats_tokens_daily(
 }
 
 // ---------------------------------------------------------------------
+// Data maintenance — retention cleanup
+// ---------------------------------------------------------------------
+//
+// Deletes old rows from the prunable time-series tables (messages,
+// sessions, user_interactions) older than a chosen window; the audit
+// trail is kept. GET previews the row counts; POST commits the delete
+// and optionally VACUUMs to reclaim disk.
+
+/// Resolve a retention window (in whole months: 1/3/6/12) to a cutoff
+/// unix-seconds timestamp. Returns None for an unsupported value so the
+/// handler can 400 rather than delete an unexpected range.
+fn cleanup_cutoff(months: u32) -> Option<i64> {
+    if !matches!(months, 1 | 3 | 6 | 12) {
+        return None;
+    }
+    chrono::Utc::now()
+        .checked_sub_months(chrono::Months::new(months))
+        .map(|d| d.timestamp())
+}
+
+#[derive(Serialize)]
+struct CleanupPreview {
+    months: u32,
+    cutoff: i64,
+    messages: i64,
+    sessions: i64,
+    user_interactions: i64,
+}
+
+/// `GET /admin/api/maintenance/cleanup?months=N` — preview only.
+pub async fn maintenance_cleanup_preview(
+    State(state): State<AdminState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let months = q.get("months").and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+    let Some(cutoff) = cleanup_cutoff(months) else {
+        return err(StatusCode::BAD_REQUEST, "invalid_input", "months must be 1, 3, 6, or 12");
+    };
+    match state.app.db.cleanup_counts(cutoff).await {
+        Ok(c) => Json(CleanupPreview {
+            months,
+            cutoff,
+            messages: c.messages,
+            sessions: c.sessions,
+            user_interactions: c.user_interactions,
+        })
+        .into_response(),
+        Err(e) => internal(e),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct CleanupRequest {
+    months: u32,
+    #[serde(default)]
+    vacuum: bool,
+}
+
+#[derive(Serialize)]
+struct CleanupResult {
+    months: u32,
+    cutoff: i64,
+    deleted_messages: i64,
+    deleted_sessions: i64,
+    deleted_user_interactions: i64,
+    vacuumed: bool,
+}
+
+/// `POST /admin/api/maintenance/cleanup` — delete + optional VACUUM.
+pub async fn maintenance_cleanup(
+    State(state): State<AdminState>,
+    Json(req): Json<CleanupRequest>,
+) -> Response {
+    let Some(cutoff) = cleanup_cutoff(req.months) else {
+        return err(StatusCode::BAD_REQUEST, "invalid_input", "months must be 1, 3, 6, or 12");
+    };
+    let deleted = match state.app.db.cleanup_delete(cutoff).await {
+        Ok(c) => c,
+        Err(e) => return internal(e),
+    };
+    let mut vacuumed = false;
+    if req.vacuum {
+        match state.app.db.vacuum().await {
+            Ok(()) => vacuumed = true,
+            Err(e) => tracing::warn!(error = %e, "vacuum after cleanup failed"),
+        }
+    }
+    tracing::info!(
+        months = req.months,
+        messages = deleted.messages,
+        sessions = deleted.sessions,
+        user_interactions = deleted.user_interactions,
+        vacuumed,
+        "admin data cleanup executed"
+    );
+    Json(CleanupResult {
+        months: req.months,
+        cutoff,
+        deleted_messages: deleted.messages,
+        deleted_sessions: deleted.sessions,
+        deleted_user_interactions: deleted.user_interactions,
+        vacuumed,
+    })
+    .into_response()
+}
+
+// ---------------------------------------------------------------------
 // Invite links
 // ---------------------------------------------------------------------
 //
