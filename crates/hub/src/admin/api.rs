@@ -2148,15 +2148,21 @@ pub async fn stats_leaderboard(
         Err(e) => return internal(e),
     };
 
+    // Message totals come from the precomputed per-(day, account, agent)
+    // rollup (refreshed hourly) instead of a live sessions⋈messages JOIN —
+    // the day-granular window is fine for a leaderboard. `group` is a
+    // validated column name (account|agent), never user text.
+    let cutoff_day = chrono::DateTime::<chrono::Utc>::from_timestamp(cutoff, 0)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_default();
     let msg_sql = format!(
-        "SELECT s.{group} AS name, COUNT(m.id) AS msg_n
-           FROM sessions s
-           JOIN messages m ON m.cc_session_id = s.session_id
-          WHERE s.started_at >= ?1
-          GROUP BY s.{group}"
+        "SELECT {group} AS name, SUM(msgs) AS msg_n
+           FROM stats_msg_by_session_daily
+          WHERE day >= ?1
+          GROUP BY {group}"
     );
     let msg_rows = match sqlx::query(&msg_sql)
-        .bind(cutoff)
+        .bind(&cutoff_day)
         .fetch_all(&state.app.db.pool)
         .await
     {
@@ -2334,13 +2340,18 @@ pub async fn stats_messages_daily(
     let now = chrono::Utc::now().timestamp();
     let cutoff = now - days * 86_400;
 
+    // Reads the precomputed daily rollup (refreshed hourly by the hub) so
+    // this never scans the messages table. `cutoff_day` bounds it to the
+    // requested window; missing days are filled with zeros below.
+    let cutoff_day = chrono::DateTime::<chrono::Utc>::from_timestamp(cutoff, 0)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_default();
     let rows = match sqlx::query(
-        "SELECT date(ts, 'unixepoch') AS day, kind, COUNT(*) AS n
-           FROM messages
-          WHERE ts >= ?1
-          GROUP BY day, kind",
+        "SELECT day, user_msgs, assistant_msgs, other_msgs
+           FROM stats_daily
+          WHERE day >= ?1",
     )
-    .bind(cutoff)
+    .bind(&cutoff_day)
     .fetch_all(&state.app.db.pool)
     .await
     {
@@ -2353,14 +2364,14 @@ pub async fn stats_messages_daily(
         std::collections::HashMap::new();
     for row in rows {
         let day: String = row.get("day");
-        let kind: String = row.get("kind");
-        let n: i64 = row.get("n");
-        let e = by_day.entry(day).or_insert((0, 0, 0));
-        match kind.as_str() {
-            "user" => e.0 += n,
-            "assistant" => e.1 += n,
-            _ => e.2 += n,
-        }
+        by_day.insert(
+            day,
+            (
+                row.get::<i64, _>("user_msgs"),
+                row.get::<i64, _>("assistant_msgs"),
+                row.get::<i64, _>("other_msgs"),
+            ),
+        );
     }
 
     // Fill zero days. We anchor at "today UTC" and walk back days-1 days
@@ -2496,21 +2507,22 @@ pub async fn stats_tokens_daily(
     let now = chrono::Utc::now().timestamp();
     let cutoff = now - days * 86_400;
 
-    // Sums the precomputed token columns (populated at insert + backfilled
-    // for old rows). With the partial index on assistant rows covering
-    // (ts, input_tokens, …), this is an index-only scan — no body reads, no
-    // json_extract — which is what fixes the previously slow / 502 query.
+    // Reads the precomputed daily rollup (refreshed hourly) — no scan of the
+    // messages table at all. `cutoff_day` bounds the window; missing days
+    // fill with zeros below.
+    let cutoff_day = chrono::DateTime::<chrono::Utc>::from_timestamp(cutoff, 0)
+        .map(|d| d.format("%Y-%m-%d").to_string())
+        .unwrap_or_default();
     let rows = match sqlx::query(
-        "SELECT date(ts, 'unixepoch') AS day,
-                SUM(input_tokens) AS i,
-                SUM(output_tokens) AS o,
-                SUM(cache_creation_tokens) AS cc,
-                SUM(cache_read_tokens) AS cr
-           FROM messages
-          WHERE ts >= ?1 AND kind = 'assistant'
-          GROUP BY day",
+        "SELECT day,
+                input_tokens AS i,
+                output_tokens AS o,
+                cache_creation_tokens AS cc,
+                cache_read_tokens AS cr
+           FROM stats_daily
+          WHERE day >= ?1",
     )
-    .bind(cutoff)
+    .bind(&cutoff_day)
     .fetch_all(&state.app.db.pool)
     .await
     {
@@ -2654,6 +2666,42 @@ pub async fn maintenance_cleanup(
         vacuumed,
     })
     .into_response()
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct AutoCleanupSettings {
+    enabled: bool,
+    months: u32,
+}
+
+/// `GET /admin/api/maintenance/auto-cleanup` — current auto-clean config.
+pub async fn maintenance_auto_cleanup_get(State(state): State<AdminState>) -> Response {
+    let (enabled, months) = state.app.db.auto_cleanup_settings().await;
+    Json(AutoCleanupSettings { enabled, months }).into_response()
+}
+
+/// `PUT /admin/api/maintenance/auto-cleanup` — update auto-clean config.
+/// The daily background job reads these on its next tick.
+pub async fn maintenance_auto_cleanup_set(
+    State(state): State<AdminState>,
+    Json(req): Json<AutoCleanupSettings>,
+) -> Response {
+    if !matches!(req.months, 1 | 3 | 6 | 12) {
+        return err(StatusCode::BAD_REQUEST, "invalid_input", "months must be 1, 3, 6, or 12");
+    }
+    match state
+        .app
+        .db
+        .set_auto_cleanup_settings(req.enabled, req.months)
+        .await
+    {
+        Ok(()) => Json(AutoCleanupSettings {
+            enabled: req.enabled,
+            months: req.months,
+        })
+        .into_response(),
+        Err(e) => internal(e),
+    }
 }
 
 // ---------------------------------------------------------------------

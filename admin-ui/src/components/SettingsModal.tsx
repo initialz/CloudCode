@@ -38,6 +38,28 @@ export function SettingsModal({
   const [confirming, setConfirming] = useState(false);
   const [cleanupErr, setCleanupErr] = useState<string | null>(null);
 
+  // ── Auto-cleanup (daily job; server-side config) ───────────────────────
+  const [autoEnabled, setAutoEnabled] = useState(false);
+  const [autoMonths, setAutoMonths] = useState(1);
+  const [autoSaving, setAutoSaving] = useState(false);
+  const [autoSaved, setAutoSaved] = useState(false);
+
+  async function saveAuto(enabled: boolean, m: number) {
+    setAutoEnabled(enabled);
+    setAutoMonths(m);
+    setAutoSaving(true);
+    setAutoSaved(false);
+    try {
+      await apiClient.maintenance.setAutoCleanup(enabled, m);
+      setAutoSaved(true);
+      setTimeout(() => setAutoSaved(false), 2000);
+    } catch {
+      /* leave the toggle reflecting intent; next open re-syncs from server */
+    } finally {
+      setAutoSaving(false);
+    }
+  }
+
   // Any change to the window invalidates a stale preview/confirm.
   function pickMonths(m: number) {
     setMonths(m);
@@ -90,6 +112,15 @@ export function SettingsModal({
       setConfirming(false);
       setCleanupErr(null);
       setBusy('idle');
+      // Load the server-side auto-cleanup config.
+      setAutoSaved(false);
+      apiClient.maintenance.getAutoCleanup().then(
+        (c) => {
+          setAutoEnabled(c.enabled);
+          setAutoMonths(c.months);
+        },
+        () => {},
+      );
     }
   }, [open]);
 
@@ -275,6 +306,46 @@ export function SettingsModal({
               file — this can take a while on a large database.
             </p>
           )}
+
+          {/* Automatic daily cleanup — server-side, saved immediately. */}
+          <div className="pt-3 mt-1 border-t border-dashed border-zinc-200 dark:border-zinc-800 space-y-2">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={autoEnabled}
+                disabled={autoSaving}
+                onChange={(e) => saveAuto(e.target.checked, autoMonths)}
+                className="h-4 w-4"
+              />
+              <span className="font-medium">Automatic daily cleanup</span>
+              {autoSaving && <span className="text-xs text-zinc-400">saving…</span>}
+              {autoSaved && (
+                <span className="text-xs text-emerald-600 dark:text-emerald-400">
+                  saved
+                </span>
+              )}
+            </label>
+            <div className="flex items-center gap-2 text-sm">
+              <span className="text-zinc-500">Every day, delete data older than</span>
+              <select
+                value={autoMonths}
+                disabled={!autoEnabled || autoSaving}
+                onChange={(e) => saveAuto(autoEnabled, Number(e.target.value))}
+                className="px-2 py-1 rounded border border-zinc-300 dark:border-zinc-700 bg-transparent text-sm disabled:opacity-50"
+              >
+                {RETENTION_OPTIONS.map((o) => (
+                  <option key={o.months} value={o.months}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <p className="text-xs text-zinc-500">
+              Runs on the hub once a day (delete only, no VACUUM — disk is
+              reclaimed by later writes). Use the manual button above to
+              VACUUM and shrink the file.
+            </p>
+          </div>
         </div>
       </div>
     </Modal>

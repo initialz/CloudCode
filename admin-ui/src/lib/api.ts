@@ -133,6 +133,11 @@ export type CleanupResultDto = {
   vacuumed: boolean;
 };
 
+export type AutoCleanupDto = {
+  enabled: boolean;
+  months: number;
+};
+
 export const apiClient = {
   login: (username: string, token: string) =>
     api<{ ok: true }>('/login', {
@@ -259,6 +264,15 @@ export const apiClient = {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ months, vacuum }),
+      }),
+    // Daily auto-cleanup config (server-side; the hub's daily job reads it).
+    getAutoCleanup: () =>
+      api<AutoCleanupDto>('/maintenance/auto-cleanup'),
+    setAutoCleanup: (enabled: boolean, months: number) =>
+      api<AutoCleanupDto>('/maintenance/auto-cleanup', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled, months }),
       }),
   },
   workspaces: {

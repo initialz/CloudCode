@@ -105,6 +105,12 @@ impl Db {
         // in the background, so an upgrade doesn't block boot on a full-table
         // json_extract pass. New rows are populated at insert time.
         db.spawn_token_backfill();
+        // Refresh the dashboard rollup tables hourly (and once at boot), so
+        // the daily charts read precomputed rows instead of scanning the
+        // messages table on every load.
+        db.spawn_stats_rollup();
+        // Auto-delete data older than the configured retention once a day.
+        db.spawn_auto_cleanup();
         Ok(db)
     }
 
@@ -225,6 +231,33 @@ impl Db {
             "CREATE INDEX IF NOT EXISTS idx_messages_assistant_tokens
                  ON messages(ts, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
                  WHERE kind = 'assistant'",
+            // Precomputed daily rollups for the admin dashboard. A background
+            // task (spawn_stats_rollup) refreshes these hourly so the daily
+            // charts read a few dozen rows instead of scanning millions of
+            // message rows on every load. One row per UTC day; days with no
+            // activity are simply absent (the API fills zeros).
+            "CREATE TABLE IF NOT EXISTS stats_daily (
+                day                   TEXT PRIMARY KEY,
+                user_msgs             INTEGER NOT NULL DEFAULT 0,
+                assistant_msgs        INTEGER NOT NULL DEFAULT 0,
+                other_msgs            INTEGER NOT NULL DEFAULT 0,
+                input_tokens          INTEGER NOT NULL DEFAULT 0,
+                output_tokens         INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens     INTEGER NOT NULL DEFAULT 0,
+                computed_at           INTEGER NOT NULL
+            )",
+            // Per-(day, account, agent) message counts feeding the
+            // leaderboard's message totals — the previously slow
+            // sessions⋈messages JOIN. Refreshed hourly for the recent
+            // window only (the leaderboard never looks back past 30 days).
+            "CREATE TABLE IF NOT EXISTS stats_msg_by_session_daily (
+                day      TEXT NOT NULL,
+                account  TEXT NOT NULL,
+                agent    TEXT NOT NULL,
+                msgs     INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (day, account, agent)
+            )",
             // Track each jsonl file's byte offset so the agent can resume
             // tailing where it left off after a restart. Keyed on the
             // claude session id (== filename without .jsonl); the cc
@@ -448,6 +481,169 @@ impl Db {
                         break;
                     }
                 }
+            }
+        });
+    }
+
+    // ---- key/value meta + settings ------------------------------------
+
+    /// Read a `db_meta` value by key. Returns None if absent.
+    pub async fn get_meta(&self, key: &str) -> Result<Option<String>> {
+        let row = sqlx::query("SELECT value FROM db_meta WHERE key = ?1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.get::<String, _>("value")))
+    }
+
+    /// Upsert a `db_meta` value.
+    pub async fn set_meta(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO db_meta (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // ---- dashboard rollups --------------------------------------------
+
+    /// Recompute the per-day message/token rollup for all days touched by
+    /// rows with `ts >= since_secs`. INSERT OR REPLACE keeps it idempotent;
+    /// a full pass (since = 0) backfills history. Indexed range scan on ts.
+    pub async fn refresh_stats_daily(&self, since_secs: i64, now_secs: i64) -> Result<()> {
+        sqlx::query(
+            "INSERT OR REPLACE INTO stats_daily
+                 (day, user_msgs, assistant_msgs, other_msgs,
+                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens,
+                  computed_at)
+             SELECT date(ts,'unixepoch') AS day,
+                    SUM(kind = 'user'),
+                    SUM(kind = 'assistant'),
+                    SUM(kind NOT IN ('user','assistant')),
+                    SUM(CASE WHEN kind='assistant' THEN COALESCE(input_tokens,0) ELSE 0 END),
+                    SUM(CASE WHEN kind='assistant' THEN COALESCE(output_tokens,0) ELSE 0 END),
+                    SUM(CASE WHEN kind='assistant' THEN COALESCE(cache_creation_tokens,0) ELSE 0 END),
+                    SUM(CASE WHEN kind='assistant' THEN COALESCE(cache_read_tokens,0) ELSE 0 END),
+                    ?2
+               FROM messages
+              WHERE ts >= ?1
+              GROUP BY day",
+        )
+        .bind(since_secs)
+        .bind(now_secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Rebuild the leaderboard's per-(day, account, agent) message counts for
+    /// the recent window. The leaderboard never looks past 30 days, so we
+    /// recompute the last `window_days` days wholesale each run and drop
+    /// anything older — keeping the table tiny and always fresh.
+    pub async fn refresh_msg_by_session_daily(&self, window_days: i64) -> Result<()> {
+        let cutoff = chrono::Utc::now().timestamp() - window_days * 86_400;
+        let cutoff_day = chrono::DateTime::<chrono::Utc>::from_timestamp(cutoff, 0)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_default();
+        // Recompute the window, then prune days that fell out of it.
+        sqlx::query(
+            "INSERT OR REPLACE INTO stats_msg_by_session_daily (day, account, agent, msgs)
+             SELECT date(m.ts,'unixepoch') AS day, s.account, s.agent, COUNT(*)
+               FROM messages m
+               JOIN sessions s ON s.session_id = m.cc_session_id
+              WHERE m.ts >= ?1
+              GROUP BY day, s.account, s.agent",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("DELETE FROM stats_msg_by_session_daily WHERE day < ?1")
+            .bind(&cutoff_day)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Background loop: backfill the daily rollup once (full history), then
+    /// refresh the recent window + leaderboard rollup every hour. Cheap —
+    /// the hourly pass is a 2-day indexed range + a 31-day join, off the
+    /// request path.
+    fn spawn_stats_rollup(&self) {
+        let db = Self { pool: self.pool.clone() };
+        tokio::spawn(async move {
+            // One-time full backfill of stats_daily on first boot after the
+            // feature ships. Marked in db_meta so later boots skip it.
+            if db.get_meta("stats_daily_backfilled").await.ok().flatten().is_none() {
+                let now = chrono::Utc::now().timestamp();
+                if let Err(e) = db.refresh_stats_daily(0, now).await {
+                    tracing::warn!(error = %e, "stats_daily backfill failed; will retry next boot");
+                } else {
+                    let _ = db.set_meta("stats_daily_backfilled", "1").await;
+                    tracing::info!("stats_daily backfill complete");
+                }
+            }
+            loop {
+                let now = chrono::Utc::now().timestamp();
+                // Recent days may still be accumulating; recompute the last
+                // 2 days each pass to absorb late-arriving messages.
+                if let Err(e) = db.refresh_stats_daily(now - 2 * 86_400, now).await {
+                    tracing::warn!(error = %e, "stats_daily refresh failed");
+                }
+                if let Err(e) = db.refresh_msg_by_session_daily(31).await {
+                    tracing::warn!(error = %e, "leaderboard rollup refresh failed");
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            }
+        });
+    }
+
+    /// Background loop: once a day, if auto-cleanup is enabled in settings,
+    /// delete time-series rows older than the configured retention. DELETE
+    /// only (no VACUUM) so it never needs scratch disk or a long exclusive
+    /// lock — space is reused by later writes.
+    fn spawn_auto_cleanup(&self) {
+        let db = Self { pool: self.pool.clone() };
+        tokio::spawn(async move {
+            loop {
+                let enabled = db
+                    .get_meta("cleanup_enabled")
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|v| v == "1")
+                    .unwrap_or(false);
+                let months = db
+                    .get_meta("cleanup_retention_months")
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or(1);
+                if enabled {
+                    if let Some(cutoff) = chrono::Utc::now()
+                        .checked_sub_months(chrono::Months::new(months))
+                        .map(|d| d.timestamp())
+                    {
+                        match db.cleanup_delete_batched(cutoff).await {
+                            Ok(c) if c.messages + c.sessions + c.user_interactions > 0 => {
+                                tracing::info!(
+                                    months,
+                                    messages = c.messages,
+                                    sessions = c.sessions,
+                                    user_interactions = c.user_interactions,
+                                    "auto-cleanup deleted old data"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(error = %e, "auto-cleanup failed"),
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
             }
         });
     }
@@ -2201,11 +2397,74 @@ impl Db {
         })
     }
 
+    /// Like `cleanup_delete` but deletes in small batches with a yield
+    /// between them, so a large auto-cleanup never holds a long write lock
+    /// that would stall agents shipping messages. Used by the daily job.
+    pub async fn cleanup_delete_batched(&self, cutoff_secs: i64) -> Result<CleanupCounts> {
+        let cutoff_ms = cutoff_secs.saturating_mul(1000);
+        let mut totals = CleanupCounts::default();
+        // (table, ts-column, cutoff value, which counter)
+        let targets: [(&str, &str, i64); 3] = [
+            ("messages", "ts", cutoff_secs),
+            ("sessions", "started_at", cutoff_secs),
+            ("user_interactions", "ts_ms", cutoff_ms),
+        ];
+        for (table, col, cutoff) in targets {
+            loop {
+                let sql = format!(
+                    "DELETE FROM {table} WHERE rowid IN
+                         (SELECT rowid FROM {table} WHERE {col} < ?1 LIMIT 5000)"
+                );
+                let n = sqlx::query(&sql)
+                    .bind(cutoff)
+                    .execute(&self.pool)
+                    .await?
+                    .rows_affected() as i64;
+                match table {
+                    "messages" => totals.messages += n,
+                    "sessions" => totals.sessions += n,
+                    _ => totals.user_interactions += n,
+                }
+                if n < 5000 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        Ok(totals)
+    }
+
     /// Rewrite the database file to reclaim space freed by deletes. Takes an
     /// exclusive lock for the duration — callers should treat it as a brief
     /// write-stall.
     pub async fn vacuum(&self) -> Result<()> {
         sqlx::query("VACUUM").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    /// Read the auto-cleanup settings (enabled + retention months).
+    pub async fn auto_cleanup_settings(&self) -> (bool, u32) {
+        let enabled = self
+            .get_meta("cleanup_enabled")
+            .await
+            .ok()
+            .flatten()
+            .map(|v| v == "1")
+            .unwrap_or(false);
+        let months = self
+            .get_meta("cleanup_retention_months")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1);
+        (enabled, months)
+    }
+
+    /// Persist the auto-cleanup settings.
+    pub async fn set_auto_cleanup_settings(&self, enabled: bool, months: u32) -> Result<()> {
+        self.set_meta("cleanup_enabled", if enabled { "1" } else { "0" }).await?;
+        self.set_meta("cleanup_retention_months", &months.to_string()).await?;
         Ok(())
     }
 }
@@ -2362,5 +2621,60 @@ mod token_tests {
         assert_eq!(u, 1);
 
         db.vacuum().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stats_daily_rollup_aggregates_by_day() {
+        let db = temp_db().await;
+        let usage = |i: i64, o: i64| {
+            format!(
+                r#"{{"message":{{"usage":{{"input_tokens":{i},"output_tokens":{o},"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}}}"#
+            )
+        };
+        // Two assistant + one user message, all on the same UTC day.
+        let day_ts = 1_700_000_000i64; // fixed, well-defined day
+        db.insert_message(&msg("assistant", day_ts, &usage(10, 20))).await;
+        db.insert_message(&msg("assistant", day_ts + 5, &usage(5, 6))).await;
+        db.insert_message(&msg("user", day_ts + 1, r#"{"message":{"content":"hi"}}"#))
+            .await;
+
+        db.refresh_stats_daily(0, day_ts + 100).await.unwrap();
+
+        let day = chrono::DateTime::<chrono::Utc>::from_timestamp(day_ts, 0)
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+        let row = sqlx::query(
+            "SELECT user_msgs, assistant_msgs, other_msgs, input_tokens, output_tokens
+               FROM stats_daily WHERE day = ?1",
+        )
+        .bind(&day)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<i64, _>("user_msgs"), 1);
+        assert_eq!(row.get::<i64, _>("assistant_msgs"), 2);
+        assert_eq!(row.get::<i64, _>("other_msgs"), 0);
+        assert_eq!(row.get::<i64, _>("input_tokens"), 15);
+        assert_eq!(row.get::<i64, _>("output_tokens"), 26);
+
+        // Idempotent re-run yields the same numbers (INSERT OR REPLACE).
+        db.refresh_stats_daily(0, day_ts + 200).await.unwrap();
+        let again: i64 =
+            sqlx::query_scalar("SELECT assistant_msgs FROM stats_daily WHERE day = ?1")
+                .bind(&day)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert_eq!(again, 2);
+    }
+
+    #[tokio::test]
+    async fn auto_cleanup_settings_roundtrip() {
+        let db = temp_db().await;
+        // Default when unset: disabled, 1 month.
+        assert_eq!(db.auto_cleanup_settings().await, (false, 1));
+        db.set_auto_cleanup_settings(true, 3).await.unwrap();
+        assert_eq!(db.auto_cleanup_settings().await, (true, 3));
     }
 }

@@ -279,6 +279,13 @@ pub fn router(state: AdminState) -> Router {
             "/admin/api/maintenance/cleanup",
             get(api::maintenance_cleanup_preview)
                 .post(api::maintenance_cleanup)
+                .route_layer(gate.clone()),
+        )
+        // Auto-cleanup config: GET reads, PUT updates the daily job's settings.
+        .route(
+            "/admin/api/maintenance/auto-cleanup",
+            get(api::maintenance_auto_cleanup_get)
+                .put(api::maintenance_auto_cleanup_set)
                 .route_layer(gate),
         )
         // -- SPA bundle (built by `cd admin-ui && npm run build`) --
